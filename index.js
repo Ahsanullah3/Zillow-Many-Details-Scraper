@@ -18,6 +18,11 @@ const MAX_RUNTIME_MS = 12 * 60 * 1000;
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
 
+// Zoom level — 0.25 = 25%. Lower = more page visible = more lazy sections mount.
+const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.25');
+const VIEWPORT_W = 1400;
+const VIEWPORT_H = 900;
+
 const HEADER_START_COL = 9; // column J
 const HEADERS = [
     "Price", "Street", "City", "State", "Zipcode", "Final URL", "Agent Details", "Sold Price",
@@ -108,30 +113,40 @@ function parseHistoryRowsInPage() {
 // EXTRACT
 // =========================================================
 async function extractPageData(page, originalUrl) {
-    // ---------- 1) SCROLL: full page top→bottom so lazy sections mount ----------
-    await page.evaluate(async () => {
-        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-        const step = 400;
-        const max = document.body.scrollHeight;
-        for (let y = 0; y <= max; y += step) {
-            window.scrollTo(0, y);
-            await sleep(80);
-        }
-        window.scrollTo(0, document.body.scrollHeight);
-    }).catch(() => {});
+    // ---------- 1) ZOOM OUT so the whole page fits the viewport ----------
+    // The whole document is now inside the viewport → IntersectionObserver fires
+    // for every lazy section (price history, facts, etc.) on load — no scroll.
+    try {
+        await page.evaluate((z) => {
+            document.documentElement.style.zoom = String(z);
+            if (document.body) document.body.style.zoom = String(z);
+        }, PAGE_ZOOM);
+    } catch (e) {}
 
-    // ---------- 2) WAIT 2 SECONDS ----------
+    // Also scale the render via CDP (belt + braces for older Chromium)
+    try {
+        const client = await page.createCDPSession();
+        await client.send('Emulation.setDeviceMetricsOverride', {
+            width: VIEWPORT_W,
+            height: VIEWPORT_H,
+            deviceScaleFactor: 1,
+            mobile: false,
+            scale: PAGE_ZOOM,
+        });
+    } catch (e) {}
+
+    // ---------- 2) WAIT 2 SECONDS for lazy sections to mount ----------
     await delay(2000);
 
-    // ---------- 3) CLICK "Table view" toggle if present ----------
+    // ---------- 3) Click "Table view" toggle if present ----------
     await page.evaluate(() => {
         const els = Array.from(document.querySelectorAll('button, [role="button"], a'));
         const tv = els.find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
         if (tv) tv.click();
     }).catch(() => {});
-    await delay(600);
+    await delay(800);
 
-    // ---------- 4) Wait for the history table header row (up to 10s) ----------
+    // ---------- 4) Wait for the history table header row (10s max) ----------
     await page.waitForFunction(
         () => {
             const tables = document.querySelectorAll('table');
@@ -183,7 +198,7 @@ async function extractPageData(page, originalUrl) {
             }
         }
 
-        // BEDS / BATHS / SQFT
+        // BEDS / BATHS / SQFT from fact containers
         const factMap = {};
         $$('[data-testid="bed-bath-sqft-fact-container"]').forEach(c => {
             const sp = c.querySelectorAll('span');
@@ -197,7 +212,7 @@ async function extractPageData(page, originalUrl) {
         if (factMap.baths) out.baths = num(factMap.baths) || factMap.baths;
         if (factMap.sqft)  out.sqft  = num(factMap.sqft)  || factMap.sqft;
 
-        // "At a glance facts" grid
+        // "At a glance facts" grid — type, year, lot, $/sqft
         const glance = $('[aria-label="At a glance facts"]');
         if (glance) {
             for (const item of glance.querySelectorAll('[role="listitem"]')) {
@@ -321,12 +336,12 @@ async function extractPageData(page, originalUrl) {
 
     if (!data.canonicalUrl) data.canonicalUrl = originalUrl;
 
-    // ---------- 6) Parse history table (now mounted after scroll+wait) ----------
+    // ---------- 6) Parse history table (should be mounted after zoom+wait) ----------
     let domRows = [];
     try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
 
     if (!domRows.length) {
-        // one more scroll + short wait as last resort
+        // last-chance: scroll heading into view at the zoomed-out scale, wait 2s, retry
         await page.evaluate(() => {
             const h = Array.from(document.querySelectorAll('h2,h3'))
                 .find(x => /price\s*history/i.test(x.textContent || ''));
@@ -397,6 +412,22 @@ async function extractPageData(page, originalUrl) {
         data.factsFeaturesText = facts || "";
     } catch (e) {}
 
+    // ---------- 9) Debug if history is still empty ----------
+    if (!data.priceHistoryText) {
+        try {
+            const debug = await page.evaluate(() => ({
+                hasPriceHistoryHeading: Array.from(document.querySelectorAll('h2,h3'))
+                    .some(h => /price history/i.test(h.textContent || '')),
+                dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
+                tableCount: document.querySelectorAll('table').length,
+                currentZoom: document.documentElement.style.zoom || '(none)',
+                bodyHeight: document.body.scrollHeight,
+                viewportHeight: window.innerHeight,
+            }));
+            console.log(`   🔍 History debug: ${JSON.stringify(debug)}`);
+        } catch (e) {}
+    }
+
     return data;
 }
 
@@ -405,7 +436,7 @@ async function extractPageData(page, originalUrl) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log("🚀 Starting Stealth Scraper V11 (scroll → wait 2s → scrape)...");
+    console.log(`🚀 Starting Stealth Scraper V12 (zoom ${PAGE_ZOOM * 100}% → wait 2s → scrape)...`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -437,7 +468,7 @@ async function runScraper() {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-blink-features=AutomationControlled',
-            '--window-size=1400,900',
+            `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
         ],
     });
 
@@ -484,8 +515,8 @@ async function runScraper() {
 
             const page = await browser.newPage();
             try {
-                // Realistic viewport so lazy sections mount like a real user
-                await page.setViewport({ width: 1400, height: 900 });
+                // Realistic viewport — lazy sections only mount above a certain size
+                await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H });
 
                 await page.setRequestInterception(true);
                 page.on('request', (req) => {

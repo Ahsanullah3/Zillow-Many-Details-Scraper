@@ -9,7 +9,7 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const MAX_RUNTIME_MS = 600000;        // 10 min per batch
+const MAX_RUNTIME_MS = 780000;        // 13 min per batch
 const MIN_SLEEP_MS = 4000;            // pause between rows
 const MAX_SLEEP_MS = 9000;
 const MAX_ROWS_PER_RUN = 30;           // successful rows per batch (blocked rows don't count)
@@ -21,7 +21,14 @@ const BATCH_NUMBER = parseInt(process.env.BATCH_NUMBER || '1', 10) || 1;
 // Batch 1 (cron start / manual start) retries previously blocked rows; later chained batches skip them.
 const RETRY_BLOCKED = BATCH_NUMBER === 1 || process.env.RETRY_BLOCKED === '1';
 const isBlockedStatus = (st) => /BLOCKED|No data/i.test(String(st || ''));
-const BLOCKED_RESOURCES = ['image', 'media']; // keep CSS/fonts so traffic looks real
+// Request interception disables the browser cache and slightly changes traffic shape,
+// so it's OFF by default. Set e.g. ['media'] only if you need to save bandwidth.
+const BLOCKED_RESOURCES = [];
+const VIEWPORTS = [[1366, 768], [1440, 900], [1536, 864], [1920, 1080]];
+const [VP_W, VP_H] = VIEWPORTS[Math.floor(Math.random() * VIEWPORTS.length)]; // one size per run
+const TIMEZONE = process.env.TIMEZONE || 'America/New_York'; // match a US IP
+const PAUSE_EVERY = [6, 11];         // take a longer "human" break every N rows
+const PAUSE_MS = [20000, 45000];
 
 // Optional env vars:
 //   PUPPETEER_EXECUTABLE_PATH : Edge/Chrome path (falls back to bundled Chromium)
@@ -50,6 +57,7 @@ async function launchBrowser() {
     const execPath = process.env.PUPPETEER_EXECUTABLE_PATH;
     if (execPath) console.log(`🌐 Using browser: ${execPath}`);
     else console.log('🌐 Using bundled Chromium');
+    console.log(`🖥️ ${HEADFUL ? 'Headful' : 'Headless'} | window ${VP_W}x${VP_H} | tz ${TIMEZONE}`);
 
     return puppeteer.launch({
         headless: HEADFUL ? false : 'new',
@@ -59,8 +67,12 @@ async function launchBrowser() {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--password-store=basic',
             '--lang=en-US,en',
-            '--window-size=1366,768',
+            `--window-size=${VP_W},${VP_H}`,
         ],
         ignoreDefaultArgs: ['--enable-automation'],
         defaultViewport: null,
@@ -73,33 +85,72 @@ async function launchBrowser() {
 async function preparePage(browser) {
     const page = await browser.newPage();
 
-    // Use the browser's REAL user agent (only remove the "Headless" tag).
-    // A hardcoded Windows UA on a Linux runner is a classic detection signal.
-    const ua = (await browser.userAgent()).replace('HeadlessChrome', 'Chrome');
-    await page.setUserAgent(ua);
-    await page.setViewport({ width: jitter(1366, 1600), height: jitter(768, 1000) });
+    // NOTE: no manual setUserAgent. The stealth plugin's user-agent-override already
+    // strips "Headless" AND sets matching client-hint metadata (sec-ch-ua, platform).
+    // Setting the UA by hand wipes that metadata and creates a mismatch.
+
+    if (!HEADFUL) await page.setViewport({ width: VP_W, height: VP_H, deviceScaleFactor: 1 });
+    await page.emulateTimezone(TIMEZONE).catch(() => {});
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-        if (BLOCKED_RESOURCES.includes(req.resourceType())) req.abort().catch(() => {});
-        else req.continue().catch(() => {});
-    });
-
-    // Stealth plugin already handles webdriver/plugins/languages/chrome.
-    // Manual overrides were removed because they create inconsistencies.
+    if (BLOCKED_RESOURCES.length) {
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (BLOCKED_RESOURCES.includes(req.resourceType())) req.abort().catch(() => {});
+            else req.continue().catch(() => {});
+        });
+    }
     return page;
 }
 
 // =========================================================
-// HUMAN-LIKE NAVIGATION
+// HUMAN-LIKE BEHAVIOUR
 // =========================================================
+// Smooth curved mouse path (quadratic bezier) instead of a straight jump
+async function humanMouse(page, toX, toY) {
+    try {
+        const fromX = jitter(50, VP_W - 50), fromY = jitter(50, VP_H - 50);
+        const cx = (fromX + toX) / 2 + jitter(-150, 150);
+        const cy = (fromY + toY) / 2 + jitter(-150, 150);
+        const steps = jitter(18, 40);
+        await page.mouse.move(fromX, fromY);
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            const x = (1 - t) * (1 - t) * fromX + 2 * (1 - t) * t * cx + t * t * toX;
+            const y = (1 - t) * (1 - t) * fromY + 2 * (1 - t) * t * cy + t * t * toY;
+            await page.mouse.move(x, y);
+            if (i % 6 === 0) await delay(jitter(5, 25));
+        }
+    } catch (_) {}
+}
+
+// Scroll down in uneven chunks, sometimes back up a little, with reading pauses
+async function humanScroll(page) {
+    try {
+        const chunks = jitter(3, 7);
+        for (let i = 0; i < chunks; i++) {
+            const dy = jitter(150, 480);
+            await page.mouse.wheel({ deltaY: dy });
+            await delay(jitter(350, 1100));
+            if (Math.random() < 0.2) {
+                await page.mouse.wheel({ deltaY: -jitter(60, 200) });
+                await delay(jitter(300, 800));
+            }
+        }
+    } catch (_) {}
+}
+
 async function humanNavigate(page, url) {
-    await delay(jitter(1500, 3500));
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-    try { await page.mouse.move(jitter(150, 900), jitter(100, 700), { steps: jitter(5, 15) }); } catch (_) {}
-    try { await page.evaluate(() => window.scrollBy(0, 200 + Math.random() * 500)); } catch (_) {}
-    await delay(jitter(1200, 2500));
+    await delay(jitter(1200, 3500));
+    await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 90000,
+        referer: Math.random() < 0.7 ? 'https://www.google.com/' : 'https://www.zillow.com/',
+    });
+    await delay(jitter(900, 2200));                       // page "loads"
+    await humanMouse(page, jitter(200, VP_W - 200), jitter(150, VP_H - 150));
+    await humanScroll(page);
+    await delay(jitter(1000, 3000));                      // reading time
 }
 
 // =========================================================
@@ -340,9 +391,19 @@ async function runScraper() {
         }
     };
 
+    let rowsSincePause = 0;
+    let nextPauseAt = jitter(PAUSE_EVERY[0], PAUSE_EVERY[1]);
     const pace = async () => {
         if (dirty >= FLUSH_BATCH_SIZE) await flush();
         await delay(jitter(MIN_SLEEP_MS, MAX_SLEEP_MS));
+        rowsSincePause++;
+        if (rowsSincePause >= nextPauseAt) {
+            const ms = jitter(PAUSE_MS[0], PAUSE_MS[1]);
+            console.log(`   ☕ Taking a ${Math.round(ms / 1000)}s break`);
+            await delay(ms);
+            rowsSincePause = 0;
+            nextPauseAt = jitter(PAUSE_EVERY[0], PAUSE_EVERY[1]);
+        }
     };
 
     // Marks the row blocked and SKIPS it. Returns true if the IP looks flagged

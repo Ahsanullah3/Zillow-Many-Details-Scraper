@@ -33,7 +33,7 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout Repository
@@ -46,6 +46,12 @@ jobs:
 
       - name: Install Dependencies
         run: npm install
+
+      - name: Ensure Xvfb (virtual display)
+        run: |
+          if ! command -v xvfb-run >/dev/null; then
+            sudo apt-get update -y && sudo apt-get install -y xvfb
+          fi
 
       - name: Setup Edge (Latest Dev)
         id: setup-edge
@@ -60,7 +66,9 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-edge.outputs.edge-path }}
           BATCH_NUMBER: ${{ inputs.batch || '1' }}
-        run: npm start
+          HEADFUL: '1'                 # real (non-headless) window inside a virtual display
+          TIMEZONE: America/New_York
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm start
 
       # Runs ONLY if the job is healthy: not cancelled, not failed,
       # not timed out, and the scraper reported more rows.

@@ -17,10 +17,10 @@ const REQUIRED_COLS = 34;
 const FLUSH_BATCH_SIZE = 5;
 const MAX_CONSECUTIVE_ERRORS = 3;     // stop run if things keep failing
 const MAX_BLOCK_STREAK = 3;           // this many blocks in a row = IP flagged -> end batch, next batch gets a new IP
-const BATCH_NUMBER = parseInt(process.env.BATCH_NUMBER || '1', 10) || 1;
-// Batch 1 (cron start / manual start) retries previously blocked rows; later chained batches skip them.
-const RETRY_BLOCKED = BATCH_NUMBER === 1 || process.env.RETRY_BLOCKED === '1';
-const isBlockedStatus = (st) => /BLOCKED|No data/i.test(String(st || ''));
+// Rows marked blocked / errored are SKIPPED in every batch, so the same rows are never
+// retried again and again. Set RETRY_BLOCKED=1 (manual run only) to retry them once.
+const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
+const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
 // Request interception disables the browser cache and slightly changes traffic shape,
 // so it's OFF by default. Set e.g. ['media'] only if you need to save bandwidth.
 const BLOCKED_RESOURCES = [];
@@ -378,7 +378,6 @@ async function runScraper() {
     let rowsRemaining = false;
     let ipFlagged = false;   // IP looks burned: ended batch after a streak of blocks
     let blockStreak = 0;
-    let streakRows = [];
     let skippedBlocked = 0;
     let consecutiveErrors = 0;
     let stoppedEarly = false;
@@ -406,22 +405,20 @@ async function runScraper() {
         }
     };
 
-    // Marks the row blocked and SKIPS it. Returns true if the IP looks flagged
-    // (several blocks in a row), in which case those rows are reset so the next
-    // batch retries them on a fresh IP.
+    // Marks the row as blocked (permanently skipped in later batches) and moves on.
+    // After several blocks in a row the IP is probably flagged: end the batch so the
+    // next batch (new runner, new IP) carries on with the NEXT rows.
     const handleBlock = (rowIndex, label) => {
         setCell(rowIndex, 17, label);
         dirty++;
         blockStreak++;
-        streakRows.push(rowIndex);
         if (blockStreak >= MAX_BLOCK_STREAK) {
-            console.log(`🛑 ${blockStreak} blocks in a row — IP flagged. Resetting those rows and ending batch.`);
-            for (const r of streakRows) { setCell(r, 17, ""); dirty++; }
+            console.log(`🛑 ${blockStreak} blocks in a row — ending batch; next batch continues with the next rows.`);
             ipFlagged = true;
             rowsRemaining = true;
             return true;
         }
-        console.log(`   ⏭️ Row blocked — skipping (${blockStreak}/${MAX_BLOCK_STREAK} in a row)`);
+        console.log(`   ⏭️ Row marked blocked — skipping (${blockStreak}/${MAX_BLOCK_STREAK} in a row)`);
         return false;
     };
 
@@ -457,7 +454,7 @@ async function runScraper() {
             const status = sheet.getCell(rowIndex, 17).value || "";
 
             if (!originalUrl || !String(originalUrl).includes("zillow.com") || String(status).includes("✅")) continue;
-            if (isBlockedStatus(status) && !RETRY_BLOCKED) { skippedBlocked++; continue; }
+            if (isSkipStatus(status) && !RETRY_BLOCKED) { skippedBlocked++; continue; }
 
             const actualRowNumber = rowIndex + 1;
             console.log(`🕵️ Row ${actualRowNumber}: ${originalUrl}`);
@@ -467,7 +464,7 @@ async function runScraper() {
 
                 if (await checkBlocked(page)) {
                     console.log(`🛑 BLOCKED on Row ${actualRowNumber}`);
-                    if (handleBlock(rowIndex, "❌ BLOCKED")) break;
+                    if (handleBlock(rowIndex, "❌ BLOCKED (skipped)")) break;
                     await pace();
                     continue;
                 }
@@ -475,7 +472,7 @@ async function runScraper() {
                 const hasNextData = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
                 if (!hasNextData) {
                     console.log(`   ⚠️ No __NEXT_DATA__ — treating as blocked`);
-                    if (handleBlock(rowIndex, "🚫 No data (blocked?)")) break;
+                    if (handleBlock(rowIndex, "🚫 No data - blocked? (skipped)")) break;
                     await pace();
                     continue;
                 }
@@ -523,8 +520,7 @@ async function runScraper() {
                 dirty++;
                 scrapeCount++;
                 consecutiveErrors = 0;
-                blockStreak = 0;     // earlier blocked rows were row-specific: they stay skipped
-                streakRows = [];
+                blockStreak = 0;
                 console.log(`   ✔️ ${data.fullAddress || '?'} | 💰 ${data.price || '?'} | 📊 Hist: ${data.priceHistoryText ? 'YES' : 'NO'}`);
 
             } catch (e) {
@@ -545,7 +541,7 @@ async function runScraper() {
         await browser.close().catch(() => {});
     }
 
-    if (skippedBlocked) console.log(`⏭️ Skipped ${skippedBlocked} previously blocked rows`);
+    if (skippedBlocked) console.log(`⏭️ Skipped ${skippedBlocked} rows already marked blocked/error`);
     // blocked=true only when the batch made zero progress because of blocks
     setOutput(rowsRemaining || stoppedEarly, ipFlagged && scrapeCount === 0);
 }

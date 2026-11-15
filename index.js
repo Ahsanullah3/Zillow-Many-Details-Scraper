@@ -109,8 +109,25 @@ function parseHistoryRowsInPage() {
 // EXTRACT
 // =========================================================
 async function extractPageData(page, originalUrl) {
-    // FIX: give the price-history table a chance to render before we format page text
-    await page.waitForSelector('[data-testid="date-info"]', { timeout: 4000 }).catch(() => {});
+    // FIX 1: click "Table view" toggle if it exists — Zillow hides history table behind it
+    await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll('button, [role="button"], a'));
+        const tv = els.find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
+        if (tv) tv.click();
+    }).catch(() => {});
+    await delay(600);
+
+    // FIX 2: wait for the history table's <th>Date/Event/Price</th> to actually exist
+    await page.waitForFunction(
+        () => {
+            const tables = document.querySelectorAll('table[data-c11n-component="Table.Root"], table.c11n_table__root, table');
+            return Array.from(tables).some(t => {
+                const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
+                return hs.includes('date') && hs.includes('event') && hs.includes('price');
+            });
+        },
+        { timeout: 8000 }
+    ).catch(() => {});
 
     const data = await page.evaluate(() => {
         const out = {
@@ -118,16 +135,14 @@ async function extractPageData(page, originalUrl) {
             agentDetails: "", soldPrice: "", canonicalUrl: "", description: "",
             pricePerSqft: "", beds: "", baths: "", sqft: "", lotSize: "",
             listedForSale: "", soldOn: "", mls: "", propertyType: "", yearBuilt: "",
-            hoa: "", priceHistoryText: "", pageText: "", embeddedHistory: []
+            hoa: "", priceHistoryText: "", pageText: "", embeddedHistory: [], mlsFromSource: ""
         };
 
         const fmtType = (raw) => !raw ? "" : String(raw).replace(/_/g, ' ')
             .replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
         const money = (n) => (typeof n === 'number') ? '$' + n.toLocaleString('en-US') : (n || '');
 
-        // -----------------------------------------------------
-        // FIXED formatPageText: skips nav/chrome, falls back to innerText
-        // -----------------------------------------------------
+        // ---- formatPageText: skips nav/chrome, falls back to innerText
         const formatPageText = () => {
             const SKIP = new Set([
                 'SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE',
@@ -155,7 +170,6 @@ async function extractPageData(page, originalUrl) {
                 buf = '';
                 if (t) lines.push(prefix + t);
             };
-
             const isChrome = (node) => {
                 if (node.id && SKIP_IDS.has(node.id)) return true;
                 const tid = node.getAttribute && node.getAttribute('data-testid');
@@ -164,7 +178,6 @@ async function extractPageData(page, originalUrl) {
                 if (/\b(topnav|znav|pfs-nav|hdp-action-bar|layout-action-bar|with-product-nav__product-nav)\b/i.test(cls)) return true;
                 return false;
             };
-
             const walk = (node) => {
                 if (node.nodeType === 3) { buf += ' ' + node.nodeValue; return; }
                 if (node.nodeType !== 1) return;
@@ -213,7 +226,6 @@ async function extractPageData(page, originalUrl) {
             const head = [clean(document.title), location.href, '', '----------------------------------------', ''];
             const formatted = head.concat(res).join('\n').trim();
 
-            // Fallback: if the SPA shell hasn't hydrated, formatted text will be tiny.
             if (formatted.length < 800) {
                 const fallback = (document.body.innerText || '')
                     .replace(/\r/g, '')
@@ -374,6 +386,28 @@ async function extractPageData(page, originalUrl) {
                 const m = info.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
                 if (m) out.mls = `${m[2]} - ${clean(m[1])}`;
             }
+
+            // FIX 3: capture MLS from the price-history source rows (this page's only MLS source)
+            // Source row format: "Source: Hive MLS #100484370  Report a problem"
+            if (empty(out.mls) || true) { // always try — prefer source row when available
+                const srcEls = document.querySelectorAll('[data-c11n-component="Table.Row"] + tr, tbody tr');
+                for (const tr of srcEls) {
+                    const txt = clean(tr.textContent || '');
+                    const m = txt.match(/Source:\s*(.+?MLS)\s*#\s*([A-Za-z0-9-]+)/i);
+                    if (m) { out.mlsFromSource = `${m[2]} - ${clean(m[1])}`; break; }
+                }
+                // also scan any element whose text has "Source: ... #..."
+                if (!out.mlsFromSource) {
+                    const all = document.querySelectorAll('span, div');
+                    for (const el of all) {
+                        const t = clean(el.textContent || '');
+                        if (t.length > 200) continue;
+                        const m = t.match(/^Source:\s*(.+?MLS)\s*#\s*([A-Za-z0-9-]+)/i);
+                        if (m) { out.mlsFromSource = `${m[2]} - ${clean(m[1])}`; break; }
+                    }
+                }
+                if (empty(out.mls) && out.mlsFromSource) out.mls = out.mlsFromSource;
+            }
         } catch (e) {}
 
         out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
@@ -383,12 +417,13 @@ async function extractPageData(page, originalUrl) {
 
     if (!data.canonicalUrl) data.canonicalUrl = originalUrl;
 
-    // ---- Price history: table + embedded, keep the richer one
+    // ---- Price history: DOM table + embedded, keep the richer one
     let domRows = [];
     try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
     const embRows = data.embeddedHistory || [];
 
     if (!domRows.length && !embRows.length) {
+        // Last-chance: give the table a moment, and if PRICE_HISTORY_DOM=1 scroll to it
         await page.waitForSelector('[data-testid="date-info"]', { timeout: 3000 }).catch(() => {});
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
         if (!domRows.length && PRICE_HISTORY_DOM) {
@@ -416,6 +451,13 @@ async function extractPageData(page, originalUrl) {
             if (ev.includes('listed for sale') && !data.listedForSale) data.listedForSale = `${r.date} (${r.price})`;
             if (ev.includes('sold') && !data.soldOn) data.soldOn = r.date;
         }
+        // FIX 3b: derive MLS from the first non-empty source row (e.g. "Source: Hive MLS #100484370")
+        if (!data.mls) {
+            for (const r of rows) {
+                const m = String(r.source || '').match(/Source:\s*(.+?MLS)\s*#\s*([A-Za-z0-9-]+)/i);
+                if (m) { data.mls = `${m[2]} - ${m[1].trim()}`; break; }
+            }
+        }
     }
 
     // Facts & Features (best-effort, from HTML already loaded)
@@ -439,7 +481,7 @@ async function extractPageData(page, originalUrl) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log("🚀 Starting Stealth Scraper V8 (fixed page text)...");
+    console.log("🚀 Starting Stealth Scraper V9 (fixed price-history + MLS source-row)...");
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -522,7 +564,7 @@ async function runScraper() {
                 await delay(jitter(500, 1000));
                 await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-                // FIX: wait for real property content to hydrate, not just the shell
+                // Wait for real property content to hydrate
                 await page.waitForSelector(
                     '[data-testid="description"], [data-testid="fact-category"], ' +
                     'script[type="application/ld+json"], [data-testid="gallery-status-pill"]',
@@ -574,12 +616,12 @@ async function runScraper() {
                         setCell(rowIndex, 30, d.hoa);
                         setCell(rowIndex, 31, d.priceHistoryText);
                         setCell(rowIndex, 32, d.factsFeaturesText);
-                        setCell(rowIndex, 33, d.pageText); // column AH
+                        setCell(rowIndex, 33, d.pageText);
                         dirty++;
                         scrapeCount++;
                         blockStreak = 0;
                         consecutiveErrors = 0;
-                        console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES' : 'NO'}`);
+                        console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES' : 'NO'} | 🏷️ MLS: ${d.mls || '—'}`);
                         console.log(`   📄 pageText: ${d.pageText ? d.pageText.length : 0} chars | desc: ${d.description ? d.description.length : 0} chars`);
                     }
                 }

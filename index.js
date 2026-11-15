@@ -15,8 +15,8 @@ const REQUIRED_COLS = 34;
 const MAX_BLOCK_STREAK = 3;         // blocks in a row => end batch, next batch continues with NEXT rows
 const MAX_CONSECUTIVE_ERRORS = 3;
 const MAX_RUNTIME_MS = 12 * 60 * 1000;
-// Optional: also read the visible price-history table if the embedded data has none.
-// Needs scrolling/lazy requests, so it's OFF by default (set PRICE_HISTORY_DOM=1 to try).
+// Price history is read from the table already in the page and from the embedded data.
+// PRICE_HISTORY_DOM=1 additionally scrolls to the section if neither has it (riskier, OFF by default).
 const PRICE_HISTORY_DOM = process.env.PRICE_HISTORY_DOM === '1';
 // Rows marked blocked/error are skipped in every batch. RETRY_BLOCKED=1 retries them once.
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
@@ -52,45 +52,55 @@ async function saveWithRetry(sheet, retries = 3) {
 }
 
 // =========================================================
-// OPTIONAL: price history from the rendered table
+// PRICE HISTORY: parse the rendered "Price history" table
+// (runs inside the page; rows carry label="Date: ..., Event: ..., Price: ...")
 // =========================================================
-async function historyFromDOM(page) {
-    try {
-        await page.evaluate(() => {
-            const h = Array.from(document.querySelectorAll('h2,h3'))
-                .find(x => (x.innerText || '').toLowerCase().includes('price history'));
-            if (h) h.scrollIntoView({ block: 'center' });
-        });
-        await delay(2000);
-        return await page.evaluate(() => {
-            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-            const h = Array.from(document.querySelectorAll('h2,h3'))
-                .find(x => clean(x.innerText).toLowerCase().includes('price history'));
-            if (!h) return { text: '', listed: '', sold: '' };
-            let node = h, table = null;
-            for (let i = 0; i < 6 && node; i++) {
-                node = node.parentElement;
-                if (!node) break;
-                table = node.querySelector('table');
-                if (table) break;
-            }
-            if (!table) return { text: '', listed: '', sold: '' };
-            const lines = []; let listed = '', sold = '';
-            for (const tr of table.querySelectorAll('tr')) {
-                const cells = Array.from(tr.querySelectorAll('th,td')).map(c => clean(c.innerText)).filter(Boolean);
-                if (!cells.length) continue;
-                lines.push(cells.join(' | '));
-                if (cells.length >= 3) {
-                    const ev = cells[1].toLowerCase();
-                    if (ev.includes('listed for sale') && !listed) listed = `${cells[0]} (${cells[2]})`;
-                    if (ev.includes('sold') && !sold) sold = cells[0];
-                }
-            }
-            return { text: lines.join('\n'), listed, sold };
-        });
-    } catch (e) {
-        return { text: '', listed: '', sold: '' };
+function parseHistoryRowsInPage() {
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const heads = Array.from(document.querySelectorAll('h2,h3'));
+    const h = heads.find(x => clean(x.textContent).toLowerCase() === 'price history') ||
+              heads.find(x => clean(x.textContent).toLowerCase().includes('price history'));
+    let table = null;
+    if (h) {
+        let node = h;
+        for (let i = 0; i < 6 && node; i++) {
+            node = node.parentElement;
+            if (!node) break;
+            table = node.querySelector('table');
+            if (table) break;
+        }
     }
+    if (!table) return [];
+
+    const rows = [];
+    for (const tr of table.querySelectorAll('tr[label]')) {
+        const label = tr.getAttribute('label') || '';
+        const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
+
+        const date = clean(tr.querySelector('[data-testid="date-info"]')?.textContent) || (lm ? clean(lm[1]) : '');
+        const tds = tr.querySelectorAll('td');
+        const event = clean(tds[1]?.textContent) || (lm ? clean(lm[2]) : '');
+
+        const priceCell = tr.querySelector('[data-testid="price-money-cell"]');
+        let price = '', change = '', ppsf = '';
+        if (priceCell) {
+            price = clean(priceCell.querySelector('span > span')?.textContent);
+            change = clean(priceCell.querySelector('[data-testid="percent-display"]')?.textContent);
+            const last = priceCell.lastElementChild;
+            const lastTxt = clean(last?.textContent);
+            if (/sqft/i.test(lastTxt)) ppsf = lastTxt;
+        }
+        if (!price && lm) price = clean(lm[3]).replace(/\s*\(.*\)\s*$/, '');
+
+        // Source sits in the following colspan row ("Source: Hive MLS #123  Report a problem")
+        let source = '';
+        const next = tr.nextElementSibling;
+        if (next && !next.hasAttribute('label')) {
+            source = clean(next.textContent).replace(/\s*Report\s+a problem\s*$/i, '');
+        }
+        if (date || event) rows.push({ date, event, price, change, ppsf, source });
+    }
+    return rows;
 }
 
 // =========================================================
@@ -103,12 +113,73 @@ async function extractPageData(page, originalUrl) {
             agentDetails: "", soldPrice: "", canonicalUrl: "", description: "",
             pricePerSqft: "", beds: "", baths: "", sqft: "", lotSize: "",
             listedForSale: "", soldOn: "", mls: "", propertyType: "", yearBuilt: "",
-            hoa: "", priceHistoryText: "", pageText: ""
+            hoa: "", priceHistoryText: "", pageText: "", embeddedHistory: []
         };
 
         const fmtType = (raw) => !raw ? "" : String(raw).replace(/_/g, ' ')
             .replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
         const money = (n) => (typeof n === 'number') ? '$' + n.toLocaleString('en-US') : (n || '');
+
+        // Turns the page into clean, readable text: headings as "## ...", list items as "- ...",
+        // table rows as "a | b | c", one block per line, junk (nav/footer/buttons/scripts) removed.
+        const formatPageText = () => {
+            const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','NAV','FOOTER','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG']);
+            const INLINE = new Set(['A','SPAN','B','STRONG','EM','I','U','SMALL','LABEL','SUP','SUB','ABBR','TIME','MARK','CODE','FONT']);
+            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const lines = [];
+            let buf = '';
+            const flush = (prefix = '') => {
+                const t = clean(buf);
+                buf = '';
+                if (t) lines.push(prefix + t);
+            };
+            const walk = (node) => {
+                if (node.nodeType === 3) { buf += ' ' + node.nodeValue; return; }
+                if (node.nodeType !== 1) return;
+                const tag = node.tagName.toUpperCase();
+                if (SKIP.has(tag) || node.hidden || node.getAttribute('aria-hidden') === 'true') return;
+                if (/display\s*:\s*none/i.test(node.getAttribute('style') || '')) return;
+
+                if (/^H[1-6]$/.test(tag)) {
+                    flush();
+                    const t = clean(node.textContent);
+                    if (t) { lines.push(''); lines.push('## ' + t); }
+                    return;
+                }
+                if (tag === 'TR') {
+                    flush();
+                    const cells = Array.from(node.children)
+                        .filter(c => /^(TD|TH)$/i.test(c.tagName))
+                        .map(c => clean(c.textContent)).filter(Boolean);
+                    if (cells.length) lines.push(cells.join(' | '));
+                    return;
+                }
+                if (tag === 'BR') { flush(); return; }
+                if (tag === 'LI') {
+                    flush();
+                    for (const c of node.childNodes) walk(c);
+                    flush('- ');
+                    return;
+                }
+                const inline = INLINE.has(tag);
+                if (!inline) flush();
+                for (const c of node.childNodes) walk(c);
+                if (!inline) flush();
+            };
+            walk(document.body);
+            flush();
+
+            // tidy: drop consecutive duplicate lines and collapse blank runs
+            const res = [];
+            for (const l of lines) {
+                const prev = res[res.length - 1];
+                if (l === '' && (prev === '' || prev === undefined)) continue;
+                if (l !== '' && l === prev) continue;
+                res.push(l);
+            }
+            const head = [clean(document.title), location.href, '', '----------------------------------------', ''];
+            return head.concat(res).join('\n').trim();
+        };
 
         out.canonicalUrl = document.querySelector('meta[property="og:url"]')?.content || "";
 
@@ -153,15 +224,21 @@ async function extractPageData(page, originalUrl) {
             else if (p.resoFacts?.hoaFeeTotal) out.hoa = p.resoFacts.hoaFeeTotal;
             else out.hoa = "No / None listed";
 
-            // Price history straight from the embedded data (no scrolling / extra requests)
-            if (Array.isArray(p.priceHistory) && p.priceHistory.length) {
-                out.priceHistoryText = p.priceHistory
-                    .map(h => [h.date, h.event, money(h.price)].filter(Boolean).join(' | ')).join('\n');
-                for (const h of p.priceHistory) {
-                    const ev = String(h.event || '').toLowerCase();
-                    if (ev.includes('listed for sale') && !out.listedForSale) out.listedForSale = `${h.date} (${money(h.price)})`;
-                    if (ev.includes('sold') && !out.soldOn) out.soldOn = h.date || "";
-                }
+            // Price history from the embedded data (no scrolling / extra requests)
+            if (Array.isArray(p.priceHistory)) {
+                const fmtDate = (d) => {
+                    if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth() + 1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
+                    const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+                    return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
+                };
+                out.embeddedHistory = p.priceHistory.map(h => ({
+                    date: fmtDate(h.date),
+                    event: h.event || '',
+                    price: money(h.price),
+                    change: (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? `${(h.priceChangeRate * 100).toFixed(1)}%` : '',
+                    ppsf: h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '',
+                    source: h.source ? `Source: ${h.source}` : ''
+                }));
             }
         } else {
             // ---- Rental building page (fallback, like the working script)
@@ -177,17 +254,47 @@ async function extractPageData(page, originalUrl) {
         }
 
         out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
-        try { out.pageText = document.body.innerText || ""; } catch (e) {}
+        try { out.pageText = formatPageText(); } catch (e) { out.pageText = document.body.innerText || ""; }
         return out;
     });
 
     if (!data.canonicalUrl) data.canonicalUrl = originalUrl;
 
-    if (PRICE_HISTORY_DOM && !data.priceHistoryText) {
-        const h = await historyFromDOM(page);
-        data.priceHistoryText = h.text;
-        if (h.listed && !data.listedForSale) data.listedForSale = h.listed;
-        if (h.sold && !data.soldOn) data.soldOn = h.sold;
+    // ---- Price history: table in the page + embedded data; keep whichever has more rows
+    let domRows = [];
+    try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
+    const embRows = data.embeddedHistory || [];
+
+    if (!domRows.length && !embRows.length) {
+        // Nothing yet: give the table a moment to render (no scrolling, no extra navigation)
+        await page.waitForSelector('tr[label]', { timeout: 3000 }).catch(() => {});
+        try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
+        if (!domRows.length && PRICE_HISTORY_DOM) {
+            // Last resort (riskier): scroll the section into view to trigger lazy rendering
+            try {
+                await page.evaluate(() => {
+                    const h = Array.from(document.querySelectorAll('h2,h3'))
+                        .find(x => (x.textContent || '').toLowerCase().includes('price history'));
+                    if (h) h.scrollIntoView({ block: 'center' });
+                });
+                await delay(2000);
+                domRows = await page.evaluate(parseHistoryRowsInPage);
+            } catch (e) {}
+        }
+    }
+
+    const rows = domRows.length >= embRows.length ? domRows : embRows;
+    delete data.embeddedHistory;
+    if (rows.length) {
+        data.priceHistoryText = rows.map(r => {
+            const priceTxt = r.price + (r.change ? ` (${r.change})` : '');
+            return [r.date, r.event, priceTxt, r.ppsf, r.source].filter(Boolean).join(' | ');
+        }).join('\n');
+        for (const r of rows) {
+            const ev = String(r.event || '').toLowerCase();
+            if (ev.includes('listed for sale') && !data.listedForSale) data.listedForSale = `${r.date} (${r.price})`;
+            if (ev.includes('sold') && !data.soldOn) data.soldOn = r.date;
+        }
     }
 
     // Facts & Features (best-effort, from the HTML already loaded)

@@ -11,10 +11,10 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const MAX_URLS_PER_RUN = 30;          // URLs attempted per process invocation
-const FLUSH_EVERY = 5;                // save to Sheets every N rows
+const MAX_URLS_PER_RUN = 30;            // URLs attempted per process invocation
+const FLUSH_EVERY = 5;                  // save to Sheets every N rows
 const REQUIRED_COLS = 34;
-const MAX_CONSECUTIVE_BLOCK_STREAKS = 3;  // 3 consecutive URL-blocks → exit for GH new batch
+const MAX_CONSECUTIVE_BLOCK_STREAKS = 3; // 3 consecutive URL-blocks → exit for GH new batch
 const MAX_CONSECUTIVE_ERRORS = 5;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
@@ -105,6 +105,31 @@ async function saveWithRetry(sheet, retries = 3) {
 }
 
 // =========================================================
+// SAFE CELL ACCESS (avoids "Value has been changed" throw)
+// =========================================================
+function safeValue(sheet, row, col) {
+    try {
+        const v = sheet.getCell(row, col).value;
+        return v === null || v === undefined ? "" : String(v);
+    } catch (e) {
+        return "";
+    }
+}
+
+// =========================================================
+// FIND START ROW
+// =========================================================
+function findStartRow(sheet) {
+    for (let r = 1; r < sheet.rowCount; r++) {
+        const url = safeValue(sheet, r, 0);
+        if (!url || !url.includes("zillow.com")) continue;
+        if (isDoneStatus(safeValue(sheet, r, 17))) continue;
+        return r;
+    }
+    return -1;
+}
+
+// =========================================================
 // PRICE HISTORY PARSER
 // =========================================================
 function parseHistoryRowsInPage() {
@@ -171,7 +196,7 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        // Zoom + wait
+        // Zoom 5% so whole page fits
         try {
             await page.evaluate((z) => {
                 document.documentElement.style.zoom = String(z);
@@ -188,6 +213,7 @@ async function scrapeOneUrl(browser, url) {
 
         await delay(ZOOM_WAIT);
 
+        // Click "Table view" if present
         await page.evaluate(() => {
             const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
                 .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
@@ -432,24 +458,11 @@ async function scrapeOneUrl(browser, url) {
 }
 
 // =========================================================
-// FIND START ROW
-// =========================================================
-function findStartRow(sheet) {
-    for (let r = 1; r < sheet.rowCount; r++) {
-        const url = sheet.getCell(r, 0).value;
-        if (!url || !String(url).includes("zillow.com")) continue;
-        if (isDoneStatus(sheet.getCell(r, 17).value || "")) continue;
-        return r;
-    }
-    return -1;
-}
-
-// =========================================================
 // MAIN
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Stealth Scraper V16 — 1 URL per browser, 3 blocks → handoff`);
+    console.log(`🚀 Stealth Scraper V17 — 1 URL/browser, safe cell reads, 3 blocks → handoff`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -477,10 +490,17 @@ async function runScraper() {
             const cell = sheet.getCell(0, col);
             if (OVERWRITE_HEADERS || !cell.value) { cell.value = title; try { cell.textFormat = { bold: true }; } catch (e) {} dirty++; }
         });
-        if (dirty) { await saveWithRetry(sheet); dirty = 0; }
+        if (dirty) { await saveWithRetry(sheet); dirty = 0; await sheet.loadCells(); }
     } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
 
-    const flush = async () => { if (dirty > 0) { await saveWithRetry(sheet); dirty = 0; } };
+    const flush = async () => {
+        if (dirty > 0) {
+            await saveWithRetry(sheet);
+            dirty = 0;
+            // Re-sync so future getCell().value reads work
+            try { await sheet.loadCells(); } catch (e) { console.warn(`⚠️ loadCells failed: ${e.message}`); }
+        }
+    };
 
     let attempted = 0, success = 0, blockStreak = 0, errorStreak = 0;
     let totalBlocks = 0, totalErrors = 0, totalSkipped = 0;
@@ -498,7 +518,7 @@ async function runScraper() {
         const rowIndex = findStartRow(sheet);
         if (rowIndex === -1) { console.log("🎉 All rows ✅ Done."); break; }
 
-        const url = String(sheet.getCell(rowIndex, 0).value);
+        const url = String(safeValue(sheet, rowIndex, 0));
         const actualRow = rowIndex + 1;
         console.log(`\n🕵️ Row ${actualRow} (attempt ${attempted + 1}/${MAX_URLS_PER_RUN}): ${url}`);
 
@@ -578,7 +598,6 @@ async function runScraper() {
             totalErrors++;
             attempted++;
         } finally {
-            // ==== ALWAYS CLOSE BROWSER (1 URL = 1 browser lifecycle) ====
             console.log(`🔒 Closing browser (1 URL done)`);
             await purgeAndClose(browser);
         }

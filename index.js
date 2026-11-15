@@ -108,21 +108,22 @@ function parseHistoryRowsInPage() {
 // EXTRACT
 // =========================================================
 async function extractPageData(page, originalUrl) {
-    // ---------- 1) SCROLL to trigger lazy mount of the price-history table ----------
-    await page.evaluate(() => {
-        const heading = Array.from(document.querySelectorAll('h2,h3'))
-            .find(h => /^\s*price\s+history\s*$/i.test((h.textContent || '').trim()));
-        if (heading) {
-            heading.scrollIntoView({ block: 'center', behavior: 'instant' });
-            return;
+    // ---------- 1) SCROLL: full page top→bottom so lazy sections mount ----------
+    await page.evaluate(async () => {
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const step = 400;
+        const max = document.body.scrollHeight;
+        for (let y = 0; y <= max; y += step) {
+            window.scrollTo(0, y);
+            await sleep(80);
         }
-        const el = Array.from(document.querySelectorAll('div, section'))
-            .find(d => /price\s+history/i.test((d.textContent || '').slice(0, 200)));
-        if (el) el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        window.scrollTo(0, document.body.scrollHeight);
     }).catch(() => {});
-    await delay(1200);
 
-    // ---------- 2) Click "Table view" toggle if present ----------
+    // ---------- 2) WAIT 2 SECONDS ----------
+    await delay(2000);
+
+    // ---------- 3) CLICK "Table view" toggle if present ----------
     await page.evaluate(() => {
         const els = Array.from(document.querySelectorAll('button, [role="button"], a'));
         const tv = els.find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
@@ -130,7 +131,7 @@ async function extractPageData(page, originalUrl) {
     }).catch(() => {});
     await delay(600);
 
-    // ---------- 3) Wait for the actual header row (not just any table) ----------
+    // ---------- 4) Wait for the history table header row (up to 10s) ----------
     await page.waitForFunction(
         () => {
             const tables = document.querySelectorAll('table');
@@ -142,7 +143,7 @@ async function extractPageData(page, originalUrl) {
         { timeout: 10000 }
     ).catch(() => {});
 
-    // ---------- 4) Extract all DOM fields ----------
+    // ---------- 5) Extract all DOM fields ----------
     const data = await page.evaluate(() => {
         const out = {
             price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -182,7 +183,7 @@ async function extractPageData(page, originalUrl) {
             }
         }
 
-        // BEDS / BATHS / SQFT from fact containers
+        // BEDS / BATHS / SQFT
         const factMap = {};
         $$('[data-testid="bed-bath-sqft-fact-container"]').forEach(c => {
             const sp = c.querySelectorAll('span');
@@ -196,7 +197,7 @@ async function extractPageData(page, originalUrl) {
         if (factMap.baths) out.baths = num(factMap.baths) || factMap.baths;
         if (factMap.sqft)  out.sqft  = num(factMap.sqft)  || factMap.sqft;
 
-        // "At a glance facts" grid — property type, year, lot, $/sqft
+        // "At a glance facts" grid
         const glance = $('[aria-label="At a glance facts"]');
         if (glance) {
             for (const item of glance.querySelectorAll('[role="listitem"]')) {
@@ -214,7 +215,7 @@ async function extractPageData(page, originalUrl) {
             }
         }
 
-        // Facts & features list fallback
+        // Facts & features fallback
         const fm = {};
         $$('[data-testid="fact-category"] li').forEach(li => {
             const t = clean(li.textContent);
@@ -233,11 +234,11 @@ async function extractPageData(page, originalUrl) {
             else out.hoa = 'No / None listed';
         }
 
-        // DESCRIPTION (visible only; JSON-LD fallback handled later)
+        // DESCRIPTION (visible)
         const descEl = $('[data-testid="description"] article') || $('[data-testid="description"]');
         if (descEl) out.description = clean(descEl.textContent) || 'N/A';
 
-        // Agent + MLS from attribution block (only on for-sale pages)
+        // Agent + MLS (for-sale pages only)
         const la = $('[data-testid="attribution-LISTING_AGENT"]');
         if (la) {
             const parts = Array.from(la.querySelectorAll('span')).map(x => clean(x.textContent).replace(/,$/, '')).filter(Boolean);
@@ -320,18 +321,18 @@ async function extractPageData(page, originalUrl) {
 
     if (!data.canonicalUrl) data.canonicalUrl = originalUrl;
 
-    // ---------- 5) Parse history table ----------
+    // ---------- 6) Parse history table (now mounted after scroll+wait) ----------
     let domRows = [];
     try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
 
     if (!domRows.length) {
-        // last-chance scroll + wait
+        // one more scroll + short wait as last resort
         await page.evaluate(() => {
             const h = Array.from(document.querySelectorAll('h2,h3'))
                 .find(x => /price\s*history/i.test(x.textContent || ''));
             if (h) h.scrollIntoView({ block: 'center' });
         }).catch(() => {});
-        await delay(1500);
+        await delay(2000);
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
     }
 
@@ -355,7 +356,7 @@ async function extractPageData(page, originalUrl) {
         }
     }
 
-    // ---------- 6) Description fallback from JSON-LD (only for description) ----------
+    // ---------- 7) Description JSON-LD fallback (only for description) ----------
     if (!data.description || data.description === 'N/A') {
         try {
             const ldDesc = await page.evaluate(() => {
@@ -376,7 +377,7 @@ async function extractPageData(page, originalUrl) {
         }
     }
 
-    // ---------- 7) Facts & Features section text ----------
+    // ---------- 8) Facts & Features section ----------
     data.factsFeaturesText = "";
     try {
         const facts = await page.evaluate(() => {
@@ -404,7 +405,7 @@ async function extractPageData(page, originalUrl) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log("🚀 Starting Stealth Scraper V10 (scroll-triggered history)...");
+    console.log("🚀 Starting Stealth Scraper V11 (scroll → wait 2s → scrape)...");
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -432,7 +433,12 @@ async function runScraper() {
 
     const browser = await puppeteer.launch({
         headless: "new",
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--window-size=1400,900',
+        ],
     });
 
     let scrapeCount = 0, skipped = 0;
@@ -478,6 +484,9 @@ async function runScraper() {
 
             const page = await browser.newPage();
             try {
+                // Realistic viewport so lazy sections mount like a real user
+                await page.setViewport({ width: 1400, height: 900 });
+
                 await page.setRequestInterception(true);
                 page.on('request', (req) => {
                     if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort().catch(() => {});
@@ -487,12 +496,12 @@ async function runScraper() {
                 await delay(jitter(500, 1000));
                 await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-                // wait for property content to hydrate
+                // wait for basic property content to hydrate
                 await page.waitForSelector(
                     '[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"]',
                     { timeout: 12000 }
                 ).catch(() => {});
-                await delay(1200);
+                await delay(1000);
 
                 const title = await page.title();
                 const hasNext = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
@@ -543,8 +552,9 @@ async function runScraper() {
                         scrapeCount++;
                         blockStreak = 0;
                         consecutiveErrors = 0;
-                        console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES' : 'NO'} | 🏷️ MLS: ${d.mls || '—'} | 📅 Listed: ${d.listedForSale || '—'} | 📅 Sold: ${d.soldOn || '—'}`);
-                        console.log(`   📄 pageText: ${d.pageText ? d.pageText.length : 0} chars | desc: ${d.description ? d.description.length : 0} chars | type: ${d.propertyType || '—'} | built: ${d.yearBuilt || '—'} | lot: ${d.lotSize || '—'}`);
+                        console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES (' + d.priceHistoryText.split('\n').length + ' rows)' : 'NO'} | 🏷️ MLS: ${d.mls || '—'}`);
+                        console.log(`   📅 Listed: ${d.listedForSale || '—'} | 📅 Sold: ${d.soldOn || '—'} | 🛏️ ${d.beds || '—'} bd / ${d.baths || '—'} ba / ${d.sqft || '—'} sqft | 📐 ${d.lotSize || '—'} | 🏗️ ${d.yearBuilt || '—'} | 🏠 ${d.propertyType || '—'}`);
+                        console.log(`   📄 pageText: ${d.pageText ? d.pageText.length : 0} chars | desc: ${d.description ? d.description.length : 0} chars`);
                     }
                 }
             } catch (e) {

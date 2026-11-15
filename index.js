@@ -9,19 +9,27 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const MAX_ROWS_PER_RUN = 30;
-const FLUSH_BATCH_SIZE = 8;
+const MAX_ROWS_PER_BATCH = 30;
+const FLUSH_BATCH_SIZE = 10;
 const REQUIRED_COLS = 34;
 const MAX_BLOCK_STREAK = 3;
-const MAX_CONSECUTIVE_ERRORS = 3;
-const MAX_RUNTIME_MS = 12 * 60 * 1000;
+const MAX_CONSECUTIVE_ERRORS = 5;
+const MAX_RUNTIME_MS = 60 * 60 * 1000; // 60 min hard cap; unlimited batches otherwise
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
+const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
-// Zoom level — 0.25 = 25%. Lower = more page visible = more lazy sections mount.
-const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.25');
+// ---- ZOOM: 5% of normal page ----
+const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.05'); // 0.05 = 5%
 const VIEWPORT_W = 1400;
 const VIEWPORT_H = 900;
+
+// Speed knobs
+const NAV_DELAY_MIN = 400;
+const NAV_DELAY_MAX = 900;
+const HYDRATE_TIMEOUT = 8000;
+const HYDRATE_SETTLE = 500;
+const ZOOM_WAIT = 1500;
 
 const HEADER_START_COL = 9; // column J
 const HEADERS = [
@@ -113,9 +121,7 @@ function parseHistoryRowsInPage() {
 // EXTRACT
 // =========================================================
 async function extractPageData(page, originalUrl) {
-    // ---------- 1) ZOOM OUT so the whole page fits the viewport ----------
-    // The whole document is now inside the viewport → IntersectionObserver fires
-    // for every lazy section (price history, facts, etc.) on load — no scroll.
+    // ---- 1) Zoom to 5% so the whole page fits ----
     try {
         await page.evaluate((z) => {
             document.documentElement.style.zoom = String(z);
@@ -123,30 +129,26 @@ async function extractPageData(page, originalUrl) {
         }, PAGE_ZOOM);
     } catch (e) {}
 
-    // Also scale the render via CDP (belt + braces for older Chromium)
     try {
         const client = await page.createCDPSession();
         await client.send('Emulation.setDeviceMetricsOverride', {
-            width: VIEWPORT_W,
-            height: VIEWPORT_H,
-            deviceScaleFactor: 1,
-            mobile: false,
-            scale: PAGE_ZOOM,
+            width: VIEWPORT_W, height: VIEWPORT_H,
+            deviceScaleFactor: 1, mobile: false, scale: PAGE_ZOOM,
         });
     } catch (e) {}
 
-    // ---------- 2) WAIT 2 SECONDS for lazy sections to mount ----------
-    await delay(2000);
+    // ---- 2) Wait for lazy sections ----
+    await delay(ZOOM_WAIT);
 
-    // ---------- 3) Click "Table view" toggle if present ----------
+    // ---- 3) Click "Table view" ----
     await page.evaluate(() => {
         const els = Array.from(document.querySelectorAll('button, [role="button"], a'));
         const tv = els.find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
         if (tv) tv.click();
     }).catch(() => {});
-    await delay(800);
+    await delay(400);
 
-    // ---------- 4) Wait for the history table header row (10s max) ----------
+    // ---- 4) Wait for history header ----
     await page.waitForFunction(
         () => {
             const tables = document.querySelectorAll('table');
@@ -155,10 +157,10 @@ async function extractPageData(page, originalUrl) {
                 return hs.includes('date') && hs.includes('event') && hs.includes('price');
             });
         },
-        { timeout: 10000 }
+        { timeout: 6000 }
     ).catch(() => {});
 
-    // ---------- 5) Extract all DOM fields ----------
+    // ---- 5) Extract ----
     const data = await page.evaluate(() => {
         const out = {
             price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -169,24 +171,22 @@ async function extractPageData(page, originalUrl) {
         };
         const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
         const num = (s) => {
-            const m = String(s || '').replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+            const str = String(s || '').replace(/,/g, '').trim();
+            if (/^[-—–]+$/.test(str)) return '';
+            const m = str.match(/-?\d+(\.\d+)?/);
             return m ? Number(m[0]) : '';
         };
         const $ = (sel, root = document) => root.querySelector(sel);
         const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
         out.canonicalUrl = $('meta[property="og:url"]')?.content || $('link[rel="canonical"]')?.href || location.href;
-
-        // PRICE
         out.price = num(clean($('[data-testid="price"]')?.textContent));
 
-        // SOLD PRICE from status pill
         const pill = clean($('[data-testid="gallery-status-pill"]')?.textContent);
         const soldMatch = pill.match(/Sold\s+for\s+\$([\d,]+)/i);
         if (soldMatch) out.soldPrice = Number(soldMatch[1].replace(/,/g, ''));
         else if (/sold/i.test(pill) && out.price) out.soldPrice = out.price;
 
-        // ADDRESS from H1
         const h1 = clean($('h1')?.textContent).replace(/\u00A0/g, ' ');
         if (h1) {
             const parts = h1.split(',').map(clean);
@@ -198,7 +198,6 @@ async function extractPageData(page, originalUrl) {
             }
         }
 
-        // BEDS / BATHS / SQFT from fact containers
         const factMap = {};
         $$('[data-testid="bed-bath-sqft-fact-container"]').forEach(c => {
             const sp = c.querySelectorAll('span');
@@ -212,7 +211,6 @@ async function extractPageData(page, originalUrl) {
         if (factMap.baths) out.baths = num(factMap.baths) || factMap.baths;
         if (factMap.sqft)  out.sqft  = num(factMap.sqft)  || factMap.sqft;
 
-        // "At a glance facts" grid — type, year, lot, $/sqft
         const glance = $('[aria-label="At a glance facts"]');
         if (glance) {
             for (const item of glance.querySelectorAll('[role="listitem"]')) {
@@ -230,7 +228,6 @@ async function extractPageData(page, originalUrl) {
             }
         }
 
-        // Facts & features fallback
         const fm = {};
         $$('[data-testid="fact-category"] li').forEach(li => {
             const t = clean(li.textContent);
@@ -249,24 +246,32 @@ async function extractPageData(page, originalUrl) {
             else out.hoa = 'No / None listed';
         }
 
-        // DESCRIPTION (visible)
         const descEl = $('[data-testid="description"] article') || $('[data-testid="description"]');
         if (descEl) out.description = clean(descEl.textContent) || 'N/A';
 
-        // Agent + MLS (for-sale pages only)
         const la = $('[data-testid="attribution-LISTING_AGENT"]');
         if (la) {
             const parts = Array.from(la.querySelectorAll('span')).map(x => clean(x.textContent).replace(/,$/, '')).filter(Boolean);
             const broker = clean($('[data-testid="attribution-BROKER"]')?.textContent);
             out.agentDetails = [parts[0], broker, parts[1]].filter(Boolean).join(' | ');
         }
+
+        // MLS — hardened regex
         const mlsInfo = clean($('[role="contentinfo"][aria-label="MLS information"]')?.textContent);
         if (mlsInfo) {
-            const m = mlsInfo.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
-            if (m) out.mls = `${m[2]} - ${clean(m[1])}`;
+            let m = mlsInfo.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
+            if (m) {
+                out.mls = `${m[2].replace(/Originating.*$/i, '').trim()} - ${clean(m[1])}`;
+            } else {
+                m = mlsInfo.match(/MLS#?:\s*([A-Za-z0-9-]+)\s*(?:Originating\s+MLS:?\s*([A-Za-z .]+))?/i);
+                if (m) {
+                    const id = m[1].replace(/Originating.*$/i, '').trim();
+                    const src = m[2] ? clean(m[2]) : 'Hive MLS';
+                    out.mls = `${id} - ${src}`;
+                }
+            }
         }
 
-        // PAGE TEXT formatter
         const formatPageText = () => {
             const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG','VIDEO','AUDIO','CANVAS','OBJECT','EMBED']);
             const SKIP_IDS = new Set(['pfs-nav-wrapper','page-header-container','sw-container','skip-topnav-target','__PFS_TOPNAV_DATA__','hdp-srp-split-page-frame-nav-styles','with-product-nav-styles','hdp-srp-split-no-search-layout-styles']);
@@ -336,18 +341,17 @@ async function extractPageData(page, originalUrl) {
 
     if (!data.canonicalUrl) data.canonicalUrl = originalUrl;
 
-    // ---------- 6) Parse history table (should be mounted after zoom+wait) ----------
+    // ---- 6) History ----
     let domRows = [];
     try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
 
     if (!domRows.length) {
-        // last-chance: scroll heading into view at the zoomed-out scale, wait 2s, retry
         await page.evaluate(() => {
             const h = Array.from(document.querySelectorAll('h2,h3'))
                 .find(x => /price\s*history/i.test(x.textContent || ''));
             if (h) h.scrollIntoView({ block: 'center' });
         }).catch(() => {});
-        await delay(2000);
+        await delay(1200);
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
     }
 
@@ -366,12 +370,16 @@ async function extractPageData(page, originalUrl) {
         if (!data.mls) {
             for (const r of domRows) {
                 const m = String(r.source || '').match(/Source:\s*(.+?MLS)\s*#\s*([A-Za-z0-9-]+)/i);
-                if (m) { data.mls = `${m[2]} - ${m[1].trim()}`; break; }
+                if (m) {
+                    const id = m[2].replace(/Originating.*$/i, '').trim();
+                    data.mls = `${id} - ${m[1].trim()}`;
+                    break;
+                }
             }
         }
     }
 
-    // ---------- 7) Description JSON-LD fallback (only for description) ----------
+    // ---- 7) Description JSON-LD fallback ----
     if (!data.description || data.description === 'N/A') {
         try {
             const ldDesc = await page.evaluate(() => {
@@ -387,12 +395,10 @@ async function extractPageData(page, originalUrl) {
             });
             if (ldDesc) data.description = ldDesc;
             else data.description = 'N/A';
-        } catch (e) {
-            data.description = data.description || 'N/A';
-        }
+        } catch (e) { data.description = data.description || 'N/A'; }
     }
 
-    // ---------- 8) Facts & Features section ----------
+    // ---- 8) Facts & Features ----
     data.factsFeaturesText = "";
     try {
         const facts = await page.evaluate(() => {
@@ -412,23 +418,21 @@ async function extractPageData(page, originalUrl) {
         data.factsFeaturesText = facts || "";
     } catch (e) {}
 
-    // ---------- 9) Debug if history is still empty ----------
-    if (!data.priceHistoryText) {
-        try {
-            const debug = await page.evaluate(() => ({
-                hasPriceHistoryHeading: Array.from(document.querySelectorAll('h2,h3'))
-                    .some(h => /price history/i.test(h.textContent || '')),
-                dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
-                tableCount: document.querySelectorAll('table').length,
-                currentZoom: document.documentElement.style.zoom || '(none)',
-                bodyHeight: document.body.scrollHeight,
-                viewportHeight: window.innerHeight,
-            }));
-            console.log(`   🔍 History debug: ${JSON.stringify(debug)}`);
-        } catch (e) {}
-    }
-
     return data;
+}
+
+// =========================================================
+// ROW SCAN — find first non-done row
+// =========================================================
+function findStartRow(sheet) {
+    for (let r = 1; r < sheet.rowCount; r++) {
+        const url = sheet.getCell(r, 0).value;
+        if (!url || !String(url).includes("zillow.com")) continue;
+        const status = sheet.getCell(r, 17).value || "";
+        if (isDoneStatus(status)) continue;
+        return r;
+    }
+    return -1;
 }
 
 // =========================================================
@@ -436,7 +440,7 @@ async function extractPageData(page, originalUrl) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Starting Stealth Scraper V12 (zoom ${PAGE_ZOOM * 100}% → wait 2s → scrape)...`);
+    console.log(`🚀 Stealth Scraper V14 — zoom ${PAGE_ZOOM * 100}%, resume-from-failure, unlimited batches`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -462,23 +466,8 @@ async function runScraper() {
 
     const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
 
-    const browser = await puppeteer.launch({
-        headless: "new",
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-blink-features=AutomationControlled',
-            `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
-        ],
-    });
-
-    let scrapeCount = 0, skipped = 0;
-    let rowsRemaining = false, ipFlagged = false, stoppedEarly = false;
-    let blockStreak = 0, consecutiveErrors = 0, dirty = 0;
-
-    const flush = async () => { if (dirty > 0) { await saveWithRetry(sheet); dirty = 0; } };
-
     // ---- Headings
+    let dirty = 0;
     try {
         HEADERS.forEach((title, i) => {
             const col = HEADER_START_COL + i;
@@ -490,32 +479,80 @@ async function runScraper() {
                 dirty++;
             }
         });
-        if (dirty) console.log(`🏷️ Added/updated ${dirty} heading cells`);
+        if (dirty) {
+            console.log(`🏷️ Added/updated ${dirty} heading cells`);
+            await saveWithRetry(sheet);
+            dirty = 0;
+        }
     } catch (e) {
         console.warn(`⚠️ Could not write headings: ${e.message}`);
     }
 
-    try {
-        for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
-            if (Date.now() - startTime > MAX_RUNTIME_MS) { rowsRemaining = true; break; }
-            if (scrapeCount >= MAX_ROWS_PER_RUN) { rowsRemaining = true; break; }
+    let browser = await puppeteer.launch({
+        headless: "new",
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
+        ],
+    });
+
+    const flush = async () => { if (dirty > 0) { await saveWithRetry(sheet); dirty = 0; } };
+
+    let totalSuccess = 0;
+    let totalSkipped = 0;
+    let totalErrors = 0;
+    let totalBlocks = 0;
+    let batchNum = 0;
+
+    // ===== Outer loop: unlimited batches until nothing left =====
+    while (Date.now() - startTime < MAX_RUNTIME_MS) {
+        batchNum++;
+        console.log(`\n📦 ─── Batch #${batchNum} ───`);
+
+        const startRow = findStartRow(sheet);
+        if (startRow === -1) {
+            console.log("🎉 All rows are ✅ Done — nothing left to process.");
+            break;
+        }
+        console.log(`▶️ Batch #${batchNum} starting at sheet row ${startRow + 1}`);
+
+        let attempted = 0;
+        let success = 0;
+        let blockedInBatch = 0;
+        let errorsInBatch = 0;
+        let blockStreak = 0;
+        let consecutiveErrors = 0;
+        let needRelaunch = false;
+
+        for (let rowIndex = startRow; rowIndex < sheet.rowCount; rowIndex++) {
+            if (Date.now() - startTime > MAX_RUNTIME_MS) {
+                console.log(`⏰ Runtime cap hit — stopping.`);
+                break;
+            }
+            if (attempted >= MAX_ROWS_PER_BATCH) {
+                console.log(`📦 Batch #${batchNum} reached ${MAX_ROWS_PER_BATCH} attempts.`);
+                break;
+            }
             if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                console.log(`🛑 ${MAX_CONSECUTIVE_ERRORS} errors in a row — ending batch.`);
-                stoppedEarly = true; break;
+                console.log(`🛑 ${MAX_CONSECUTIVE_ERRORS} consecutive errors — ending batch.`);
+                break;
             }
 
             const url = sheet.getCell(rowIndex, 0).value;
             const status = sheet.getCell(rowIndex, 17).value || "";
 
-            if (!url || !String(url).includes("zillow.com") || String(status).includes("✅")) continue;
-            if (isSkipStatus(status) && !RETRY_BLOCKED) { skipped++; continue; }
+            if (!url || !String(url).includes("zillow.com")) continue;
+            if (isDoneStatus(status)) continue;
+            if (isSkipStatus(status) && !RETRY_BLOCKED) { totalSkipped++; continue; }
 
             const actualRow = rowIndex + 1;
+            attempted++;
             console.log(`🕵️ Row ${actualRow}: ${url}`);
 
             const page = await browser.newPage();
             try {
-                // Realistic viewport — lazy sections only mount above a certain size
                 await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H });
 
                 await page.setRequestInterception(true);
@@ -524,28 +561,30 @@ async function runScraper() {
                     else req.continue().catch(() => {});
                 });
 
-                await delay(jitter(500, 1000));
+                await delay(jitter(NAV_DELAY_MIN, NAV_DELAY_MAX));
                 await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-                // wait for basic property content to hydrate
                 await page.waitForSelector(
                     '[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"]',
-                    { timeout: 12000 }
+                    { timeout: HYDRATE_TIMEOUT }
                 ).catch(() => {});
-                await delay(1000);
+                await delay(HYDRATE_SETTLE);
 
                 const title = await page.title();
                 const hasNext = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
                 const blockedTitle = /pardon our interruption|robot check|access denied/i.test(title);
 
                 if (blockedTitle || !hasNext) {
-                    console.log(`❌ BLOCKED on Row ${actualRow} — marked and skipped`);
+                    console.log(`❌ BLOCKED on Row ${actualRow} — will retry next batch`);
                     setCell(rowIndex, 17, blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)");
                     dirty++;
                     blockStreak++;
+                    blockedInBatch++;
+                    totalBlocks++;
                     if (blockStreak >= MAX_BLOCK_STREAK) {
-                        console.log(`🛑 ${blockStreak} blocks in a row — ending batch; next batch continues with the next rows.`);
-                        ipFlagged = true; rowsRemaining = true;
+                        console.log(`🛑 ${blockStreak} blocks in a row — relaunching browser for next batch.`);
+                        needRelaunch = true;
+                        break;
                     }
                 } else {
                     const d = await extractPageData(page, String(url));
@@ -553,6 +592,8 @@ async function runScraper() {
                         setCell(rowIndex, 17, "⚠️ Empty parse (skipped)");
                         dirty++;
                         consecutiveErrors++;
+                        errorsInBatch++;
+                        totalErrors++;
                     } else {
                         setCell(rowIndex, 9,  d.price);
                         setCell(rowIndex, 10, d.street);
@@ -580,38 +621,64 @@ async function runScraper() {
                         setCell(rowIndex, 32, d.factsFeaturesText);
                         setCell(rowIndex, 33, d.pageText);
                         dirty++;
-                        scrapeCount++;
+                        success++;
+                        totalSuccess++;
                         blockStreak = 0;
                         consecutiveErrors = 0;
                         console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES (' + d.priceHistoryText.split('\n').length + ' rows)' : 'NO'} | 🏷️ MLS: ${d.mls || '—'}`);
-                        console.log(`   📅 Listed: ${d.listedForSale || '—'} | 📅 Sold: ${d.soldOn || '—'} | 🛏️ ${d.beds || '—'} bd / ${d.baths || '—'} ba / ${d.sqft || '—'} sqft | 📐 ${d.lotSize || '—'} | 🏗️ ${d.yearBuilt || '—'} | 🏠 ${d.propertyType || '—'}`);
-                        console.log(`   📄 pageText: ${d.pageText ? d.pageText.length : 0} chars | desc: ${d.description ? d.description.length : 0} chars`);
                     }
                 }
             } catch (e) {
                 console.error(`🛑 Error on Row ${actualRow}: ${e.message}`);
-                setCell(rowIndex, 17, "🛑 Error: " + e.message);
+                setCell(rowIndex, 17, "🛑 Error: " + e.message.slice(0, 100));
                 dirty++;
                 consecutiveErrors++;
+                errorsInBatch++;
+                totalErrors++;
             } finally {
                 await page.close().catch(() => {});
             }
 
-            if (ipFlagged) break;
             if (dirty >= FLUSH_BATCH_SIZE) {
-                console.log(`📦 Saving batch to Google Sheets...`);
+                console.log(`💾 Saving ${dirty} dirty rows...`);
                 await flush();
             }
         }
-    } finally {
-        try { await flush(); } catch (e) { console.error(`⚠️ Final save failed: ${e.message}`); }
-        await browser.close().catch(() => {});
+
+        try { await flush(); } catch (e) { console.error(`⚠️ Batch flush failed: ${e.message}`); }
+
+        console.log(`📊 Batch #${batchNum} summary: ${success}✅ / ${blockedInBatch}🚫 / ${errorsInBatch}🛑 / ${attempted} attempted`);
+
+        if (needRelaunch) {
+            console.log("🔄 Relaunching browser (new session) for next batch...");
+            try { await browser.close(); } catch (e) {}
+            browser = await puppeteer.launch({
+                headless: "new",
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
+                ],
+            });
+        }
     }
 
-    if (skipped) console.log(`⏭️ Skipped ${skipped} rows already marked blocked/error`);
-    const hasMore = rowsRemaining || stoppedEarly;
-    setOutput(hasMore, ipFlagged && scrapeCount === 0);
-    console.log(hasMore ? "🔄 More rows remain — next batch will be triggered." : "🎉 Sheet fully processed!");
+    try { await browser.close(); } catch (e) {}
+
+    console.log(`\n📊 ─── FINAL TOTALS ───`);
+    console.log(`✅ Success: ${totalSuccess}`);
+    console.log(`⏭️ Skipped (already blocked): ${totalSkipped}`);
+    console.log(`🚫 Blocked: ${totalBlocks}`);
+    console.log(`🛑 Errors: ${totalErrors}`);
+    console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
+
+    const remaining = findStartRow(sheet);
+    const hasMore = remaining !== -1;
+    setOutput(hasMore, totalBlocks > 0 && totalSuccess === 0);
+    console.log(hasMore
+        ? `🔄 More rows remain — next run will resume at row ${remaining + 1}.`
+        : "🎉 Sheet fully processed!");
 }
 
 runScraper().catch(err => {

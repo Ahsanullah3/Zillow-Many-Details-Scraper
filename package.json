@@ -1,7 +1,7 @@
 {
-  "name": "zillow-full-scraper",
-  "version": "12.0.0",
-  "description": "Stealth Zillow scraper — headless real Chrome, no proxy, full detail + page text to Google Sheets",
+  "name": "zillow-edge-scraper",
+  "version": "15.0.0",
+  "description": "Zillow scraper using latest Microsoft Edge",
   "main": "scraper.js",
   "scripts": {
     "start": "node scraper.js"
@@ -9,9 +9,8 @@
   "dependencies": {
     "google-auth-library": "^9.15.0",
     "google-spreadsheet": "^4.1.4",
-    "puppeteer": "^23.10.4",
+    "puppeteer-core": "^23.10.4",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-anonymize-ua": "^2.4.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "engines": {

@@ -34,12 +34,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+          # cache: 'npm'  <-- removed (no package-lock.json in repo)
 
       - name: Install Dependencies
         run: npm install
         env:
-          PUPPETEER_SKIP_DOWNLOAD: 'true'   # we use real Chrome from setup-chrome
+          PUPPETEER_SKIP_DOWNLOAD: 'true'
 
       - name: Setup Google Chrome Build Engine
         id: setup-chrome

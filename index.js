@@ -7,22 +7,17 @@ const fs = require('fs');
 puppeteer.use(StealthPlugin());
 
 // =========================================================
-// CONFIG  (same lightweight approach as the working script)
+// CONFIG
 // =========================================================
-const MAX_ROWS_PER_RUN = 30;        // successful rows per batch (blocked rows don't count)
+const MAX_ROWS_PER_RUN = 30;
 const FLUSH_BATCH_SIZE = 8;
 const REQUIRED_COLS = 34;
-const MAX_BLOCK_STREAK = 3;         // blocks in a row => end batch, next batch continues with NEXT rows
+const MAX_BLOCK_STREAK = 3;
 const MAX_CONSECUTIVE_ERRORS = 3;
 const MAX_RUNTIME_MS = 12 * 60 * 1000;
-// Price history is read from the table already in the page and from the embedded data.
-// PRICE_HISTORY_DOM=1 additionally scrolls to the section if neither has it (riskier, OFF by default).
-const PRICE_HISTORY_DOM = process.env.PRICE_HISTORY_DOM === '1';
-// Rows marked blocked/error are skipped in every batch. RETRY_BLOCKED=1 retries them once.
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
 
-// Heading row (row 1). Column A (URL) and any columns before J are yours and are left alone.
 const HEADER_START_COL = 9; // column J
 const HEADERS = [
     "Price", "Street", "City", "State", "Zipcode", "Final URL", "Agent Details", "Sold Price",
@@ -30,7 +25,6 @@ const HEADERS = [
     "Listed For Sale", "Sold On", "MLS", "Property Type", "Year Built", "HOA",
     "Price History", "Facts & Features", "Page Text (Formatted)"
 ];
-// Existing headings are kept; set OVERWRITE_HEADERS=1 to replace them with the names above.
 const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
@@ -44,7 +38,7 @@ const safeCell = (v) => {
 };
 
 // =========================================================
-// GOOGLE API RETRY (500 error fix)
+// GOOGLE API RETRY
 // =========================================================
 async function saveWithRetry(sheet, retries = 3) {
     for (let i = 0; i < retries; i++) {
@@ -63,16 +57,11 @@ async function saveWithRetry(sheet, retries = 3) {
 }
 
 // =========================================================
-// PRICE HISTORY: parse the Zillow "Table.Root" (c11n) price-history table
-// Anchors on the component markup itself, not on the heading:
-//   table[data-c11n-component="Table.Root"] (.c11n_table__root) with Date | Event | Price headers
-//   row cells: [data-testid="date-info"], 2nd Table.Cell (event), [data-testid="price-money-cell"],
-//              [data-testid="percent-display"], next colspan row = "Source: ..."
+// PRICE HISTORY PARSER (in-page)
 // =========================================================
 function parseHistoryRowsInPage() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-    // Find the table by its column headers so other tables (taxes, etc.) are ignored
     const isHistoryTable = (t) => {
         const hs = Array.from(t.querySelectorAll('th')).map(x => clean(x.textContent).toLowerCase());
         return hs.includes('date') && hs.includes('event') && hs.includes('price');
@@ -87,7 +76,7 @@ function parseHistoryRowsInPage() {
     for (const tr of table.querySelectorAll('tr')) {
         const dateEl = tr.querySelector('[data-testid="date-info"]');
         const label = tr.getAttribute('label') || '';
-        if (!dateEl && !label) continue;               // header row / source row
+        if (!dateEl && !label) continue;
 
         const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
         const cells = tr.querySelectorAll('td[data-c11n-component="Table.Cell"], td');
@@ -105,11 +94,10 @@ function parseHistoryRowsInPage() {
         }
         if (!price && lm) price = clean(lm[3]).replace(/\s*\(.*\)\s*$/, '');
 
-        // Following colspan row: "Source: Hive MLS #123   Report a problem"
         let source = '';
         const next = tr.nextElementSibling;
         if (next && !next.querySelector('[data-testid="date-info"]') && !next.hasAttribute('label')) {
-            source = clean(next.textContent).replace(/\s*Report\s+a problem\s*$/i, '');
+            source = clean(next.textContent).replace(/\s*Report\s+a\s+problem\s*$/i, '');
         }
         rows.push({ date, event, price, change, ppsf, source });
     }
@@ -117,72 +105,198 @@ function parseHistoryRowsInPage() {
 }
 
 // =========================================================
-// EXTRACT (reads embedded Next.js state, like the working script)
+// EXTRACT
 // =========================================================
 async function extractPageData(page, originalUrl) {
+    // ---------- 1) SCROLL to trigger lazy mount of the price-history table ----------
+    await page.evaluate(() => {
+        const heading = Array.from(document.querySelectorAll('h2,h3'))
+            .find(h => /^\s*price\s+history\s*$/i.test((h.textContent || '').trim()));
+        if (heading) {
+            heading.scrollIntoView({ block: 'center', behavior: 'instant' });
+            return;
+        }
+        const el = Array.from(document.querySelectorAll('div, section'))
+            .find(d => /price\s+history/i.test((d.textContent || '').slice(0, 200)));
+        if (el) el.scrollIntoView({ block: 'center', behavior: 'instant' });
+    }).catch(() => {});
+    await delay(1200);
+
+    // ---------- 2) Click "Table view" toggle if present ----------
+    await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll('button, [role="button"], a'));
+        const tv = els.find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
+        if (tv) tv.click();
+    }).catch(() => {});
+    await delay(600);
+
+    // ---------- 3) Wait for the actual header row (not just any table) ----------
+    await page.waitForFunction(
+        () => {
+            const tables = document.querySelectorAll('table');
+            return Array.from(tables).some(t => {
+                const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
+                return hs.includes('date') && hs.includes('event') && hs.includes('price');
+            });
+        },
+        { timeout: 10000 }
+    ).catch(() => {});
+
+    // ---------- 4) Extract all DOM fields ----------
     const data = await page.evaluate(() => {
         const out = {
             price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
             agentDetails: "", soldPrice: "", canonicalUrl: "", description: "",
             pricePerSqft: "", beds: "", baths: "", sqft: "", lotSize: "",
             listedForSale: "", soldOn: "", mls: "", propertyType: "", yearBuilt: "",
-            hoa: "", priceHistoryText: "", pageText: "", embeddedHistory: []
+            hoa: "", priceHistoryText: "", pageText: ""
         };
+        const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+        const num = (s) => {
+            const m = String(s || '').replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+            return m ? Number(m[0]) : '';
+        };
+        const $ = (sel, root = document) => root.querySelector(sel);
+        const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-        const fmtType = (raw) => !raw ? "" : String(raw).replace(/_/g, ' ')
-            .replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
-        const money = (n) => (typeof n === 'number') ? '$' + n.toLocaleString('en-US') : (n || '');
+        out.canonicalUrl = $('meta[property="og:url"]')?.content || $('link[rel="canonical"]')?.href || location.href;
 
-        // Turns the page into clean, readable text: headings as "## ...", list items as "- ...",
-        // table rows as "a | b | c", one block per line, junk (nav/footer/buttons/scripts) removed.
+        // PRICE
+        out.price = num(clean($('[data-testid="price"]')?.textContent));
+
+        // SOLD PRICE from status pill
+        const pill = clean($('[data-testid="gallery-status-pill"]')?.textContent);
+        const soldMatch = pill.match(/Sold\s+for\s+\$([\d,]+)/i);
+        if (soldMatch) out.soldPrice = Number(soldMatch[1].replace(/,/g, ''));
+        else if (/sold/i.test(pill) && out.price) out.soldPrice = out.price;
+
+        // ADDRESS from H1
+        const h1 = clean($('h1')?.textContent).replace(/\u00A0/g, ' ');
+        if (h1) {
+            const parts = h1.split(',').map(clean);
+            if (parts.length >= 3) {
+                out.street = parts[0];
+                out.city = parts[1];
+                const stZip = parts[2].match(/^([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+                if (stZip) { out.state = stZip[1]; out.zipcode = stZip[2]; }
+            }
+        }
+
+        // BEDS / BATHS / SQFT from fact containers
+        const factMap = {};
+        $$('[data-testid="bed-bath-sqft-fact-container"]').forEach(c => {
+            const sp = c.querySelectorAll('span');
+            if (sp.length >= 2) {
+                const val = clean(sp[0].textContent);
+                const key = clean(sp[1].textContent).toLowerCase();
+                if (key) factMap[key] = val;
+            }
+        });
+        if (factMap.beds)  out.beds  = num(factMap.beds)  || factMap.beds;
+        if (factMap.baths) out.baths = num(factMap.baths) || factMap.baths;
+        if (factMap.sqft)  out.sqft  = num(factMap.sqft)  || factMap.sqft;
+
+        // "At a glance facts" grid — property type, year, lot, $/sqft
+        const glance = $('[aria-label="At a glance facts"]');
+        if (glance) {
+            for (const item of glance.querySelectorAll('[role="listitem"]')) {
+                const t = clean(item.textContent);
+                if (!t) continue;
+                const lotM = t.match(/^([\d.,]+)\s*Acres?\s+Lot$/i);
+                if (lotM && !out.lotSize) out.lotSize = `${lotM[1]} Acres`;
+                const yearM = t.match(/^Built\s+in\s+(\d{4})$/i);
+                if (yearM && !out.yearBuilt) out.yearBuilt = yearM[1];
+                if (!out.propertyType && /^(Single Family|Multi Family|Condo|Townhouse|Manufactured|Mobile|Apartment|Land|Vacant)/i.test(t)) {
+                    out.propertyType = t;
+                }
+                const ppsfM = t.match(/\$([\d,]+)\s*\/\s*sqft/i);
+                if (ppsfM && !out.pricePerSqft) out.pricePerSqft = Number(ppsfM[1].replace(/,/g, ''));
+            }
+        }
+
+        // Facts & features list fallback
+        const fm = {};
+        $$('[data-testid="fact-category"] li').forEach(li => {
+            const t = clean(li.textContent);
+            const i = t.indexOf(': ');
+            if (i > 0) {
+                const k = t.slice(0, i);
+                if (!(k in fm)) fm[k] = t.slice(i + 2);
+            }
+        });
+        if (!out.propertyType && (fm['Home type'] || fm['Property subtype'])) out.propertyType = fm['Home type'] || fm['Property subtype'];
+        if (!out.yearBuilt && fm['Year built']) out.yearBuilt = fm['Year built'];
+        if (!out.lotSize && fm['Size']) out.lotSize = fm['Size'];
+        if (!out.pricePerSqft && fm['Price per square foot']) out.pricePerSqft = num(fm['Price per square foot']);
+        if (!out.hoa) {
+            if (fm['HOA fee'] || fm['HOA fee frequency']) out.hoa = fm['HOA fee'] || fm['HOA fee frequency'];
+            else out.hoa = 'No / None listed';
+        }
+
+        // DESCRIPTION (visible only; JSON-LD fallback handled later)
+        const descEl = $('[data-testid="description"] article') || $('[data-testid="description"]');
+        if (descEl) out.description = clean(descEl.textContent) || 'N/A';
+
+        // Agent + MLS from attribution block (only on for-sale pages)
+        const la = $('[data-testid="attribution-LISTING_AGENT"]');
+        if (la) {
+            const parts = Array.from(la.querySelectorAll('span')).map(x => clean(x.textContent).replace(/,$/, '')).filter(Boolean);
+            const broker = clean($('[data-testid="attribution-BROKER"]')?.textContent);
+            out.agentDetails = [parts[0], broker, parts[1]].filter(Boolean).join(' | ');
+        }
+        const mlsInfo = clean($('[role="contentinfo"][aria-label="MLS information"]')?.textContent);
+        if (mlsInfo) {
+            const m = mlsInfo.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
+            if (m) out.mls = `${m[2]} - ${clean(m[1])}`;
+        }
+
+        // PAGE TEXT formatter
         const formatPageText = () => {
-            const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','NAV','FOOTER','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG']);
-            const INLINE = new Set(['A','SPAN','B','STRONG','EM','I','U','SMALL','LABEL','SUP','SUB','ABBR','TIME','MARK','CODE','FONT']);
-            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG','VIDEO','AUDIO','CANVAS','OBJECT','EMBED']);
+            const SKIP_IDS = new Set(['pfs-nav-wrapper','page-header-container','sw-container','skip-topnav-target','__PFS_TOPNAV_DATA__','hdp-srp-split-page-frame-nav-styles','with-product-nav-styles','hdp-srp-split-no-search-layout-styles']);
+            const SKIP_TESTIDS = new Set(['topnav','back-link','desktop-action-bar','close-lightbox-button']);
+            const INLINE = new Set(['A','SPAN','B','STRONG','EM','I','U','SMALL','LABEL','SUP','SUB','ABBR','TIME','MARK','CODE','FONT','BR']);
             const lines = [];
             let buf = '';
-            const flush = (prefix = '') => {
-                const t = clean(buf);
-                buf = '';
-                if (t) lines.push(prefix + t);
+            const flush = (prefix = '') => { const t = clean(buf); buf = ''; if (t) lines.push(prefix + t); };
+            const isChrome = (n) => {
+                if (n.id && SKIP_IDS.has(n.id)) return true;
+                const tid = n.getAttribute && n.getAttribute('data-testid');
+                if (tid && SKIP_TESTIDS.has(tid)) return true;
+                const cls = (n.className && String(n.className)) || '';
+                return /\b(topnav|znav|pfs-nav|hdp-action-bar|layout-action-bar|with-product-nav__product-nav)\b/i.test(cls);
             };
-            const walk = (node) => {
-                if (node.nodeType === 3) { buf += ' ' + node.nodeValue; return; }
-                if (node.nodeType !== 1) return;
-                const tag = node.tagName.toUpperCase();
-                if (SKIP.has(tag) || node.hidden || node.getAttribute('aria-hidden') === 'true') return;
-                if (/display\s*:\s*none/i.test(node.getAttribute('style') || '')) return;
-
+            const walk = (n) => {
+                if (n.nodeType === 3) { buf += ' ' + n.nodeValue; return; }
+                if (n.nodeType !== 1) return;
+                const tag = n.tagName.toUpperCase();
+                if (SKIP.has(tag)) return;
+                if (n.hidden || n.getAttribute('aria-hidden') === 'true') return;
+                if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(n.getAttribute('style') || '')) return;
+                if (isChrome(n)) return;
                 if (/^H[1-6]$/.test(tag)) {
                     flush();
-                    const t = clean(node.textContent);
+                    const t = clean(n.textContent);
                     if (t) { lines.push(''); lines.push('## ' + t); }
                     return;
                 }
                 if (tag === 'TR') {
                     flush();
-                    const cells = Array.from(node.children)
+                    const cells = Array.from(n.children)
                         .filter(c => /^(TD|TH)$/i.test(c.tagName))
                         .map(c => clean(c.textContent)).filter(Boolean);
                     if (cells.length) lines.push(cells.join(' | '));
                     return;
                 }
                 if (tag === 'BR') { flush(); return; }
-                if (tag === 'LI') {
-                    flush();
-                    for (const c of node.childNodes) walk(c);
-                    flush('- ');
-                    return;
-                }
+                if (tag === 'LI') { flush(); for (const c of n.childNodes) walk(c); flush('- '); return; }
                 const inline = INLINE.has(tag);
                 if (!inline) flush();
-                for (const c of node.childNodes) walk(c);
+                for (const c of n.childNodes) walk(c);
                 if (!inline) flush();
             };
             walk(document.body);
             flush();
-
-            // tidy: drop consecutive duplicate lines and collapse blank runs
             const res = [];
             for (const l of lines) {
                 const prev = res[res.length - 1];
@@ -191,225 +305,95 @@ async function extractPageData(page, originalUrl) {
                 res.push(l);
             }
             const head = [clean(document.title), location.href, '', '----------------------------------------', ''];
-            return head.concat(res).join('\n').trim();
+            const formatted = head.concat(res).join('\n').trim();
+            if (formatted.length < 800) {
+                const fb = (document.body.innerText || '').replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+                return head.concat(['', fb]).join('\n').trim();
+            }
+            return formatted;
         };
+        try { out.pageText = formatPageText(); } catch (e) { out.pageText = document.body.innerText || ''; }
 
-        out.canonicalUrl = document.querySelector('meta[property="og:url"]')?.content || "";
-
-        let json = null;
-        try { json = JSON.parse(document.querySelector('script#__NEXT_DATA__')?.innerText || 'null'); } catch (e) {}
-        const cp = json?.props?.pageProps?.componentProps;
-
-        // ---- Home detail page
-        let p = null;
-        try {
-            const raw = cp?.gdpClientCache;
-            if (raw) {
-                const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-                const key = Object.keys(parsed).find(k => parsed[k]?.property);
-                p = key ? parsed[key].property : null;
-            }
-        } catch (e) {}
-
-        if (p) {
-            out.price = p.price || "";
-            out.street = p.address?.streetAddress || p.streetAddress || "";
-            out.city = p.address?.city || p.city || "";
-            out.state = p.address?.state || p.state || "";
-            out.zipcode = p.address?.zipcode || p.zipcode || "";
-            out.beds = p.bedrooms ?? p.resoFacts?.bedrooms ?? "";
-            out.baths = p.bathrooms ?? p.resoFacts?.bathrooms ?? "";
-            out.sqft = p.livingAreaValue ?? p.livingArea ?? p.resoFacts?.livingArea ?? "";
-            if (p.resoFacts?.pricePerSquareFoot) out.pricePerSqft = p.resoFacts.pricePerSquareFoot;
-            else if (out.price && out.sqft && Number(out.sqft) > 0) out.pricePerSqft = Math.round(Number(out.price) / Number(out.sqft));
-            const lotStr = p.resoFacts?.lotSize || "";
-            const lotVal = p.lotAreaValue || "";
-            out.lotSize = lotStr || (lotVal ? `${lotVal} ${p.lotAreaUnits || ''}`.trim() : "");
-            if (p.attributionInfo) {
-                out.agentDetails = [p.attributionInfo.agentName, p.attributionInfo.brokerName, p.attributionInfo.agentPhoneNumber].filter(Boolean).join(" | ");
-            }
-            out.soldPrice = p.lastSoldPrice || "";
-            out.description = p.description || p.homeDescription || "N/A";
-            out.mls = [p.attributionInfo?.mlsId, p.attributionInfo?.mlsName].filter(Boolean).join(" - ");
-            out.propertyType = fmtType(p.homeType || p.resoFacts?.homeType || p.propertyTypeDimension);
-            out.yearBuilt = p.yearBuilt || p.resoFacts?.yearBuilt || "";
-            if (p.monthlyHoaFee) out.hoa = `$${p.monthlyHoaFee}/mo`;
-            else if (p.resoFacts?.hoaFeeTotal) out.hoa = p.resoFacts.hoaFeeTotal;
-            else out.hoa = "No / None listed";
-
-            // Price history from the embedded data (no scrolling / extra requests)
-            if (Array.isArray(p.priceHistory)) {
-                const fmtDate = (d) => {
-                    if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth() + 1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
-                    const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
-                    return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
-                };
-                out.embeddedHistory = p.priceHistory.map(h => ({
-                    date: fmtDate(h.date),
-                    event: h.event || '',
-                    price: money(h.price),
-                    change: (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? `${(h.priceChangeRate * 100).toFixed(1)}%` : '',
-                    ppsf: h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '',
-                    source: h.source ? `Source: ${h.source}` : ''
-                }));
-            }
-        } else {
-            // ---- Rental building page (fallback, like the working script)
-            const b = cp?.initialReduxState?.gdp?.building;
-            if (b) {
-                out.street = b.streetAddress || "";
-                out.city = b.city || "";
-                out.state = b.state || "";
-                out.zipcode = b.zipcode || "";
-                out.description = b.description || "";
-                out.propertyType = "Apartment";
-            }
-        }
-
-        // ---- DOM / JSON-LD fallback for SOLD & off-market pages (fills only EMPTY fields)
-        // These pages ("not-for-sale" template) render the data in the page itself, so we
-        // read the JSON-LD block, the data-testid blocks and the "Facts & features" lists.
-        try {
-            const clean = (x) => (x || '').replace(/\s+/g, ' ').trim();
-            const num = (x) => { const m = String(x || '').replace(/,/g, '').match(/[\d.]+/); return m ? Number(m[0]) : ''; };
-            const empty = (v) => v === '' || v === null || v === undefined || v === 'N/A';
-            const $ = (sel) => document.querySelector(sel);
-
-            let ld = null;
-            for (const sc of document.querySelectorAll('script[type="application/ld+json"]')) {
-                try {
-                    const j = JSON.parse(sc.textContent);
-                    if ([].concat(j['@type'] || []).includes('RealEstateListing') || j.offers) { ld = j; break; }
-                } catch (e) {}
-            }
-            const item = ld?.offers?.itemOffered;
-            const addr = item?.address;
-
-            if (empty(out.street))  out.street  = addr?.streetAddress || '';
-            if (empty(out.city))    out.city    = addr?.addressLocality || '';
-            if (empty(out.state))   out.state   = addr?.addressRegion || '';
-            if (empty(out.zipcode)) out.zipcode = addr?.postalCode || '';
-            if (empty(out.street)) {
-                // last resort: <h1> "17 Running Branch Drive, Havelock, NC 28532"
-                const parts = clean($('h1')?.textContent).split(',').map(clean);
-                if (parts.length >= 3) {
-                    out.street = parts[0]; out.city = parts[1];
-                    const m = parts[2].match(/^([A-Z]{2})\s+(\d{5})/);
-                    if (m) { out.state = m[1]; out.zipcode = m[2]; }
-                }
-            }
-            if (empty(out.canonicalUrl)) out.canonicalUrl = ld?.url || '';
-
-            // price (on sold pages this is the sold price) + sold price from the status pill
-            if (empty(out.price)) out.price = ld?.offers?.price || num($('[data-testid="price"]')?.textContent);
-            if (empty(out.soldPrice)) {
-                const m = clean($('[data-testid="gallery-status-pill"]')?.textContent).match(/Sold for \$([\d,]+)/i);
-                if (m) out.soldPrice = Number(m[1].replace(/,/g, ''));
-            }
-
-            // beds / baths / sqft from the headline facts ("3 beds", "2 baths", "2,081 sqft")
-            const head = {};
-            document.querySelectorAll('[data-testid="bed-bath-sqft-fact-container"]').forEach((c) => {
-                const sp = c.querySelectorAll('span');
-                if (sp.length >= 2) head[clean(sp[1].textContent).toLowerCase()] = clean(sp[0].textContent);
-            });
-            if (empty(out.beds))  out.beds  = num(head.beds)  || item?.numberOfBedrooms || '';
-            if (empty(out.baths)) out.baths = num(head.baths) || '';
-            if (empty(out.sqft))  out.sqft  = num(head.sqft)  || item?.floorSize?.value || '';
-
-            // description
-            if (empty(out.description)) {
-                out.description = clean(ld?.description) ? String(ld.description).replace(/\r/g, '').trim()
-                    : clean($('[data-testid="description"] article')?.textContent) || 'N/A';
-            }
-
-            // "Facts & features" list items -> { label: value }
-            const fm = {};
-            document.querySelectorAll('[data-testid="fact-category"] li').forEach((li) => {
-                const t = clean(li.textContent), i = t.indexOf(': ');
-                if (i > 0) { const k = t.slice(0, i); if (!(k in fm)) fm[k] = t.slice(i + 2); }
-            });
-            if (empty(out.propertyType)) out.propertyType = fmtType(fm['Home type'] || fm['Property subtype'] || '');
-            if (empty(out.yearBuilt))    out.yearBuilt    = fm['Year built'] || '';
-            if (empty(out.lotSize))      out.lotSize      = fm['Size'] || '';
-            if (empty(out.pricePerSqft)) {
-                out.pricePerSqft = num(fm['Price per square foot']) ||
-                    ((out.price && out.sqft && Number(out.sqft) > 0) ? Math.round(Number(out.price) / Number(out.sqft)) : '');
-            }
-            if (empty(out.hoa)) {
-                if (fm['HOA fee'] || fm['HOA fee frequency']) out.hoa = fm['HOA fee'] || fm['HOA fee frequency'];
-                else if (/^no$/i.test(fm['Has HOA'] || '')) out.hoa = 'No / None listed';
-            }
-
-            // listing agent / broker / MLS
-            if (empty(out.agentDetails)) {
-                const la = $('[data-testid="attribution-LISTING_AGENT"]');
-                const parts = la ? Array.from(la.querySelectorAll('span')).map((x) => clean(x.textContent).replace(/,$/, '')).filter(Boolean) : [];
-                const broker = clean($('[data-testid="attribution-BROKER"]')?.textContent);
-                out.agentDetails = [parts[0], broker, parts[1]].filter(Boolean).join(' | ');
-            }
-            if (empty(out.mls)) {
-                const info = clean($('[role="contentinfo"][aria-label="MLS information"]')?.textContent);
-                const m = info.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
-                if (m) out.mls = `${m[2]} - ${clean(m[1])}`;
-            }
-        } catch (e) {}
-
-        out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
-        try { out.pageText = formatPageText(); } catch (e) { out.pageText = document.body.innerText || ""; }
+        out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
         return out;
     });
 
     if (!data.canonicalUrl) data.canonicalUrl = originalUrl;
 
-    // ---- Price history: table in the page + embedded data; keep whichever has more rows
+    // ---------- 5) Parse history table ----------
     let domRows = [];
     try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
-    const embRows = data.embeddedHistory || [];
 
-    if (!domRows.length && !embRows.length) {
-        // Nothing yet: give the table a moment to render (no scrolling, no extra navigation)
-        await page.waitForSelector('[data-testid="date-info"]', { timeout: 3000 }).catch(() => {});
+    if (!domRows.length) {
+        // last-chance scroll + wait
+        await page.evaluate(() => {
+            const h = Array.from(document.querySelectorAll('h2,h3'))
+                .find(x => /price\s*history/i.test(x.textContent || ''));
+            if (h) h.scrollIntoView({ block: 'center' });
+        }).catch(() => {});
+        await delay(1500);
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
-        if (!domRows.length && PRICE_HISTORY_DOM) {
-            // Last resort (riskier): scroll the section into view to trigger lazy rendering
-            try {
-                await page.evaluate(() => {
-                    const h = Array.from(document.querySelectorAll('h2,h3'))
-                        .find(x => (x.textContent || '').toLowerCase().includes('price history'));
-                    if (h) h.scrollIntoView({ block: 'center' });
-                });
-                await delay(2000);
-                domRows = await page.evaluate(parseHistoryRowsInPage);
-            } catch (e) {}
-        }
     }
 
-    const rows = domRows.length >= embRows.length ? domRows : embRows;
-    delete data.embeddedHistory;
-    if (rows.length) {
-        data.priceHistoryText = rows.map(r => {
+    if (domRows.length) {
+        data.priceHistoryText = domRows.map(r => {
             const priceTxt = r.price + (r.change ? ` (${r.change})` : '');
             return [r.date, r.event, priceTxt, r.ppsf, r.source].filter(Boolean).join(' | ');
         }).join('\n');
-        for (const r of rows) {
+
+        for (const r of domRows) {
             const ev = String(r.event || '').toLowerCase();
             if (ev.includes('listed for sale') && !data.listedForSale) data.listedForSale = `${r.date} (${r.price})`;
             if (ev.includes('sold') && !data.soldOn) data.soldOn = r.date;
         }
+
+        if (!data.mls) {
+            for (const r of domRows) {
+                const m = String(r.source || '').match(/Source:\s*(.+?MLS)\s*#\s*([A-Za-z0-9-]+)/i);
+                if (m) { data.mls = `${m[2]} - ${m[1].trim()}`; break; }
+            }
+        }
     }
 
-    // Facts & Features (best-effort, from the HTML already loaded)
+    // ---------- 6) Description fallback from JSON-LD (only for description) ----------
+    if (!data.description || data.description === 'N/A') {
+        try {
+            const ldDesc = await page.evaluate(() => {
+                for (const sc of document.querySelectorAll('script[type="application/ld+json"]')) {
+                    try {
+                        const j = JSON.parse(sc.textContent);
+                        if (j && j.description && String(j.description).length > 40) {
+                            return String(j.description).replace(/\r/g, '').trim();
+                        }
+                    } catch (e) {}
+                }
+                return "";
+            });
+            if (ldDesc) data.description = ldDesc;
+            else data.description = 'N/A';
+        } catch (e) {
+            data.description = data.description || 'N/A';
+        }
+    }
+
+    // ---------- 7) Facts & Features section text ----------
     data.factsFeaturesText = "";
     try {
-        const html = await page.content();
-        const m = html.match(/Facts &amp; Features([\s\S]{0,50000})/i);
-        if (m) {
-            data.factsFeaturesText = m[1]
-                .replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '')
-                .replace(/<[^>]+>/g, '\n').split('\n')
-                .map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n').slice(0, 45000);
-        }
+        const facts = await page.evaluate(() => {
+            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const h = Array.from(document.querySelectorAll('h2,h3'))
+                .find(x => /^Facts\s*&\s*[Ff]eatures$/i.test(clean(x.textContent)));
+            if (!h || !h.parentElement) return "";
+            const lines = [];
+            h.parentElement.querySelectorAll('*').forEach(el => {
+                if (/^(P|LI|SPAN|DIV|H[1-6])$/i.test(el.tagName)) {
+                    const t = clean(el.textContent);
+                    if (t && t.length < 300 && !lines.includes(t)) lines.push(t);
+                }
+            });
+            return lines.join('\n');
+        });
+        data.factsFeaturesText = facts || "";
     } catch (e) {}
 
     return data;
@@ -420,7 +404,7 @@ async function extractPageData(page, originalUrl) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log("🚀 Starting Stealth Scraper V7 (lightweight, skip-blocked)...");
+    console.log("🚀 Starting Stealth Scraper V10 (scroll-triggered history)...");
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -446,7 +430,6 @@ async function runScraper() {
 
     const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
 
-    // Same launch as the working script: bundled Chrome, headless new, minimal args
     const browser = await puppeteer.launch({
         headless: "new",
         args: ['--no-sandbox', '--disable-setuid-sandbox'],
@@ -458,7 +441,7 @@ async function runScraper() {
 
     const flush = async () => { if (dirty > 0) { await saveWithRetry(sheet); dirty = 0; } };
 
-    // ---- Heading row: fill in column titles (J..AH) if they're missing
+    // ---- Headings
     try {
         HEADERS.forEach((title, i) => {
             const col = HEADER_START_COL + i;
@@ -493,7 +476,6 @@ async function runScraper() {
             const actualRow = rowIndex + 1;
             console.log(`🕵️ Row ${actualRow}: ${url}`);
 
-            // New page per row, request blocking, short delay — same as the working script
             const page = await browser.newPage();
             try {
                 await page.setRequestInterception(true);
@@ -504,6 +486,13 @@ async function runScraper() {
 
                 await delay(jitter(500, 1000));
                 await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+                // wait for property content to hydrate
+                await page.waitForSelector(
+                    '[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"]',
+                    { timeout: 12000 }
+                ).catch(() => {});
+                await delay(1200);
 
                 const title = await page.title();
                 const hasNext = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
@@ -554,7 +543,8 @@ async function runScraper() {
                         scrapeCount++;
                         blockStreak = 0;
                         consecutiveErrors = 0;
-                        console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES' : 'NO'}`);
+                        console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES' : 'NO'} | 🏷️ MLS: ${d.mls || '—'} | 📅 Listed: ${d.listedForSale || '—'} | 📅 Sold: ${d.soldOn || '—'}`);
+                        console.log(`   📄 pageText: ${d.pageText ? d.pageText.length : 0} chars | desc: ${d.description ? d.description.length : 0} chars | type: ${d.propertyType || '—'} | built: ${d.yearBuilt || '—'} | lot: ${d.lotSize || '—'}`);
                     }
                 }
             } catch (e) {
@@ -579,7 +569,6 @@ async function runScraper() {
 
     if (skipped) console.log(`⏭️ Skipped ${skipped} rows already marked blocked/error`);
     const hasMore = rowsRemaining || stoppedEarly;
-    // blocked=true only when this batch made zero progress because of blocks
     setOutput(hasMore, ipFlagged && scrapeCount === 0);
     console.log(hasMore ? "🔄 More rows remain — next batch will be triggered." : "🎉 Sheet fully processed!");
 }

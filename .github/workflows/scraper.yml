@@ -1,6 +1,6 @@
-name: 🚀 Stealth Scraper V6
+name: 🚀 Edge Scraper V6
 
-run-name: 🚀 Stealth Scraper V6 (Batch ${{ inputs.batch || '1' }})
+run-name: 🚀 Edge Scraper V6 (Batch ${{ inputs.batch || '1' }})
 
 on:
   schedule:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       batch:
-        description: "The current batch number"
+        description: "Batch number"
         required: false
         default: "1"
         type: string
@@ -24,46 +24,41 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js Environment
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          # cache: 'npm'  <-- removed (no package-lock.json in repo)
 
       - name: Install Dependencies
         run: npm install
-        env:
-          PUPPETEER_SKIP_DOWNLOAD: 'true'
 
-      - name: Setup Google Chrome Build Engine
-        id: setup-chrome
-        uses: browser-actions/setup-chrome@v1
+      - name: Setup Edge (Latest Dev)
+        id: setup-edge
+        uses: browser-actions/setup-edge@v1
         with:
-          chrome-version: stable
+          edge-version: 'dev'
 
-      - name: Run Scraper Engine
+      - name: Run Scraper
         id: scraper_task
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-edge.outputs.edge-path }}
         run: npm start
 
-      - name: Evaluate Self-Reboot Sequence
+      - name: Evaluate Self-Reboot
         if: steps.scraper_task.outputs.has_more == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           CURRENT_BATCH="${{ inputs.batch || '1' }}"
           NEXT_BATCH=$((CURRENT_BATCH + 1))
-
-          echo "Batch $CURRENT_BATCH threshold hit. Rotating environment and triggering Batch $NEXT_BATCH..."
-
+          echo "Batch $CURRENT_BATCH → Batch $NEXT_BATCH"
           gh workflow run scraper.yml --ref main -f batch=$NEXT_BATCH
           sleep 5

@@ -2,93 +2,56 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const AnonymizeUA = require('puppeteer-extra-plugin-anonymize-ua');
 const fs = require('fs');
 
-// =========================================================
-// STEALTH PLUGINS
-// =========================================================
 puppeteer.use(StealthPlugin());
-puppeteer.use(AnonymizeUA({
-    stripHeadless: true,
-    makeWindows: true,
-}));
 
 // =========================================================
 // CONFIG
 // =========================================================
-const MAX_ROWS_PER_RUN = 5;         // no proxy → keep low to protect the IP
-const FLUSH_BATCH_SIZE = 3;         // smaller batches → more frequent saves
-const REQUIRED_COLS = 34;           // A..AH
+const MAX_RUNTIME_MS = 330000;
+const SLEEP_BETWEEN_ROWS_MS = 800;
+const MAX_ROWS_PER_RUN = 30;
+const REQUIRED_COLS = 34;
+const FLUSH_BATCH_SIZE = 8;
 
 // =========================================================
 // HELPERS
 // =========================================================
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
 const jitter = (min, max) => min + Math.floor(Math.random() * (max - min));
 
 const MAX_CELL_LEN = 49000;
-function safeCell(v) {
+const safeCell = (v) => {
     if (v === null || v === undefined) return "";
     const s = String(v);
     return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…[truncated]" : s;
-}
-
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-];
-const pickUA = () => USER_AGENTS[jitter(0, USER_AGENTS.length)];
-
-async function saveWithRetry(sheet, retries = 4) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            await sheet.saveUpdatedCells();
-            return;
-        } catch (error) {
-            if (i === retries - 1) {
-                console.error("❌ Max retries reached. Google API unavailable.");
-                throw error;
-            }
-            const waitTime = (2 ** i) * 1000 + jitter(0, 500);
-            console.log(`⚠️ Google API error. Retry in ${Math.round(waitTime / 1000)}s...`);
-            await delay(waitTime);
-        }
-    }
-}
+};
 
 // =========================================================
-// BROWSER LAUNCH — HEADLESS + REAL CHROME
+// BROWSER LAUNCH (EDGE)
 // =========================================================
 async function launchBrowser() {
-    const args = [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-dev-shm-usage',
-        '--lang=en-US,en',
-        '--window-size=1366,768',
-        // NO --disable-gpu, NO --single-process
-    ];
-
-    const launchOpts = {
-        headless: "new",
-        args,
-        ignoreDefaultArgs: ['--enable-automation'],
-    };
-
-    // Use real Chrome if provided by CI / local env
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-        launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-        console.log(`🌐 Using real Chrome: ${launchOpts.executablePath}`);
-    } else {
-        console.log("🌐 Using Puppeteer-bundled Chromium (set PUPPETEER_EXECUTABLE_PATH for real Chrome)");
+    const edgePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    if (!edgePath) {
+        throw new Error("PUPPETEER_EXECUTABLE_PATH not set. Edge path must be provided.");
     }
+    console.log(`🌐 Using Edge: ${edgePath}`);
 
-    return puppeteer.launch(launchOpts);
+    return puppeteer.launch({
+        headless: "new",
+        executablePath: edgePath,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-dev-shm-usage',
+            '--lang=en-US,en',
+            '--window-size=1366,768',
+        ],
+        ignoreDefaultArgs: ['--enable-automation'],
+    });
 }
 
 // =========================================================
@@ -97,44 +60,22 @@ async function launchBrowser() {
 async function preparePage(browser) {
     const page = await browser.newPage();
 
-    await page.setUserAgent(pickUA());
-    await page.setViewport({
-        width: jitter(1366, 1600),
-        height: jitter(768, 1000),
-        deviceScaleFactor: 1,
-    });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0');
+    await page.setViewport({ width: jitter(1366, 1600), height: jitter(768, 1000) });
 
     await page.setRequestInterception(true);
     page.on('request', (req) => {
-        const t = req.resourceType();
-        if (['image', 'stylesheet', 'font', 'media'].includes(t)) req.abort();
+        if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort();
         else req.continue();
     });
 
-    // JS-level fingerprint patches
     await page.evaluateOnNewDocument(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
         Object.defineProperty(navigator, 'plugins', {
-            get: () => [
-                { name: 'Chrome PDF Plugin' },
-                { name: 'Chrome PDF Viewer' },
-                { name: 'Native Client' },
-            ],
+            get: () => [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }],
         });
         window.chrome = window.chrome || { runtime: {} };
-        const origQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (params) =>
-            params.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : origQuery(params);
-    });
-
-    // CDP-level webdriver patch (belt & suspenders)
-    const client = await page.target().createCDPSession();
-    await client.send('Page.addScriptToEvaluateOnNewDocument', {
-        source: `Object.defineProperty(navigator,'webdriver',{get:()=>undefined});`,
     });
 
     return page;
@@ -146,164 +87,178 @@ async function preparePage(browser) {
 async function humanNavigate(page, url) {
     await delay(jitter(1500, 3500));
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-
-    try {
-        await page.mouse.move(jitter(150, 900), jitter(100, 700), { steps: jitter(5, 15) });
-    } catch (_) {}
-    try {
-        await page.evaluate(() => window.scrollBy(0, 200 + Math.random() * 500));
-    } catch (_) {}
-
+    try { await page.mouse.move(jitter(150, 900), jitter(100, 700), { steps: jitter(5, 15) }); } catch (_) {}
+    try { await page.evaluate(() => window.scrollBy(0, 200 + Math.random() * 500)); } catch (_) {}
     await delay(jitter(1200, 2500));
 }
 
 // =========================================================
-// EXTRACTION (runs inside page context)
+// GRAPHQL PRICE HISTORY
 // =========================================================
-function extractPageData() {
+async function fetchPriceHistory(zpid) {
+    if (!zpid) return { priceHistory: [], taxHistory: [] };
+
+    const query = `
+        query ZestimateDeepDiveQuery($zpid: ID!) {
+            property(zpid: $zpid) {
+                zpid
+                zestimate
+                priceHistory { date price priceChangeRate event source pricePerSquareFoot }
+                taxHistory { time taxPaid taxAssessedValue }
+            }
+        }
+    `;
+
+    try {
+        const res = await fetch("https://www.zillow.com/graphql/", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+                "client-id": "hdp-react-web-client",
+            },
+            body: JSON.stringify({
+                operationName: "ZestimateDeepDiveQuery",
+                variables: { zpid: parseInt(zpid, 10) },
+                query,
+            }),
+        });
+
+        const json = await res.json();
+        if (json?.data?.property) {
+            return {
+                priceHistory: json.data.property.priceHistory || [],
+                taxHistory: json.data.property.taxHistory || [],
+            };
+        }
+    } catch (e) {
+        console.log(`   ⚠️ GraphQL: ${e.message}`);
+    }
+    return { priceHistory: [], taxHistory: [] };
+}
+
+// =========================================================
+// FORMAT HISTORY
+// =========================================================
+function formatPriceHistory(priceHistory) {
+    if (!priceHistory || priceHistory.length === 0) return "";
+    const lines = ["Date | Event | Price | $/sqft | Source"];
+    for (const h of priceHistory) {
+        const date = h.date ? h.date.split("T")[0] : "";
+        const price = h.price ? `$${Number(h.price).toLocaleString()}` : "";
+        const psf = h.pricePerSquareFoot ? `$${h.pricePerSquareFoot}` : "";
+        lines.push(`${date} | ${h.event || ""} | ${price} | ${psf} | ${h.source || ""}`);
+    }
+    return lines.join("\n");
+}
+
+function formatTaxHistory(taxHistory) {
+    if (!taxHistory || taxHistory.length === 0) return "";
+    const lines = ["Year | Tax Paid | Assessed Value"];
+    for (const t of taxHistory) {
+        const year = t.time ? new Date(t.time).getFullYear() : "";
+        const paid = t.taxPaid ? `$${Number(t.taxPaid).toLocaleString()}` : "";
+        const assessed = t.taxAssessedValue ? `$${Number(t.taxAssessedValue).toLocaleString()}` : "";
+        lines.push(`${year} | ${paid} | ${assessed}`);
+    }
+    return lines.join("\n");
+}
+
+// =========================================================
+// EXTRACT PAGE DATA
+// =========================================================
+async function extractPageData(page, originalUrl) {
     const out = {
         price: "", street: "", city: "", state: "", zipcode: "",
         fullAddress: "", agentDetails: "", soldPrice: "",
         canonicalUrl: "", description: "", pricePerSqft: "",
         beds: "", baths: "", sqft: "", lotSize: "",
         listedForSale: "", soldOn: "", mls: "", propertyType: "",
-        yearBuilt: "", hoa: "",
+        yearBuilt: "", hoa: "", zpid: "",
         priceHistoryText: "", factsFeaturesText: "", pageText: ""
     };
 
-    const cleanText = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const html = await page.content();
 
-    out.canonicalUrl =
-        document.querySelector('meta[property="og:url"]')?.content ||
-        document.querySelector('link[rel="canonical"]')?.href || "";
+    // Canonical
+    const ogMatch = html.match(/<meta\s+property="og:url"\s+content="([^"]+)"/i);
+    if (ogMatch) out.canonicalUrl = ogMatch[1];
 
-    const nextDataScript = document.querySelector('script#__NEXT_DATA__');
-    let p = null;
-    if (nextDataScript) {
+    // zpid
+    const zpidMatch = originalUrl.match(/\/(\d+)_zpid/);
+    if (zpidMatch) out.zpid = zpidMatch[1];
+
+    // __NEXT_DATA__
+    const nextMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i);
+    if (nextMatch) {
         try {
-            const jsonData = JSON.parse(nextDataScript.innerText);
-            const rawCache = jsonData?.props?.pageProps?.componentProps?.gdpClientCache;
+            const json = JSON.parse(nextMatch[1]);
+            const rawCache = json?.props?.pageProps?.componentProps?.gdpClientCache;
             if (rawCache) {
-                const parsedCache = JSON.parse(rawCache);
-                const key = Object.keys(parsedCache).find(k => parsedCache[k]?.property);
-                p = parsedCache[key]?.property;
+                const parsed = JSON.parse(rawCache);
+                const key = Object.keys(parsed).find(k => parsed[k]?.property);
+                const p = parsed[key]?.property;
+                if (p) {
+                    out.price = p.price || "";
+                    out.street = p.address?.streetAddress || p.streetAddress || "";
+                    out.city = p.address?.city || p.city || "";
+                    out.state = p.address?.state || p.state || "";
+                    out.zipcode = p.address?.zipcode || p.zipcode || "";
+                    out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
+                    out.beds = p.bedrooms ?? p.resoFacts?.bedrooms ?? "";
+                    out.baths = p.bathrooms ?? p.resoFacts?.bathrooms ?? "";
+                    out.sqft = p.livingAreaValue ?? p.livingArea ?? p.resoFacts?.livingArea ?? "";
+                    if (p.resoFacts?.pricePerSquareFoot) out.pricePerSqft = p.resoFacts.pricePerSquareFoot;
+                    else if (out.price && out.sqft) out.pricePerSqft = Math.round(Number(out.price) / Number(out.sqft));
+                    const lotStr = p.resoFacts?.lotSize || "";
+                    const lotAcres = p.lotAreaValue || "";
+                    const lotUnits = p.lotAreaUnits || "";
+                    out.lotSize = lotStr || (lotAcres ? `${lotAcres} ${lotUnits}`.trim() : "");
+                    if (p.attributionInfo) {
+                        out.agentDetails = [p.attributionInfo.agentName, p.attributionInfo.brokerName, p.attributionInfo.agentPhoneNumber].filter(Boolean).join(" | ");
+                    }
+                    out.soldPrice = p.lastSoldPrice || "";
+                    out.description = p.description || p.homeDescription || "N/A";
+                    out.mls = [p.attributionInfo?.mlsId, p.attributionInfo?.mlsName].filter(Boolean).join(" - ");
+                    out.propertyType = p.homeType || p.resoFacts?.homeType || p.propertyTypeDimension || "";
+                    out.yearBuilt = p.yearBuilt || p.resoFacts?.yearBuilt || "";
+                    if (p.monthlyHoaFee) out.hoa = `$${p.monthlyHoaFee}/mo`;
+                    else if (p.resoFacts?.hoaFeeTotal) out.hoa = p.resoFacts.hoaFeeTotal;
+                    else out.hoa = "No / None listed";
+                }
             }
         } catch (e) {}
     }
 
-    if (p) {
-        out.price = p.price || "";
-        out.street  = p.address?.streetAddress || p.streetAddress || "";
-        out.city    = p.address?.city          || p.city          || "";
-        out.state   = p.address?.state         || p.state         || "";
-        out.zipcode = p.address?.zipcode       || p.zipcode       || "";
-        out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
-
-        out.beds = p.bedrooms ?? p.resoFacts?.bedrooms ?? "";
-        out.baths = p.bathrooms ?? p.resoFacts?.bathrooms ?? "";
-        out.sqft = p.livingAreaValue ?? p.livingArea ?? p.resoFacts?.livingArea ?? "";
-
-        if (p.resoFacts?.pricePerSquareFoot) out.pricePerSqft = p.resoFacts.pricePerSquareFoot;
-        else if (out.price && out.sqft) out.pricePerSqft = Math.round(Number(out.price) / Number(out.sqft));
-
-        const lotStr = p.resoFacts?.lotSize || "";
-        const lotAcres = p.lotAreaValue || "";
-        const lotUnits = p.lotAreaUnits || "";
-        out.lotSize = lotStr || (lotAcres ? `${lotAcres} ${lotUnits}`.trim() : "");
-
-        if (p.attributionInfo) {
-            const name = p.attributionInfo.agentName || "";
-            const broker = p.attributionInfo.brokerName || "";
-            const phone = p.attributionInfo.agentPhoneNumber || "";
-            out.agentDetails = [name, broker, phone].filter(Boolean).join(" | ");
+    // GraphQL history
+    if (out.zpid) {
+        console.log(`   📊 Fetching history for zpid ${out.zpid}...`);
+        const hist = await fetchPriceHistory(out.zpid);
+        out.priceHistoryText = formatPriceHistory(hist.priceHistory);
+        for (const h of hist.priceHistory) {
+            const event = (h.event || "").toLowerCase();
+            const date = h.date ? h.date.split("T")[0] : "";
+            const price = h.price ? `$${Number(h.price).toLocaleString()}` : "";
+            if (event.includes("listed") && !out.listedForSale) out.listedForSale = `${date} (${price})`;
+            if (event.includes("sold") && !out.soldOn) out.soldOn = date;
         }
-
-        out.soldPrice = p.lastSoldPrice || "";
-        out.description = p.description || p.homeDescription || "N/A";
-
-        const mlsId = p.attributionInfo?.mlsId || "";
-        const mlsName = p.attributionInfo?.mlsName || "";
-        out.mls = [mlsId, mlsName].filter(Boolean).join(" - ");
-
-        out.propertyType = p.homeType || p.resoFacts?.homeType || p.propertyTypeDimension || "";
-        out.yearBuilt = p.yearBuilt || p.resoFacts?.yearBuilt || "";
-
-        if (p.monthlyHoaFee) out.hoa = `$${p.monthlyHoaFee}/mo`;
-        else if (p.resoFacts?.hoaFeeTotal) out.hoa = p.resoFacts.hoaFeeTotal;
-        else out.hoa = "No / None listed";
+        const taxText = formatTaxHistory(hist.taxHistory);
+        if (taxText) out.priceHistoryText += "\n\n--- TAX HISTORY ---\n" + taxText;
     }
 
-    // Price history
+    // Facts & Features (best-effort)
     try {
-        const headers = Array.from(document.querySelectorAll('h2,h3'));
-        const phHeader = headers.find(h => cleanText(h.innerText).toLowerCase() === "price history");
-        let tableEl = null;
-        if (phHeader) {
-            let node = phHeader;
-            for (let i = 0; i < 6 && node; i++) {
-                node = node.parentElement;
-                if (!node) break;
-                const t = node.querySelector('table');
-                if (t) { tableEl = t; break; }
-            }
-        }
-        if (tableEl) {
-            const rows = Array.from(tableEl.querySelectorAll('tr'));
-            const lines = [];
-            for (const tr of rows) {
-                const cells = Array.from(tr.querySelectorAll('th,td'))
-                    .map(c => cleanText(c.innerText)).filter(Boolean);
-                if (cells.length) lines.push(cells.join(" | "));
-            }
-            out.priceHistoryText = lines.join("\n");
-
-            for (const tr of rows) {
-                const cells = Array.from(tr.querySelectorAll('td')).map(c => cleanText(c.innerText));
-                if (cells.length >= 3) {
-                    const date = cells[0];
-                    const event = (cells[1] || "").toLowerCase();
-                    const price = cells[2];
-                    if (event.includes("listed for sale") && !out.listedForSale) out.listedForSale = `${date} (${price})`;
-                    if (event.includes("sold") && !out.soldOn) out.soldOn = date;
-                }
-            }
+        const cleanText = (s) => (s || "").replace(/\s+/g, " ").trim();
+        const ffSection = html.match(/Facts &amp; Features([\s\S]{0,50000})/i);
+        if (ffSection) {
+            const text = ffSection[1].replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, '\n');
+            out.factsFeaturesText = text.split('\n').map(l => cleanText(l)).filter(Boolean).join("\n").slice(0, 45000);
         }
     } catch (e) {}
 
-    // Facts & Features
+    // Page text
     try {
-        const factHeaders = Array.from(document.querySelectorAll('h6'));
-        if (factHeaders.length) {
-            const lines = [];
-            const sections = Array.from(document.querySelectorAll('h3'));
-            for (const sec of sections) {
-                const secName = cleanText(sec.innerText);
-                if (!secName) continue;
-                const parent = sec.closest('[data-testid="category-group"]');
-                if (!parent) continue;
-                const facts = [];
-                for (const h6 of parent.querySelectorAll('h6')) {
-                    const cat = cleanText(h6.innerText);
-                    const ul = h6.parentElement.querySelector('ul');
-                    if (!ul) continue;
-                    const items = Array.from(ul.querySelectorAll('li'))
-                        .map(li => cleanText(li.innerText)).filter(Boolean);
-                    if (items.length) facts.push(`${cat}: ${items.join("; ")}`);
-                }
-                if (facts.length) lines.push(`[${secName}]\n${facts.join("\n")}`);
-            }
-            out.factsFeaturesText = lines.join("\n\n");
-        }
-    } catch (e) {}
-
-    // Whole page text
-    try {
-        const raw = document.body.innerText || "";
-        out.pageText = raw
-            .split("\n")
-            .map(l => l.replace(/[ \t]+/g, " ").trim())
-            .filter((l, i, arr) => !(l === "" && arr[i - 1] === ""))
-            .join("\n");
+        out.pageText = await page.evaluate(() => document.body.innerText || "");
     } catch (e) {}
 
     return out;
@@ -315,22 +270,15 @@ function extractPageData() {
 function isBlocked(title, bodyText) {
     const t = (title || "").toLowerCase();
     const b = (bodyText || "").toLowerCase();
-    return (
-        t.includes("pardon our interruption") ||
-        t.includes("robot check") ||
-        t.includes("access denied") ||
-        t.includes("access to this page has been denied") ||
-        b.includes("pardon our interruption") ||
-        b.includes("press & hold to confirm") ||
-        b.includes("verify you are a human")
-    );
+    return t.includes("pardon our interruption") || t.includes("robot check") || t.includes("access denied") || b.includes("pardon our interruption");
 }
 
 // =========================================================
 // MAIN
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting Full-Detail Stealth Scraper V12 (headless + real Chrome, no proxy)...");
+    const startTime = Date.now();
+    console.log("🚀 Starting Edge Scraper V15...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -344,11 +292,10 @@ async function runScraper() {
     const sheet = doc.sheetsByIndex[0];
 
     if (sheet.columnCount < REQUIRED_COLS) {
-        console.log(`📏 Expanding sheet columns from ${sheet.columnCount} to ${REQUIRED_COLS}...`);
         await sheet.resize({ rowCount: sheet.rowCount, columnCount: REQUIRED_COLS });
     }
     await sheet.loadCells();
-    console.log(`📊 Sheet ready: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
+    console.log(`📊 Sheet: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
 
     const setCell = (r, c, v) => {
         if (c >= sheet.columnCount) return;
@@ -357,35 +304,24 @@ async function runScraper() {
 
     const browser = await launchBrowser();
 
-    // Warm-up: clear cookies → Google referer → Zillow homepage
+    // Warm-up
     try {
         console.log("🍪 Warming up...");
         const warm = await preparePage(browser);
-        const client = await warm.target().createCDPSession();
-        await client.send('Network.clearBrowserCookies');
-
-        await warm.goto('https://www.google.com/search?q=zillow+havelock+nc', {
-            waitUntil: 'domcontentloaded', timeout: 60000,
-        });
-        await delay(jitter(2500, 4000));
-
         await warm.goto('https://www.zillow.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
         await delay(jitter(3000, 5000));
-
         const warmTitle = await warm.title();
         if (isBlocked(warmTitle, "")) {
-            console.log("🛑 Warm-up page is blocked. Aborting run to protect IP.");
+            console.log("🛑 Warm-up blocked. Aborting.");
             await warm.close();
             await browser.close();
-            if (process.env.GITHUB_OUTPUT) {
-                fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=false\n");
-            }
+            if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=false\n");
             return;
         }
         await warm.close();
         console.log("🍪 Warm-up done.");
     } catch (e) {
-        console.warn(`⚠️ Warm-up failed: ${e.message}`);
+        console.warn(`⚠️ Warm-up: ${e.message}`);
     }
 
     let scrapeCount = 0;
@@ -395,21 +331,16 @@ async function runScraper() {
 
     for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
         if (ipBlocked) break;
+        if (Date.now() - startTime > MAX_RUNTIME_MS) { rowsRemaining = true; break; }
+        if (scrapeCount >= MAX_ROWS_PER_RUN) { rowsRemaining = true; break; }
 
         const originalUrl = sheet.getCell(rowIndex, 0).value;
         const status = sheet.getCell(rowIndex, 17).value || "";
 
-        if (!originalUrl) continue;
-        if (!String(originalUrl).includes("zillow.com") || String(status).includes("✅")) continue;
-
-        if (scrapeCount >= MAX_ROWS_PER_RUN) {
-            console.log(`🛑 Reached ${MAX_ROWS_PER_RUN} rows. Stopping to protect IP...`);
-            rowsRemaining = true;
-            break;
-        }
+        if (!originalUrl || !String(originalUrl).includes("zillow.com") || String(status).includes("✅")) continue;
 
         const actualRowNumber = rowIndex + 1;
-        console.log(`🕵️ Scraping Row ${actualRowNumber}: ${originalUrl}`);
+        console.log(`🕵️ Row ${actualRowNumber}: ${originalUrl}`);
 
         let page;
         try {
@@ -421,34 +352,16 @@ async function runScraper() {
             try { bodySnippet = await page.evaluate(() => (document.body?.innerText || "").slice(0, 500)); } catch (_) {}
 
             if (isBlocked(title, bodySnippet)) {
-                console.log(`🛑 BLOCKED on Row ${actualRowNumber} — stopping entire run.`);
-                setCell(rowIndex, 17, "❌ BLOCKED (no proxy — IP flagged)");
+                console.log(`🛑 BLOCKED on Row ${actualRowNumber} — stopping run.`);
+                setCell(rowIndex, 17, "❌ BLOCKED");
                 ipBlocked = true;
                 rowsRemaining = false;
-                await saveWithRetry(sheet);
-                await page.close();
+                await sheet.saveUpdatedCells();
                 break;
             }
 
-            try {
-                await page.waitForFunction(() => {
-                    const t = document.body.innerText || "";
-                    return t.includes("Price history") || t.includes("Facts & Features") || t.includes("Interior");
-                }, { timeout: 12000 });
-            } catch (_) {}
-
-            try {
-                await page.evaluate(() => {
-                    const btns = Array.from(document.querySelectorAll('button'));
-                    for (const b of btns) {
-                        const t = (b.innerText || "").toLowerCase();
-                        if (t.includes("show more") || t.includes("see all") || t.includes("view more")) b.click();
-                    }
-                });
-                await delay(jitter(600, 1400));
-            } catch (_) {}
-
-            const data = await page.evaluate(extractPageData);
+            setCell(rowIndex, 17, "Parsing + History...");
+            const data = await extractPageData(page, originalUrl);
             const finalUrl = data.canonicalUrl || originalUrl;
 
             setCell(rowIndex, 9,  data.price);
@@ -459,7 +372,7 @@ async function runScraper() {
             setCell(rowIndex, 14, finalUrl);
             setCell(rowIndex, 15, data.agentDetails);
             setCell(rowIndex, 16, data.soldPrice);
-            setCell(rowIndex, 17, "✅ SUCCESS");
+            setCell(rowIndex, 17, "✅ Done (Edge)");
             setCell(rowIndex, 18, data.description);
             setCell(rowIndex, 19, data.fullAddress);
             setCell(rowIndex, 20, data.pricePerSqft);
@@ -478,11 +391,11 @@ async function runScraper() {
             setCell(rowIndex, 33, data.pageText);
 
             staged.push(rowIndex);
-            console.log(`✔️ Row ${actualRowNumber} | 💰 ${data.price} | 🛏 ${data.beds} 🛁 ${data.baths} | 📅 ${data.listedForSale || "-"} → ${data.soldOn || "-"}`);
             scrapeCount++;
+            console.log(`   ✔️ ${data.fullAddress} | 💰 ${data.price} | 📊 Hist: ${data.priceHistoryText ? 'YES' : 'NO'}`);
 
         } catch (e) {
-            console.error(`🛑 Error Row ${actualRowNumber}: ${e.message}`);
+            console.error(`   🛑 Error: ${e.message}`);
             setCell(rowIndex, 17, "🛑 Error: " + e.message);
             staged.push(rowIndex);
         } finally {
@@ -490,27 +403,18 @@ async function runScraper() {
         }
 
         if (staged.length >= FLUSH_BATCH_SIZE) {
-            console.log(`📦 Flushing batch of ${staged.length}...`);
-            await saveWithRetry(sheet);
+            await sheet.saveUpdatedCells();
             staged = [];
         }
+        await delay(SLEEP_BETWEEN_ROWS_MS + jitter(0, 400));
     }
 
-    if (staged.length > 0) {
-        console.log(`📦 Flushing final ${staged.length}...`);
-        await saveWithRetry(sheet);
-    }
-
+    if (staged.length > 0) await sheet.saveUpdatedCells();
     await browser.close();
 
     if (process.env.GITHUB_OUTPUT) {
-        if (rowsRemaining) {
-            fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=true\n");
-            console.log("🔄 Remaining links found. Relaying trigger token...");
-        } else {
-            fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=false\n");
-            console.log("🎉 Run completed (or stopped by block).");
-        }
+        if (rowsRemaining) fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=true\n");
+        else fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=false\n");
     }
 }
 

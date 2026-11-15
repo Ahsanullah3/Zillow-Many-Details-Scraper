@@ -1,49 +1,64 @@
-name: Zillow Scraper
+name: 🚀 Stealth Scraper V6
+
+# This dynamically names the run in the GitHub Actions UI!
+run-name: 🚀 Stealth Scraper V6 (Batch ${{ inputs.batch || '1' }})
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
-  workflow_dispatch:
+    - cron: '0 */4 * * *' 
+  workflow_dispatch: 
+    inputs:
+      batch:
+        description: "The current batch number"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
-    outputs:
-      has_more: ${{ steps.run.outputs.has_more }}
-      blocked:  ${{ steps.run.outputs.blocked }}
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 15
 
-      - uses: actions/setup-node@v4
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Install deps
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
-          fi
+      - name: Install Dependencies
+        run: npm install
 
-      - name: Run scraper
-        id: run
-        run: node scraper.js
+      # Installs a clean, stable runtime instance of Google Chrome
+      - name: Setup Google Chrome Build Engine
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Run Scraper Engine
+        id: scraper_task 
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          SPREADSHEET_ID:          ${{ secrets.SPREADSHEET_ID }}
-          PAGE_ZOOM: '0.05'
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: npm start
 
-      - name: Re-dispatch if blocked
-        if: steps.run.outputs.has_more == 'true' && steps.run.outputs.blocked == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              workflow_id: 'scraper.yml',
-              ref:   context.ref.replace('refs/heads/', ''),
-            });
+      - name: Evaluate Self-Reboot Sequence
+        if: steps.scraper_task.outputs.has_more == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Grab the current batch number and add 1
+          CURRENT_BATCH="${{ inputs.batch || '1' }}"
+          NEXT_BATCH=$((CURRENT_BATCH + 1))
+          
+          echo "Batch $CURRENT_BATCH threshold hit. Rotating environment and triggering Batch $NEXT_BATCH..."
+          
+          # Pass the new batch number into the next run
+          gh workflow run scraper.yml --ref main -f batch=$NEXT_BATCH
+          sleep 5

@@ -52,53 +52,55 @@ async function saveWithRetry(sheet, retries = 3) {
 }
 
 // =========================================================
-// PRICE HISTORY: parse the rendered "Price history" table
-// (runs inside the page; rows carry label="Date: ..., Event: ..., Price: ...")
+// PRICE HISTORY: parse the Zillow "Table.Root" (c11n) price-history table
+// Anchors on the component markup itself, not on the heading:
+//   table[data-c11n-component="Table.Root"] (.c11n_table__root) with Date | Event | Price headers
+//   row cells: [data-testid="date-info"], 2nd Table.Cell (event), [data-testid="price-money-cell"],
+//              [data-testid="percent-display"], next colspan row = "Source: ..."
 // =========================================================
 function parseHistoryRowsInPage() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const heads = Array.from(document.querySelectorAll('h2,h3'));
-    const h = heads.find(x => clean(x.textContent).toLowerCase() === 'price history') ||
-              heads.find(x => clean(x.textContent).toLowerCase().includes('price history'));
-    let table = null;
-    if (h) {
-        let node = h;
-        for (let i = 0; i < 6 && node; i++) {
-            node = node.parentElement;
-            if (!node) break;
-            table = node.querySelector('table');
-            if (table) break;
-        }
-    }
+
+    // Find the table by its column headers so other tables (taxes, etc.) are ignored
+    const isHistoryTable = (t) => {
+        const hs = Array.from(t.querySelectorAll('th')).map(x => clean(x.textContent).toLowerCase());
+        return hs.includes('date') && hs.includes('event') && hs.includes('price');
+    };
+    const candidates = Array.from(document.querySelectorAll(
+        'table[data-c11n-component="Table.Root"], table.c11n_table__root, table'
+    ));
+    const table = candidates.find(isHistoryTable);
     if (!table) return [];
 
     const rows = [];
-    for (const tr of table.querySelectorAll('tr[label]')) {
+    for (const tr of table.querySelectorAll('tr')) {
+        const dateEl = tr.querySelector('[data-testid="date-info"]');
         const label = tr.getAttribute('label') || '';
+        if (!dateEl && !label) continue;               // header row / source row
+
         const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
+        const cells = tr.querySelectorAll('td[data-c11n-component="Table.Cell"], td');
 
-        const date = clean(tr.querySelector('[data-testid="date-info"]')?.textContent) || (lm ? clean(lm[1]) : '');
-        const tds = tr.querySelectorAll('td');
-        const event = clean(tds[1]?.textContent) || (lm ? clean(lm[2]) : '');
+        const date = clean(dateEl?.textContent) || (lm ? clean(lm[1]) : '');
+        const event = clean(cells[1]?.textContent) || (lm ? clean(lm[2]) : '');
 
-        const priceCell = tr.querySelector('[data-testid="price-money-cell"]');
         let price = '', change = '', ppsf = '';
+        const priceCell = tr.querySelector('[data-testid="price-money-cell"]');
         if (priceCell) {
             price = clean(priceCell.querySelector('span > span')?.textContent);
             change = clean(priceCell.querySelector('[data-testid="percent-display"]')?.textContent);
-            const last = priceCell.lastElementChild;
-            const lastTxt = clean(last?.textContent);
+            const lastTxt = clean(priceCell.lastElementChild?.textContent);
             if (/sqft/i.test(lastTxt)) ppsf = lastTxt;
         }
         if (!price && lm) price = clean(lm[3]).replace(/\s*\(.*\)\s*$/, '');
 
-        // Source sits in the following colspan row ("Source: Hive MLS #123  Report a problem")
+        // Following colspan row: "Source: Hive MLS #123   Report a problem"
         let source = '';
         const next = tr.nextElementSibling;
-        if (next && !next.hasAttribute('label')) {
+        if (next && !next.querySelector('[data-testid="date-info"]') && !next.hasAttribute('label')) {
             source = clean(next.textContent).replace(/\s*Report\s+a problem\s*$/i, '');
         }
-        if (date || event) rows.push({ date, event, price, change, ppsf, source });
+        rows.push({ date, event, price, change, ppsf, source });
     }
     return rows;
 }
@@ -267,7 +269,7 @@ async function extractPageData(page, originalUrl) {
 
     if (!domRows.length && !embRows.length) {
         // Nothing yet: give the table a moment to render (no scrolling, no extra navigation)
-        await page.waitForSelector('tr[label]', { timeout: 3000 }).catch(() => {});
+        await page.waitForSelector('[data-testid="date-info"]', { timeout: 3000 }).catch(() => {});
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
         if (!domRows.length && PRICE_HISTORY_DOM) {
             // Last resort (riskier): scroll the section into view to trigger lazy rendering

@@ -1,19 +1,16 @@
 {
-  "name": "zillow-edge-scraper",
-  "version": "15.0.0",
-  "description": "Zillow scraper using latest Microsoft Edge",
+  "name": "github-stealth-scraper",
+  "version": "1.0.0",
+  "description": "Headless Real Estate Scraper",
   "main": "scraper.js",
   "scripts": {
-    "start": "node scraper.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "google-auth-library": "^9.15.0",
-    "google-spreadsheet": "^4.1.4",
-    "puppeteer-core": "^23.10.4",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
-  },
-  "engines": {
-    "node": ">=18"
+    "google-auth-library": "latest",
+    "google-spreadsheet": "latest",
+    "puppeteer": "^24.15.0",
+    "puppeteer-extra": "latest",
+    "puppeteer-extra-plugin-stealth": "latest"
   }
 }

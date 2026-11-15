@@ -12,6 +12,11 @@ on:
         required: false
         default: "1"
         type: string
+      retry_blocked:
+        description: "Retry rows marked blocked/error (this run only, not chained)"
+        required: false
+        default: "false"
+        type: string
       blocks:
         description: "Consecutive blocked batches"
         required: false
@@ -65,7 +70,7 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-edge.outputs.edge-path }}
-          BATCH_NUMBER: ${{ inputs.batch || '1' }}
+          RETRY_BLOCKED: ${{ inputs.retry_blocked == 'true' && '1' || '0' }}
           HEADFUL: '1'                 # real (non-headless) window inside a virtual display
           TIMEZONE: America/New_York
         run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm start

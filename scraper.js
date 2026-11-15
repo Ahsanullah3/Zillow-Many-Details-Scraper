@@ -7,39 +7,21 @@ const fs = require('fs');
 puppeteer.use(StealthPlugin());
 
 // =========================================================
-// CONFIG
+// CONFIG  (same lightweight approach as the working script)
 // =========================================================
-const MAX_RUNTIME_MS = 780000;        // 13 min per batch
-const MIN_SLEEP_MS = 4000;            // pause between rows
-const MAX_SLEEP_MS = 9000;
-const MAX_ROWS_PER_RUN = 30;           // successful rows per batch (blocked rows don't count)
+const MAX_ROWS_PER_RUN = 30;        // successful rows per batch (blocked rows don't count)
+const FLUSH_BATCH_SIZE = 8;
 const REQUIRED_COLS = 34;
-const FLUSH_BATCH_SIZE = 5;
-const MAX_CONSECUTIVE_ERRORS = 3;     // stop run if things keep failing
-const MAX_BLOCK_STREAK = 3;           // this many blocks in a row = IP flagged -> end batch, next batch gets a new IP
-// Rows marked blocked / errored are SKIPPED in every batch, so the same rows are never
-// retried again and again. Set RETRY_BLOCKED=1 (manual run only) to retry them once.
+const MAX_BLOCK_STREAK = 3;         // blocks in a row => end batch, next batch continues with NEXT rows
+const MAX_CONSECUTIVE_ERRORS = 3;
+const MAX_RUNTIME_MS = 12 * 60 * 1000;
+// Optional: also read the visible price-history table if the embedded data has none.
+// Needs scrolling/lazy requests, so it's OFF by default (set PRICE_HISTORY_DOM=1 to try).
+const PRICE_HISTORY_DOM = process.env.PRICE_HISTORY_DOM === '1';
+// Rows marked blocked/error are skipped in every batch. RETRY_BLOCKED=1 retries them once.
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
-// Request interception disables the browser cache and slightly changes traffic shape,
-// so it's OFF by default. Set e.g. ['media'] only if you need to save bandwidth.
-const BLOCKED_RESOURCES = [];
-const VIEWPORTS = [[1366, 768], [1440, 900], [1536, 864], [1920, 1080]];
-const [VP_W, VP_H] = VIEWPORTS[Math.floor(Math.random() * VIEWPORTS.length)]; // one size per run
-const TIMEZONE = process.env.TIMEZONE || 'America/New_York'; // match a US IP
-const PAUSE_EVERY = [6, 11];         // take a longer "human" break every N rows
-const PAUSE_MS = [20000, 45000];
 
-// Optional env vars:
-//   PUPPETEER_EXECUTABLE_PATH : Edge/Chrome path (falls back to bundled Chromium)
-//   USER_DATA_DIR             : persistent profile folder (keeps cookies between runs)
-//   HEADFUL=1                 : run with a visible window (best on a local/home PC)
-const USER_DATA_DIR = process.env.USER_DATA_DIR || './browser-profile';
-const HEADFUL = process.env.HEADFUL === '1';
-
-// =========================================================
-// HELPERS
-// =========================================================
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 const jitter = (min, max) => min + Math.floor(Math.random() * (max - min));
 
@@ -51,290 +33,177 @@ const safeCell = (v) => {
 };
 
 // =========================================================
-// BROWSER LAUNCH
+// GOOGLE API RETRY (500 error fix)
 // =========================================================
-async function launchBrowser() {
-    const execPath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    if (execPath) console.log(`🌐 Using browser: ${execPath}`);
-    else console.log('🌐 Using bundled Chromium');
-    console.log(`🖥️ ${HEADFUL ? 'Headful' : 'Headless'} | window ${VP_W}x${VP_H} | tz ${TIMEZONE}`);
-
-    return puppeteer.launch({
-        headless: HEADFUL ? false : 'new',
-        ...(execPath ? { executablePath: execPath } : {}),
-        userDataDir: USER_DATA_DIR,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-blink-features=AutomationControlled',
-            '--no-first-run',
-            '--no-default-browser-check',
-            '--password-store=basic',
-            '--lang=en-US,en',
-            `--window-size=${VP_W},${VP_H}`,
-        ],
-        ignoreDefaultArgs: ['--enable-automation'],
-        defaultViewport: null,
-    });
-}
-
-// =========================================================
-// PAGE SETUP (created ONCE and reused for every row)
-// =========================================================
-async function preparePage(browser) {
-    const page = await browser.newPage();
-
-    // NOTE: no manual setUserAgent. The stealth plugin's user-agent-override already
-    // strips "Headless" AND sets matching client-hint metadata (sec-ch-ua, platform).
-    // Setting the UA by hand wipes that metadata and creates a mismatch.
-
-    if (!HEADFUL) await page.setViewport({ width: VP_W, height: VP_H, deviceScaleFactor: 1 });
-    await page.emulateTimezone(TIMEZONE).catch(() => {});
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-
-    if (BLOCKED_RESOURCES.length) {
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (BLOCKED_RESOURCES.includes(req.resourceType())) req.abort().catch(() => {});
-            else req.continue().catch(() => {});
-        });
-    }
-    return page;
-}
-
-// =========================================================
-// HUMAN-LIKE BEHAVIOUR
-// =========================================================
-// Smooth curved mouse path (quadratic bezier) instead of a straight jump
-async function humanMouse(page, toX, toY) {
-    try {
-        const fromX = jitter(50, VP_W - 50), fromY = jitter(50, VP_H - 50);
-        const cx = (fromX + toX) / 2 + jitter(-150, 150);
-        const cy = (fromY + toY) / 2 + jitter(-150, 150);
-        const steps = jitter(18, 40);
-        await page.mouse.move(fromX, fromY);
-        for (let i = 1; i <= steps; i++) {
-            const t = i / steps;
-            const x = (1 - t) * (1 - t) * fromX + 2 * (1 - t) * t * cx + t * t * toX;
-            const y = (1 - t) * (1 - t) * fromY + 2 * (1 - t) * t * cy + t * t * toY;
-            await page.mouse.move(x, y);
-            if (i % 6 === 0) await delay(jitter(5, 25));
-        }
-    } catch (_) {}
-}
-
-// Scroll down in uneven chunks, sometimes back up a little, with reading pauses
-async function humanScroll(page) {
-    try {
-        const chunks = jitter(3, 7);
-        for (let i = 0; i < chunks; i++) {
-            const dy = jitter(150, 480);
-            await page.mouse.wheel({ deltaY: dy });
-            await delay(jitter(350, 1100));
-            if (Math.random() < 0.2) {
-                await page.mouse.wheel({ deltaY: -jitter(60, 200) });
-                await delay(jitter(300, 800));
+async function saveWithRetry(sheet, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await sheet.saveUpdatedCells();
+            return;
+        } catch (error) {
+            if (i === retries - 1) {
+                console.error("❌ Max retries reached. Google API unavailable.");
+                throw error;
             }
+            console.log(`⚠️ Google API error. Retrying in ${2 ** i}s...`);
+            await delay((2 ** i) * 1000);
         }
-    } catch (_) {}
-}
-
-async function humanNavigate(page, url) {
-    await delay(jitter(1200, 3500));
-    await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 90000,
-        referer: Math.random() < 0.7 ? 'https://www.google.com/' : 'https://www.zillow.com/',
-    });
-    await delay(jitter(900, 2200));                       // page "loads"
-    await humanMouse(page, jitter(200, VP_W - 200), jitter(150, VP_H - 150));
-    await humanScroll(page);
-    await delay(jitter(1000, 3000));                      // reading time
+    }
 }
 
 // =========================================================
-// BLOCK DETECTION
+// OPTIONAL: price history from the rendered table
 // =========================================================
-function isBlocked(title, bodyText) {
-    const t = (title || '').toLowerCase();
-    const b = (bodyText || '').toLowerCase();
-    return (
-        t.includes('pardon our interruption') ||
-        t.includes('robot check') ||
-        t.includes('access denied') ||
-        t.includes('captcha') ||
-        b.includes('pardon our interruption') ||
-        b.includes('press & hold') ||
-        b.includes('press and hold') ||
-        b.includes('verify you are a human')
-    );
-}
-
-async function checkBlocked(page) {
-    const title = await page.title().catch(() => '');
-    const body = await page.evaluate(() => (document.body?.innerText || '').slice(0, 600)).catch(() => '');
-    return isBlocked(title, body);
-}
-
-// =========================================================
-// EXTRACT HISTORY FROM RENDERED DOM
-// =========================================================
-async function extractHistoryFromDOM(page) {
-    const result = { priceHistoryText: "", listedForSale: "", soldOn: "" };
-
+async function historyFromDOM(page) {
     try {
         await page.evaluate(() => {
-            const headers = Array.from(document.querySelectorAll('h2, h3'));
-            const ph = headers.find(h => (h.innerText || '').toLowerCase().includes('price history'));
-            if (ph) ph.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const h = Array.from(document.querySelectorAll('h2,h3'))
+                .find(x => (x.innerText || '').toLowerCase().includes('price history'));
+            if (h) h.scrollIntoView({ block: 'center' });
         });
-        await delay(2500);
-
-        // Wait briefly for the table instead of assuming it's there
-        await page.waitForSelector('table', { timeout: 4000 }).catch(() => {});
-
-        const data = await page.evaluate(() => {
-            const cleanText = (s) => (s || '').replace(/\s+/g, ' ').trim();
-            const headers = Array.from(document.querySelectorAll('h2, h3'));
-            const phHeader =
-                headers.find(h => cleanText(h.innerText).toLowerCase() === 'price history') ||
-                headers.find(h => cleanText(h.innerText).toLowerCase().includes('price history'));
-            if (!phHeader) return { lines: [], listedForSale: '', soldOn: '' };
-
-            let node = phHeader;
-            let table = null;
+        await delay(2000);
+        return await page.evaluate(() => {
+            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const h = Array.from(document.querySelectorAll('h2,h3'))
+                .find(x => clean(x.innerText).toLowerCase().includes('price history'));
+            if (!h) return { text: '', listed: '', sold: '' };
+            let node = h, table = null;
             for (let i = 0; i < 6 && node; i++) {
                 node = node.parentElement;
                 if (!node) break;
                 table = node.querySelector('table');
                 if (table) break;
             }
-            if (!table) return { lines: [], listedForSale: '', soldOn: '' };
-
-            const rows = Array.from(table.querySelectorAll('tr'));
-            const lines = [];
-            let listedForSale = '';
-            let soldOn = '';
-
-            for (const tr of rows) {
-                const cells = Array.from(tr.querySelectorAll('th,td'))
-                    .map(c => cleanText(c.innerText)).filter(Boolean);
-                if (cells.length) lines.push(cells.join(' | '));
-
+            if (!table) return { text: '', listed: '', sold: '' };
+            const lines = []; let listed = '', sold = '';
+            for (const tr of table.querySelectorAll('tr')) {
+                const cells = Array.from(tr.querySelectorAll('th,td')).map(c => clean(c.innerText)).filter(Boolean);
+                if (!cells.length) continue;
+                lines.push(cells.join(' | '));
                 if (cells.length >= 3) {
-                    const date = cells[0];
-                    const event = (cells[1] || '').toLowerCase();
-                    const price = cells[2];
-                    if (event.includes('listed for sale') && !listedForSale) listedForSale = `${date} (${price})`;
-                    if (event.includes('sold') && !soldOn) soldOn = date;
+                    const ev = cells[1].toLowerCase();
+                    if (ev.includes('listed for sale') && !listed) listed = `${cells[0]} (${cells[2]})`;
+                    if (ev.includes('sold') && !sold) sold = cells[0];
                 }
             }
-            return { lines, listedForSale, soldOn };
+            return { text: lines.join('\n'), listed, sold };
         });
-
-        result.priceHistoryText = data.lines.join('\n');
-        result.listedForSale = data.listedForSale;
-        result.soldOn = data.soldOn;
-
-        if (result.priceHistoryText) console.log(`   📊 History from DOM: ${data.lines.length} rows`);
     } catch (e) {
-        console.log(`   ⚠️ DOM history: ${e.message}`);
+        return { text: '', listed: '', sold: '' };
     }
-
-    return result;
 }
 
 // =========================================================
-// EXTRACT PAGE DATA
+// EXTRACT (reads embedded Next.js state, like the working script)
 // =========================================================
 async function extractPageData(page, originalUrl) {
-    const out = {
-        price: "", street: "", city: "", state: "", zipcode: "",
-        fullAddress: "", agentDetails: "", soldPrice: "",
-        canonicalUrl: "", description: "", pricePerSqft: "",
-        beds: "", baths: "", sqft: "", lotSize: "",
-        listedForSale: "", soldOn: "", mls: "", propertyType: "",
-        yearBuilt: "", hoa: "", zpid: "",
-        priceHistoryText: "", factsFeaturesText: "", pageText: ""
-    };
+    const data = await page.evaluate(() => {
+        const out = {
+            price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
+            agentDetails: "", soldPrice: "", canonicalUrl: "", description: "",
+            pricePerSqft: "", beds: "", baths: "", sqft: "", lotSize: "",
+            listedForSale: "", soldOn: "", mls: "", propertyType: "", yearBuilt: "",
+            hoa: "", priceHistoryText: "", pageText: ""
+        };
 
-    const html = await page.content();
+        const fmtType = (raw) => !raw ? "" : String(raw).replace(/_/g, ' ')
+            .replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+        const money = (n) => (typeof n === 'number') ? '$' + n.toLocaleString('en-US') : (n || '');
 
-    const ogMatch = html.match(/<meta\s+property="og:url"\s+content="([^"]+)"/i);
-    if (ogMatch) out.canonicalUrl = ogMatch[1];
+        out.canonicalUrl = document.querySelector('meta[property="og:url"]')?.content || "";
 
-    const zpidMatch = originalUrl.match(/\/(\d+)_zpid/);
-    if (zpidMatch) out.zpid = zpidMatch[1];
+        let json = null;
+        try { json = JSON.parse(document.querySelector('script#__NEXT_DATA__')?.innerText || 'null'); } catch (e) {}
+        const cp = json?.props?.pageProps?.componentProps;
 
-    const nextMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i);
-    if (nextMatch) {
+        // ---- Home detail page
+        let p = null;
         try {
-            const json = JSON.parse(nextMatch[1]);
-            const rawCache = json?.props?.pageProps?.componentProps?.gdpClientCache;
-            if (rawCache) {
-                const parsed = typeof rawCache === 'string' ? JSON.parse(rawCache) : rawCache;
+            const raw = cp?.gdpClientCache;
+            if (raw) {
+                const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
                 const key = Object.keys(parsed).find(k => parsed[k]?.property);
-                const p = key ? parsed[key]?.property : null;
-                if (p) {
-                    out.price = p.price || "";
-                    out.street = p.address?.streetAddress || p.streetAddress || "";
-                    out.city = p.address?.city || p.city || "";
-                    out.state = p.address?.state || p.state || "";
-                    out.zipcode = p.address?.zipcode || p.zipcode || "";
-                    out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
-                    out.beds = p.bedrooms ?? p.resoFacts?.bedrooms ?? "";
-                    out.baths = p.bathrooms ?? p.resoFacts?.bathrooms ?? "";
-                    out.sqft = p.livingAreaValue ?? p.livingArea ?? p.resoFacts?.livingArea ?? "";
-                    if (p.resoFacts?.pricePerSquareFoot) out.pricePerSqft = p.resoFacts.pricePerSquareFoot;
-                    else if (out.price && out.sqft && Number(out.sqft) > 0) {
-                        out.pricePerSqft = Math.round(Number(out.price) / Number(out.sqft));
-                    }
-                    const lotStr = p.resoFacts?.lotSize || "";
-                    const lotAcres = p.lotAreaValue || "";
-                    const lotUnits = p.lotAreaUnits || "";
-                    out.lotSize = lotStr || (lotAcres ? `${lotAcres} ${lotUnits}`.trim() : "");
-                    if (p.attributionInfo) {
-                        out.agentDetails = [p.attributionInfo.agentName, p.attributionInfo.brokerName, p.attributionInfo.agentPhoneNumber].filter(Boolean).join(" | ");
-                    }
-                    out.soldPrice = p.lastSoldPrice || "";
-                    out.description = p.description || p.homeDescription || "N/A";
-                    out.mls = [p.attributionInfo?.mlsId, p.attributionInfo?.mlsName].filter(Boolean).join(" - ");
-                    out.propertyType = p.homeType || p.resoFacts?.homeType || p.propertyTypeDimension || "";
-                    out.yearBuilt = p.yearBuilt || p.resoFacts?.yearBuilt || "";
-                    if (p.monthlyHoaFee) out.hoa = `$${p.monthlyHoaFee}/mo`;
-                    else if (p.resoFacts?.hoaFeeTotal) out.hoa = p.resoFacts.hoaFeeTotal;
-                    else out.hoa = "No / None listed";
+                p = key ? parsed[key].property : null;
+            }
+        } catch (e) {}
+
+        if (p) {
+            out.price = p.price || "";
+            out.street = p.address?.streetAddress || p.streetAddress || "";
+            out.city = p.address?.city || p.city || "";
+            out.state = p.address?.state || p.state || "";
+            out.zipcode = p.address?.zipcode || p.zipcode || "";
+            out.beds = p.bedrooms ?? p.resoFacts?.bedrooms ?? "";
+            out.baths = p.bathrooms ?? p.resoFacts?.bathrooms ?? "";
+            out.sqft = p.livingAreaValue ?? p.livingArea ?? p.resoFacts?.livingArea ?? "";
+            if (p.resoFacts?.pricePerSquareFoot) out.pricePerSqft = p.resoFacts.pricePerSquareFoot;
+            else if (out.price && out.sqft && Number(out.sqft) > 0) out.pricePerSqft = Math.round(Number(out.price) / Number(out.sqft));
+            const lotStr = p.resoFacts?.lotSize || "";
+            const lotVal = p.lotAreaValue || "";
+            out.lotSize = lotStr || (lotVal ? `${lotVal} ${p.lotAreaUnits || ''}`.trim() : "");
+            if (p.attributionInfo) {
+                out.agentDetails = [p.attributionInfo.agentName, p.attributionInfo.brokerName, p.attributionInfo.agentPhoneNumber].filter(Boolean).join(" | ");
+            }
+            out.soldPrice = p.lastSoldPrice || "";
+            out.description = p.description || p.homeDescription || "N/A";
+            out.mls = [p.attributionInfo?.mlsId, p.attributionInfo?.mlsName].filter(Boolean).join(" - ");
+            out.propertyType = fmtType(p.homeType || p.resoFacts?.homeType || p.propertyTypeDimension);
+            out.yearBuilt = p.yearBuilt || p.resoFacts?.yearBuilt || "";
+            if (p.monthlyHoaFee) out.hoa = `$${p.monthlyHoaFee}/mo`;
+            else if (p.resoFacts?.hoaFeeTotal) out.hoa = p.resoFacts.hoaFeeTotal;
+            else out.hoa = "No / None listed";
+
+            // Price history straight from the embedded data (no scrolling / extra requests)
+            if (Array.isArray(p.priceHistory) && p.priceHistory.length) {
+                out.priceHistoryText = p.priceHistory
+                    .map(h => [h.date, h.event, money(h.price)].filter(Boolean).join(' | ')).join('\n');
+                for (const h of p.priceHistory) {
+                    const ev = String(h.event || '').toLowerCase();
+                    if (ev.includes('listed for sale') && !out.listedForSale) out.listedForSale = `${h.date} (${money(h.price)})`;
+                    if (ev.includes('sold') && !out.soldOn) out.soldOn = h.date || "";
                 }
             }
-        } catch (e) {
-            console.log(`   ⚠️ __NEXT_DATA__ parse: ${e.message}`);
+        } else {
+            // ---- Rental building page (fallback, like the working script)
+            const b = cp?.initialReduxState?.gdp?.building;
+            if (b) {
+                out.street = b.streetAddress || "";
+                out.city = b.city || "";
+                out.state = b.state || "";
+                out.zipcode = b.zipcode || "";
+                out.description = b.description || "";
+                out.propertyType = "Apartment";
+            }
         }
+
+        out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
+        try { out.pageText = document.body.innerText || ""; } catch (e) {}
+        return out;
+    });
+
+    if (!data.canonicalUrl) data.canonicalUrl = originalUrl;
+
+    if (PRICE_HISTORY_DOM && !data.priceHistoryText) {
+        const h = await historyFromDOM(page);
+        data.priceHistoryText = h.text;
+        if (h.listed && !data.listedForSale) data.listedForSale = h.listed;
+        if (h.sold && !data.soldOn) data.soldOn = h.sold;
     }
 
-    const history = await extractHistoryFromDOM(page);
-    out.priceHistoryText = history.priceHistoryText;
-    if (history.listedForSale && !out.listedForSale) out.listedForSale = history.listedForSale;
-    if (history.soldOn && !out.soldOn) out.soldOn = history.soldOn;
-
-    // Facts & Features (best-effort)
+    // Facts & Features (best-effort, from the HTML already loaded)
+    data.factsFeaturesText = "";
     try {
-        const cleanText = (s) => (s || '').replace(/\s+/g, ' ').trim();
-        const ffSection = html.match(/Facts &amp; Features([\s\S]{0,50000})/i);
-        if (ffSection) {
-            const text = ffSection[1]
-                .replace(/<script[\s\S]*?<\/script>/gi, '')
-                .replace(/<style[\s\S]*?<\/style>/gi, '')
-                .replace(/<[^>]+>/g, '\n');
-            out.factsFeaturesText = text.split('\n').map(l => cleanText(l)).filter(Boolean).join("\n").slice(0, 45000);
+        const html = await page.content();
+        const m = html.match(/Facts &amp; Features([\s\S]{0,50000})/i);
+        if (m) {
+            data.factsFeaturesText = m[1]
+                .replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '')
+                .replace(/<[^>]+>/g, '\n').split('\n')
+                .map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n').slice(0, 45000);
         }
     } catch (e) {}
 
-    try {
-        out.pageText = await page.evaluate(() => document.body.innerText || "");
-    } catch (e) {}
-
-    return out;
+    return data;
 }
 
 // =========================================================
@@ -342,22 +211,21 @@ async function extractPageData(page, originalUrl) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log("🚀 Starting Scraper V17...");
+    console.log("🚀 Starting Stealth Scraper V7 (lightweight, skip-blocked)...");
 
-    const setOutput = (hasMore, blocked = false) => {
+    const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
             fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_more=${hasMore}\nblocked=${blocked}\n`);
         }
     };
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-    const serviceAccountAuth = new JWT({
+    const auth = new JWT({
         email: creds.client_email,
         key: creds.private_key,
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
-
-    const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, serviceAccountAuth);
+    const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, auth);
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
@@ -367,183 +235,127 @@ async function runScraper() {
     await sheet.loadCells();
     console.log(`📊 Sheet: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
 
-    const setCell = (r, c, v) => {
-        if (c >= sheet.columnCount) return;
-        sheet.getCell(r, c).value = safeCell(v);
-    };
+    const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
 
-    const browser = await launchBrowser();
-    let page;
-    let scrapeCount = 0;
-    let rowsRemaining = false;
-    let ipFlagged = false;   // IP looks burned: ended batch after a streak of blocks
-    let blockStreak = 0;
-    let skippedBlocked = 0;
-    let consecutiveErrors = 0;
-    let stoppedEarly = false;
-    let dirty = 0;
+    // Same launch as the working script: bundled Chrome, headless new, minimal args
+    const browser = await puppeteer.launch({
+        headless: "new",
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
 
-    const flush = async () => {
-        if (dirty > 0) {
-            await sheet.saveUpdatedCells();
-            dirty = 0;
-        }
-    };
+    let scrapeCount = 0, skipped = 0;
+    let rowsRemaining = false, ipFlagged = false, stoppedEarly = false;
+    let blockStreak = 0, consecutiveErrors = 0, dirty = 0;
 
-    let rowsSincePause = 0;
-    let nextPauseAt = jitter(PAUSE_EVERY[0], PAUSE_EVERY[1]);
-    const pace = async () => {
-        if (dirty >= FLUSH_BATCH_SIZE) await flush();
-        await delay(jitter(MIN_SLEEP_MS, MAX_SLEEP_MS));
-        rowsSincePause++;
-        if (rowsSincePause >= nextPauseAt) {
-            const ms = jitter(PAUSE_MS[0], PAUSE_MS[1]);
-            console.log(`   ☕ Taking a ${Math.round(ms / 1000)}s break`);
-            await delay(ms);
-            rowsSincePause = 0;
-            nextPauseAt = jitter(PAUSE_EVERY[0], PAUSE_EVERY[1]);
-        }
-    };
-
-    // Marks the row as blocked (permanently skipped in later batches) and moves on.
-    // After several blocks in a row the IP is probably flagged: end the batch so the
-    // next batch (new runner, new IP) carries on with the NEXT rows.
-    const handleBlock = (rowIndex, label) => {
-        setCell(rowIndex, 17, label);
-        dirty++;
-        blockStreak++;
-        if (blockStreak >= MAX_BLOCK_STREAK) {
-            console.log(`🛑 ${blockStreak} blocks in a row — ending batch; next batch continues with the next rows.`);
-            ipFlagged = true;
-            rowsRemaining = true;
-            return true;
-        }
-        console.log(`   ⏭️ Row marked blocked — skipping (${blockStreak}/${MAX_BLOCK_STREAK} in a row)`);
-        return false;
-    };
+    const flush = async () => { if (dirty > 0) { await saveWithRetry(sheet); dirty = 0; } };
 
     try {
-        page = await preparePage(browser);
-
-        // Warm-up on the SAME page/session
-        try {
-            console.log("🍪 Warming up...");
-            await page.goto('https://www.zillow.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-            await delay(jitter(3000, 5000));
-            if (await checkBlocked(page)) {
-                console.log("🛑 Warm-up blocked (IP likely flagged). Ending batch; next batch gets a new IP.");
-                setOutput(true, true);
-                return;
-            }
-            console.log("🍪 Warm-up done.");
-        } catch (e) {
-            console.warn(`⚠️ Warm-up: ${e.message}`);
-        }
-
         for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
-            if (ipFlagged) break;
             if (Date.now() - startTime > MAX_RUNTIME_MS) { rowsRemaining = true; break; }
             if (scrapeCount >= MAX_ROWS_PER_RUN) { rowsRemaining = true; break; }
             if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                console.log(`🛑 ${MAX_CONSECUTIVE_ERRORS} errors in a row — stopping run.`);
-                stoppedEarly = true;
-                break;
+                console.log(`🛑 ${MAX_CONSECUTIVE_ERRORS} errors in a row — ending batch.`);
+                stoppedEarly = true; break;
             }
 
-            const originalUrl = sheet.getCell(rowIndex, 0).value;
+            const url = sheet.getCell(rowIndex, 0).value;
             const status = sheet.getCell(rowIndex, 17).value || "";
 
-            if (!originalUrl || !String(originalUrl).includes("zillow.com") || String(status).includes("✅")) continue;
-            if (isSkipStatus(status) && !RETRY_BLOCKED) { skippedBlocked++; continue; }
+            if (!url || !String(url).includes("zillow.com") || String(status).includes("✅")) continue;
+            if (isSkipStatus(status) && !RETRY_BLOCKED) { skipped++; continue; }
 
-            const actualRowNumber = rowIndex + 1;
-            console.log(`🕵️ Row ${actualRowNumber}: ${originalUrl}`);
+            const actualRow = rowIndex + 1;
+            console.log(`🕵️ Row ${actualRow}: ${url}`);
 
+            // New page per row, request blocking, short delay — same as the working script
+            const page = await browser.newPage();
             try {
-                await humanNavigate(page, String(originalUrl));
+                await page.setRequestInterception(true);
+                page.on('request', (req) => {
+                    if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort().catch(() => {});
+                    else req.continue().catch(() => {});
+                });
 
-                if (await checkBlocked(page)) {
-                    console.log(`🛑 BLOCKED on Row ${actualRowNumber}`);
-                    if (handleBlock(rowIndex, "❌ BLOCKED (skipped)")) break;
-                    await pace();
-                    continue;
-                }
+                await delay(jitter(500, 1000));
+                await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-                const hasNextData = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
-                if (!hasNextData) {
-                    console.log(`   ⚠️ No __NEXT_DATA__ — treating as blocked`);
-                    if (handleBlock(rowIndex, "🚫 No data - blocked? (skipped)")) break;
-                    await pace();
-                    continue;
-                }
+                const title = await page.title();
+                const hasNext = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
+                const blockedTitle = /pardon our interruption|robot check|access denied/i.test(title);
 
-                setCell(rowIndex, 17, "Parsing + History...");
-                const data = await extractPageData(page, String(originalUrl));
-                const finalUrl = data.canonicalUrl || originalUrl;
-
-                // Don't mark Done if nothing useful was extracted
-                const gotData = data.price || data.fullAddress || data.description;
-                if (!gotData) {
-                    setCell(rowIndex, 17, "⚠️ Empty parse");
+                if (blockedTitle || !hasNext) {
+                    console.log(`❌ BLOCKED on Row ${actualRow} — marked and skipped`);
+                    setCell(rowIndex, 17, blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)");
                     dirty++;
-                    consecutiveErrors++;
-                    await pace();
-                    continue;
+                    blockStreak++;
+                    if (blockStreak >= MAX_BLOCK_STREAK) {
+                        console.log(`🛑 ${blockStreak} blocks in a row — ending batch; next batch continues with the next rows.`);
+                        ipFlagged = true; rowsRemaining = true;
+                    }
+                } else {
+                    const d = await extractPageData(page, String(url));
+                    if (!(d.price || d.fullAddress || d.description)) {
+                        setCell(rowIndex, 17, "⚠️ Empty parse (skipped)");
+                        dirty++;
+                        consecutiveErrors++;
+                    } else {
+                        setCell(rowIndex, 9,  d.price);
+                        setCell(rowIndex, 10, d.street);
+                        setCell(rowIndex, 11, d.city);
+                        setCell(rowIndex, 12, d.state);
+                        setCell(rowIndex, 13, d.zipcode);
+                        setCell(rowIndex, 14, d.canonicalUrl);
+                        setCell(rowIndex, 15, d.agentDetails);
+                        setCell(rowIndex, 16, d.soldPrice);
+                        setCell(rowIndex, 17, "✅ Done");
+                        setCell(rowIndex, 18, d.description);
+                        setCell(rowIndex, 19, d.fullAddress);
+                        setCell(rowIndex, 20, d.pricePerSqft);
+                        setCell(rowIndex, 21, d.beds);
+                        setCell(rowIndex, 22, d.baths);
+                        setCell(rowIndex, 23, d.sqft);
+                        setCell(rowIndex, 24, d.lotSize);
+                        setCell(rowIndex, 25, d.listedForSale);
+                        setCell(rowIndex, 26, d.soldOn);
+                        setCell(rowIndex, 27, d.mls);
+                        setCell(rowIndex, 28, d.propertyType);
+                        setCell(rowIndex, 29, d.yearBuilt);
+                        setCell(rowIndex, 30, d.hoa);
+                        setCell(rowIndex, 31, d.priceHistoryText);
+                        setCell(rowIndex, 32, d.factsFeaturesText);
+                        setCell(rowIndex, 33, d.pageText);
+                        dirty++;
+                        scrapeCount++;
+                        blockStreak = 0;
+                        consecutiveErrors = 0;
+                        console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES' : 'NO'}`);
+                    }
                 }
-
-                setCell(rowIndex, 9,  data.price);
-                setCell(rowIndex, 10, data.street);
-                setCell(rowIndex, 11, data.city);
-                setCell(rowIndex, 12, data.state);
-                setCell(rowIndex, 13, data.zipcode);
-                setCell(rowIndex, 14, finalUrl);
-                setCell(rowIndex, 15, data.agentDetails);
-                setCell(rowIndex, 16, data.soldPrice);
-                setCell(rowIndex, 17, "✅ Done");
-                setCell(rowIndex, 18, data.description);
-                setCell(rowIndex, 19, data.fullAddress);
-                setCell(rowIndex, 20, data.pricePerSqft);
-                setCell(rowIndex, 21, data.beds);
-                setCell(rowIndex, 22, data.baths);
-                setCell(rowIndex, 23, data.sqft);
-                setCell(rowIndex, 24, data.lotSize);
-                setCell(rowIndex, 25, data.listedForSale);
-                setCell(rowIndex, 26, data.soldOn);
-                setCell(rowIndex, 27, data.mls);
-                setCell(rowIndex, 28, data.propertyType);
-                setCell(rowIndex, 29, data.yearBuilt);
-                setCell(rowIndex, 30, data.hoa);
-                setCell(rowIndex, 31, data.priceHistoryText);
-                setCell(rowIndex, 32, data.factsFeaturesText);
-                setCell(rowIndex, 33, data.pageText);
-
-                dirty++;
-                scrapeCount++;
-                consecutiveErrors = 0;
-                blockStreak = 0;
-                console.log(`   ✔️ ${data.fullAddress || '?'} | 💰 ${data.price || '?'} | 📊 Hist: ${data.priceHistoryText ? 'YES' : 'NO'}`);
-
             } catch (e) {
-                console.error(`   🛑 Error: ${e.message}`);
+                console.error(`🛑 Error on Row ${actualRow}: ${e.message}`);
                 setCell(rowIndex, 17, "🛑 Error: " + e.message);
                 dirty++;
                 consecutiveErrors++;
-
-                // If the page itself died, open a fresh one
-                if (page.isClosed()) page = await preparePage(browser);
+            } finally {
+                await page.close().catch(() => {});
             }
 
-            await pace();
+            if (ipFlagged) break;
+            if (dirty >= FLUSH_BATCH_SIZE) {
+                console.log(`📦 Saving batch to Google Sheets...`);
+                await flush();
+            }
         }
     } finally {
-        // Always save pending changes (including BLOCKED status) before exiting
         try { await flush(); } catch (e) { console.error(`⚠️ Final save failed: ${e.message}`); }
         await browser.close().catch(() => {});
     }
 
-    if (skippedBlocked) console.log(`⏭️ Skipped ${skippedBlocked} rows already marked blocked/error`);
-    // blocked=true only when the batch made zero progress because of blocks
-    setOutput(rowsRemaining || stoppedEarly, ipFlagged && scrapeCount === 0);
+    if (skipped) console.log(`⏭️ Skipped ${skipped} rows already marked blocked/error`);
+    const hasMore = rowsRemaining || stoppedEarly;
+    // blocked=true only when this batch made zero progress because of blocks
+    setOutput(hasMore, ipFlagged && scrapeCount === 0);
+    console.log(hasMore ? "🔄 More rows remain — next batch will be triggered." : "🎉 Sheet fully processed!");
 }
 
 runScraper().catch(err => {

@@ -44,6 +44,14 @@ function cleanText(s) {
     return (s || "").replace(/\s+/g, " ").trim();
 }
 
+// Google Sheets hard cell limit is 50,000 chars; keep a safe margin
+const MAX_CELL_LEN = 49000;
+function safeCell(v) {
+    if (v === null || v === undefined) return "";
+    const s = String(v);
+    return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…[truncated]" : s;
+}
+
 // =========================================================
 // 3. CORE SCRAPER — FULL DETAIL EXTRACTION
 // =========================================================
@@ -61,15 +69,23 @@ async function runScraper() {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
-    // Columns: A=URL, B-K existing, L-S new mapping, T+ = full-page extras
-    // We'll ensure at least 30 columns exist.
-    const REQUIRED_COLS = 30;
+    // A..AH = 34 columns (indices 0..33). Resize BEFORE loadCells.
+    const REQUIRED_COLS = 34;
     if (sheet.columnCount < REQUIRED_COLS) {
         console.log(`📏 Expanding sheet columns from ${sheet.columnCount} to ${REQUIRED_COLS}...`);
         await sheet.resize({ rowCount: sheet.rowCount, columnCount: REQUIRED_COLS });
     }
-
     await sheet.loadCells();
+    console.log(`📊 Sheet ready: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
+
+    // Defensive cell writer — never throws on out-of-bounds
+    const setCell = (r, c, v) => {
+        if (c >= sheet.columnCount) {
+            console.warn(`⚠️ Skipping write to column ${c} (sheet only has ${sheet.columnCount} cols)`);
+            return;
+        }
+        sheet.getCell(r, c).value = safeCell(v);
+    };
 
     const browser = await puppeteer.launch({
         headless: "new",
@@ -83,8 +99,6 @@ async function runScraper() {
 
     // Column map (0-indexed):
     // 0  A = Original URL
-    // 1  B = (existing)
-    // ...
     // 9  J = Price
     // 10 K = Street
     // 11 L = City
@@ -101,7 +115,7 @@ async function runScraper() {
     // 22 W = Baths
     // 23 X = Sqft
     // 24 Y = Lot Size
-    // 25 Z = Listed for sale (date)
+    // 25 Z = Listed for sale (date + price)
     // 26 AA = Sold On (date)
     // 27 AB = MLS
     // 28 AC = Property Type
@@ -146,7 +160,7 @@ async function runScraper() {
             const pageTitle = await page.title();
             if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
                 console.log(`❌ BLOCKED: IP flagged on Row ${actualRowNumber}`);
-                sheet.getCell(rowIndex, 17).value = "❌ BLOCKED (IP Burned)";
+                setCell(rowIndex, 17, "❌ BLOCKED (IP Burned)");
                 await saveWithRetry(sheet);
                 await page.close();
                 continue;
@@ -188,6 +202,8 @@ async function runScraper() {
                     priceHistoryText: "", factsFeaturesText: "", pageText: ""
                 };
 
+                const cleanText = (s) => (s || "").replace(/\s+/g, " ").trim();
+
                 // --- Canonical URL ---
                 out.canonicalUrl =
                     document.querySelector('meta[property="og:url"]')?.content ||
@@ -209,33 +225,29 @@ async function runScraper() {
                 }
 
                 if (p) {
-                    // Price
                     out.price = p.price || "";
 
-                    // Address parts
-                    out.street = p.address?.streetAddress || p.streetAddress || "";
-                    out.city   = p.address?.city        || p.city        || "";
-                    out.state  = p.address?.state       || p.state       || "";
-                    out.zipcode= p.address?.zipcode     || p.zipcode     || "";
+                    out.street  = p.address?.streetAddress || p.streetAddress || "";
+                    out.city    = p.address?.city          || p.city          || "";
+                    out.state   = p.address?.state         || p.state         || "";
+                    out.zipcode = p.address?.zipcode       || p.zipcode       || "";
                     out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
 
-                    // Beds / Baths / Sqft
                     out.beds = p.bedrooms ?? p.resoFacts?.bedrooms ?? "";
                     out.baths = p.bathrooms ?? p.resoFacts?.bathrooms ?? "";
                     out.sqft = p.livingAreaValue ?? p.livingArea ?? p.resoFacts?.livingArea ?? "";
+
                     if (p.resoFacts?.pricePerSquareFoot) {
                         out.pricePerSqft = p.resoFacts.pricePerSquareFoot;
                     } else if (out.price && out.sqft) {
                         out.pricePerSqft = Math.round(Number(out.price) / Number(out.sqft));
                     }
 
-                    // Lot size
                     const lotStr = p.resoFacts?.lotSize || "";
                     const lotAcres = p.lotAreaValue || "";
                     const lotUnits = p.lotAreaUnits || "";
                     out.lotSize = lotStr || (lotAcres ? `${lotAcres} ${lotUnits}`.trim() : "");
 
-                    // Agent
                     if (p.attributionInfo) {
                         const name = p.attributionInfo.agentName || "";
                         const broker = p.attributionInfo.brokerName || "";
@@ -243,24 +255,16 @@ async function runScraper() {
                         out.agentDetails = [name, broker, phone].filter(Boolean).join(" | ");
                     }
 
-                    // Sold price
                     out.soldPrice = p.lastSoldPrice || "";
-
-                    // Description
                     out.description = p.description || p.homeDescription || "N/A";
 
-                    // MLS
                     const mlsId = p.attributionInfo?.mlsId || "";
                     const mlsName = p.attributionInfo?.mlsName || "";
                     out.mls = [mlsId, mlsName].filter(Boolean).join(" - ");
 
-                    // Property Type
                     out.propertyType = p.homeType || p.resoFacts?.homeType || p.propertyTypeDimension || "";
-
-                    // Year Built
                     out.yearBuilt = p.yearBuilt || p.resoFacts?.yearBuilt || "";
 
-                    // HOA
                     if (p.monthlyHoaFee) out.hoa = `$${p.monthlyHoaFee}/mo`;
                     else if (p.resoFacts?.hoaFeeTotal) out.hoa = p.resoFacts.hoaFeeTotal;
                     else out.hoa = "No / None listed";
@@ -272,7 +276,6 @@ async function runScraper() {
                     const phHeader = headers.find(h => cleanText(h.innerText).toLowerCase() === "price history");
                     let tableEl = null;
                     if (phHeader) {
-                        // Walk up to the section container and find the table
                         let node = phHeader;
                         for (let i = 0; i < 6 && node; i++) {
                             node = node.parentElement;
@@ -313,13 +316,9 @@ async function runScraper() {
 
                 // --- Facts & Features text ---
                 try {
-                    const headers = Array.from(document.querySelectorAll('h3'));
-                    const ffHeader = headers.find(h => cleanText(h.innerText).toLowerCase().includes("facts"));
-                    // Some pages don't have an FF header; grab all h6 fact categories
                     const factHeaders = Array.from(document.querySelectorAll('h6'));
                     if (factHeaders.length) {
                         const lines = [];
-                        // Group by category section (h3)
                         const sections = Array.from(document.querySelectorAll('h3'));
                         for (const sec of sections) {
                             const secName = cleanText(sec.innerText);
@@ -346,7 +345,6 @@ async function runScraper() {
                 // --- Whole page text (formatted) ---
                 try {
                     const raw = document.body.innerText || "";
-                    // Normalize: collapse blank lines, strip repeated whitespace
                     out.pageText = raw
                         .split("\n")
                         .map(l => l.replace(/[ \t]+/g, " ").trim())
@@ -358,45 +356,43 @@ async function runScraper() {
             });
 
             // =========================================================
-            // 5. WRITE TO SHEET (expanded columns)
+            // 5. WRITE TO SHEET (using safe setCell)
             // =========================================================
             const finalUrl = extractedData.canonicalUrl || originalUrl;
 
-            sheet.getCell(rowIndex, 9).value  = extractedData.price;
-            sheet.getCell(rowIndex, 10).value = extractedData.street;
-            sheet.getCell(rowIndex, 11).value = extractedData.city;
-            sheet.getCell(rowIndex, 12).value = extractedData.state;
-            sheet.getCell(rowIndex, 13).value = extractedData.zipcode;
-            sheet.getCell(rowIndex, 14).value = finalUrl;
-            sheet.getCell(rowIndex, 15).value = extractedData.agentDetails;
-            sheet.getCell(rowIndex, 16).value = extractedData.soldPrice;
-            sheet.getCell(rowIndex, 17).value = "✅ SUCCESS";
-            sheet.getCell(rowIndex, 18).value = extractedData.description;
-
-            // New columns
-            sheet.getCell(rowIndex, 19).value = extractedData.fullAddress;      // T
-            sheet.getCell(rowIndex, 20).value = extractedData.pricePerSqft;     // U
-            sheet.getCell(rowIndex, 21).value = extractedData.beds;             // V
-            sheet.getCell(rowIndex, 22).value = extractedData.baths;            // W
-            sheet.getCell(rowIndex, 23).value = extractedData.sqft;             // X
-            sheet.getCell(rowIndex, 24).value = extractedData.lotSize;          // Y
-            sheet.getCell(rowIndex, 25).value = extractedData.listedForSale;    // Z
-            sheet.getCell(rowIndex, 26).value = extractedData.soldOn;           // AA
-            sheet.getCell(rowIndex, 27).value = extractedData.mls;              // AB
-            sheet.getCell(rowIndex, 28).value = extractedData.propertyType;     // AC
-            sheet.getCell(rowIndex, 29).value = extractedData.yearBuilt;        // AD
-            sheet.getCell(rowIndex, 30).value = extractedData.hoa;              // AE
-            sheet.getCell(rowIndex, 31).value = extractedData.priceHistoryText; // AF
-            sheet.getCell(rowIndex, 32).value = extractedData.factsFeaturesText;// AG
-            sheet.getCell(rowIndex, 33).value = extractedData.pageText;         // AH
+            setCell(rowIndex, 9,  extractedData.price);
+            setCell(rowIndex, 10, extractedData.street);
+            setCell(rowIndex, 11, extractedData.city);
+            setCell(rowIndex, 12, extractedData.state);
+            setCell(rowIndex, 13, extractedData.zipcode);
+            setCell(rowIndex, 14, finalUrl);
+            setCell(rowIndex, 15, extractedData.agentDetails);
+            setCell(rowIndex, 16, extractedData.soldPrice);
+            setCell(rowIndex, 17, "✅ SUCCESS");
+            setCell(rowIndex, 18, extractedData.description);
+            setCell(rowIndex, 19, extractedData.fullAddress);
+            setCell(rowIndex, 20, extractedData.pricePerSqft);
+            setCell(rowIndex, 21, extractedData.beds);
+            setCell(rowIndex, 22, extractedData.baths);
+            setCell(rowIndex, 23, extractedData.sqft);
+            setCell(rowIndex, 24, extractedData.lotSize);
+            setCell(rowIndex, 25, extractedData.listedForSale);
+            setCell(rowIndex, 26, extractedData.soldOn);
+            setCell(rowIndex, 27, extractedData.mls);
+            setCell(rowIndex, 28, extractedData.propertyType);
+            setCell(rowIndex, 29, extractedData.yearBuilt);
+            setCell(rowIndex, 30, extractedData.hoa);
+            setCell(rowIndex, 31, extractedData.priceHistoryText);
+            setCell(rowIndex, 32, extractedData.factsFeaturesText);
+            setCell(rowIndex, 33, extractedData.pageText);
 
             stagedCellsToSave.push(rowIndex);
-            console.log(`✔️ Row ${actualRowNumber} | 💰 ${extractedData.price} | 🛏 ${extractedData.beds} 🛁 ${extractedData.baths} | 📅 Listed ${extractedData.listedForSale} | Sold ${extractedData.soldOn}`);
+            console.log(`✔️ Row ${actualRowNumber} | 💰 ${extractedData.price} | 🛏 ${extractedData.beds} 🛁 ${extractedData.baths} | 📅 Listed ${extractedData.listedForSale || "-"} | Sold ${extractedData.soldOn || "-"}`);
             scrapeCount++;
 
         } catch (e) {
             console.error(`🛑 Error on Row ${actualRowNumber}: ${e.message}`);
-            sheet.getCell(rowIndex, 17).value = "🛑 Error: " + e.message;
+            setCell(rowIndex, 17, "🛑 Error: " + e.message);
             stagedCellsToSave.push(rowIndex);
         } finally {
             await page.close();

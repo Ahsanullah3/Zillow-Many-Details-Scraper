@@ -33,9 +33,8 @@ const safeCell = (v) => {
 // =========================================================
 async function launchBrowser() {
     const edgePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    if (!edgePath) {
-        throw new Error("PUPPETEER_EXECUTABLE_PATH not set. Edge path must be provided.");
-    }
+    if (!edgePath) throw new Error("PUPPETEER_EXECUTABLE_PATH not set.");
+
     console.log(`🌐 Using Edge: ${edgePath}`);
 
     return puppeteer.launch({
@@ -93,79 +92,75 @@ async function humanNavigate(page, url) {
 }
 
 // =========================================================
-// GRAPHQL PRICE HISTORY
+// EXTRACT HISTORY FROM RENDERED DOM (Primary Method)
 // =========================================================
-async function fetchPriceHistory(zpid) {
-    if (!zpid) return { priceHistory: [], taxHistory: [] };
-
-    const query = `
-        query ZestimateDeepDiveQuery($zpid: ID!) {
-            property(zpid: $zpid) {
-                zpid
-                zestimate
-                priceHistory { date price priceChangeRate event source pricePerSquareFoot }
-                taxHistory { time taxPaid taxAssessedValue }
-            }
-        }
-    `;
+async function extractHistoryFromDOM(page) {
+    const result = { priceHistoryText: "", listedForSale: "", soldOn: "" };
 
     try {
-        const res = await fetch("https://www.zillow.com/graphql/", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-                "client-id": "hdp-react-web-client",
-            },
-            body: JSON.stringify({
-                operationName: "ZestimateDeepDiveQuery",
-                variables: { zpid: parseInt(zpid, 10) },
-                query,
-            }),
+        // Scroll to trigger lazy rendering of the price history section
+        await page.evaluate(() => {
+            const headers = Array.from(document.querySelectorAll('h2, h3'));
+            const ph = headers.find(h => (h.innerText || '').toLowerCase().includes('price history'));
+            if (ph) ph.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        await delay(2500);
+
+        const data = await page.evaluate(() => {
+            const cleanText = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const headers = Array.from(document.querySelectorAll('h2, h3'));
+            const phHeader = headers.find(h => cleanText(h.innerText).toLowerCase() === 'price history');
+            if (!phHeader) return { lines: [], listedForSale: '', soldOn: '' };
+
+            // Walk up to find the table container
+            let node = phHeader;
+            let table = null;
+            for (let i = 0; i < 6 && node; i++) {
+                node = node.parentElement;
+                if (!node) break;
+                table = node.querySelector('table');
+                if (table) break;
+            }
+            if (!table) return { lines: [], listedForSale: '', soldOn: '' };
+
+            const rows = Array.from(table.querySelectorAll('tr'));
+            const lines = [];
+            let listedForSale = '';
+            let soldOn = '';
+
+            for (const tr of rows) {
+                const cells = Array.from(tr.querySelectorAll('th,td'))
+                    .map(c => cleanText(c.innerText)).filter(Boolean);
+                if (cells.length) lines.push(cells.join(' | '));
+
+                if (cells.length >= 3) {
+                    const date = cells[0];
+                    const event = (cells[1] || '').toLowerCase();
+                    const price = cells[2];
+                    if (event.includes('listed for sale') && !listedForSale) listedForSale = `${date} (${price})`;
+                    if (event.includes('sold') && !soldOn) soldOn = date;
+                }
+            }
+
+            return { lines, listedForSale, soldOn };
         });
 
-        const json = await res.json();
-        if (json?.data?.property) {
-            return {
-                priceHistory: json.data.property.priceHistory || [],
-                taxHistory: json.data.property.taxHistory || [],
-            };
+        result.priceHistoryText = data.lines.join('\n');
+        result.listedForSale = data.listedForSale;
+        result.soldOn = data.soldOn;
+
+        if (result.priceHistoryText) {
+            console.log(`   📊 History from DOM: ${data.lines.length} rows`);
         }
     } catch (e) {
-        console.log(`   ⚠️ GraphQL: ${e.message}`);
+        console.log(`   ⚠️ DOM history: ${e.message}`);
     }
-    return { priceHistory: [], taxHistory: [] };
+
+    return result;
 }
 
 // =========================================================
-// FORMAT HISTORY
-// =========================================================
-function formatPriceHistory(priceHistory) {
-    if (!priceHistory || priceHistory.length === 0) return "";
-    const lines = ["Date | Event | Price | $/sqft | Source"];
-    for (const h of priceHistory) {
-        const date = h.date ? h.date.split("T")[0] : "";
-        const price = h.price ? `$${Number(h.price).toLocaleString()}` : "";
-        const psf = h.pricePerSquareFoot ? `$${h.pricePerSquareFoot}` : "";
-        lines.push(`${date} | ${h.event || ""} | ${price} | ${psf} | ${h.source || ""}`);
-    }
-    return lines.join("\n");
-}
-
-function formatTaxHistory(taxHistory) {
-    if (!taxHistory || taxHistory.length === 0) return "";
-    const lines = ["Year | Tax Paid | Assessed Value"];
-    for (const t of taxHistory) {
-        const year = t.time ? new Date(t.time).getFullYear() : "";
-        const paid = t.taxPaid ? `$${Number(t.taxPaid).toLocaleString()}` : "";
-        const assessed = t.taxAssessedValue ? `$${Number(t.taxAssessedValue).toLocaleString()}` : "";
-        lines.push(`${year} | ${paid} | ${assessed}`);
-    }
-    return lines.join("\n");
-}
-
-// =========================================================
-// EXTRACT PAGE DATA
+// EXTRACT PAGE DATA (includes DOM history)
 // =========================================================
 async function extractPageData(page, originalUrl) {
     const out = {
@@ -230,25 +225,15 @@ async function extractPageData(page, originalUrl) {
         } catch (e) {}
     }
 
-    // GraphQL history
-    if (out.zpid) {
-        console.log(`   📊 Fetching history for zpid ${out.zpid}...`);
-        const hist = await fetchPriceHistory(out.zpid);
-        out.priceHistoryText = formatPriceHistory(hist.priceHistory);
-        for (const h of hist.priceHistory) {
-            const event = (h.event || "").toLowerCase();
-            const date = h.date ? h.date.split("T")[0] : "";
-            const price = h.price ? `$${Number(h.price).toLocaleString()}` : "";
-            if (event.includes("listed") && !out.listedForSale) out.listedForSale = `${date} (${price})`;
-            if (event.includes("sold") && !out.soldOn) out.soldOn = date;
-        }
-        const taxText = formatTaxHistory(hist.taxHistory);
-        if (taxText) out.priceHistoryText += "\n\n--- TAX HISTORY ---\n" + taxText;
-    }
+    // --- History from DOM (in-browser, uses session cookies) ---
+    const history = await extractHistoryFromDOM(page);
+    out.priceHistoryText = history.priceHistoryText;
+    if (history.listedForSale && !out.listedForSale) out.listedForSale = history.listedForSale;
+    if (history.soldOn && !out.soldOn) out.soldOn = history.soldOn;
 
     // Facts & Features (best-effort)
     try {
-        const cleanText = (s) => (s || "").replace(/\s+/g, " ").trim();
+        const cleanText = (s) => (s || '').replace(/\s+/g, ' ').trim();
         const ffSection = html.match(/Facts &amp; Features([\s\S]{0,50000})/i);
         if (ffSection) {
             const text = ffSection[1].replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, '\n');
@@ -268,9 +253,9 @@ async function extractPageData(page, originalUrl) {
 // BLOCK DETECTION
 // =========================================================
 function isBlocked(title, bodyText) {
-    const t = (title || "").toLowerCase();
-    const b = (bodyText || "").toLowerCase();
-    return t.includes("pardon our interruption") || t.includes("robot check") || t.includes("access denied") || b.includes("pardon our interruption");
+    const t = (title || '').toLowerCase();
+    const b = (bodyText || '').toLowerCase();
+    return t.includes('pardon our interruption') || t.includes('robot check') || t.includes('access denied') || b.includes('pardon our interruption');
 }
 
 // =========================================================
@@ -278,7 +263,7 @@ function isBlocked(title, bodyText) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log("🚀 Starting Edge Scraper V15...");
+    console.log("🚀 Starting Edge Scraper V16 (DOM-based history)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -352,11 +337,20 @@ async function runScraper() {
             try { bodySnippet = await page.evaluate(() => (document.body?.innerText || "").slice(0, 500)); } catch (_) {}
 
             if (isBlocked(title, bodySnippet)) {
-                console.log(`🛑 BLOCKED on Row ${actualRowNumber} — stopping run.`);
+                console.log(`🛑 BLOCKED on Row ${actualRowNumber} — stopping.`);
                 setCell(rowIndex, 17, "❌ BLOCKED");
                 ipBlocked = true;
                 rowsRemaining = false;
                 await sheet.saveUpdatedCells();
+                break;
+            }
+
+            // Check for __NEXT_DATA__ presence
+            const hasNextData = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
+            if (!hasNextData) {
+                console.log(`   ⚠️ No __NEXT_DATA__ — page may be blocked or wrong template`);
+                setCell(rowIndex, 17, "🚫 No data (blocked?)");
+                ipBlocked = true;
                 break;
             }
 
@@ -392,7 +386,7 @@ async function runScraper() {
 
             staged.push(rowIndex);
             scrapeCount++;
-            console.log(`   ✔️ ${data.fullAddress} | 💰 ${data.price} | 📊 Hist: ${data.priceHistoryText ? 'YES' : 'NO'}`);
+            console.log(`   ✔️ ${data.fullAddress || '?'} | 💰 ${data.price || '?'} | 📊 Hist: ${data.priceHistoryText ? 'YES' : 'NO'}`);
 
         } catch (e) {
             console.error(`   🛑 Error: ${e.message}`);

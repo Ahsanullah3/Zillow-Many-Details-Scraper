@@ -12,6 +12,11 @@ on:
         required: false
         default: "1"
         type: string
+      blocks:
+        description: "Consecutive blocked batches"
+        required: false
+        default: "0"
+        type: string
 
 permissions:
   actions: write
@@ -22,13 +27,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MAX_BATCHES: "40"          # hard cap so a persistent block can't loop forever
-  BLOCK_COOLDOWN_SEC: "300"  # wait this long before retrying after a block
+  MAX_BATCHES: "40"            # hard cap on the whole chain
+  MAX_CONSECUTIVE_BLOCKS: "6"  # stop after this many blocked batches in a row
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 25       # room for scrape (~6 min) + cooldown
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
@@ -56,28 +61,37 @@ jobs:
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-edge.outputs.edge-path }}
         run: npm start
 
-      # Runs ONLY if the job is still healthy: not cancelled, not failed,
+      # Runs ONLY if the job is healthy: not cancelled, not failed,
       # not timed out, and the scraper reported more rows.
       - name: Evaluate Self-Reboot
         if: ${{ !cancelled() && success() && steps.scraper_task.outputs.has_more == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CURRENT_BATCH: ${{ inputs.batch || '1' }}
+          CURRENT_BLOCKS: ${{ inputs.blocks || '0' }}
           WAS_BLOCKED: ${{ steps.scraper_task.outputs.blocked }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           if ! [[ "$CURRENT_BATCH" =~ ^[0-9]+$ ]]; then CURRENT_BATCH=1; fi
+          if ! [[ "$CURRENT_BLOCKS" =~ ^[0-9]+$ ]]; then CURRENT_BLOCKS=0; fi
           NEXT_BATCH=$((CURRENT_BATCH + 1))
 
           if [ "$NEXT_BATCH" -gt "$MAX_BATCHES" ]; then
-            echo "Reached MAX_BATCHES ($MAX_BATCHES). Stopping chain; cron will resume later."
+            echo "Reached MAX_BATCHES ($MAX_BATCHES). Stopping; cron will resume later."
             exit 0
           fi
 
+          # Blocked -> retry immediately (new runner = new IP), but cap consecutive blocks
           if [ "$WAS_BLOCKED" = "true" ]; then
-            echo "Blocked — cooling down ${BLOCK_COOLDOWN_SEC}s before next batch"
-            sleep "$BLOCK_COOLDOWN_SEC"
+            NEXT_BLOCKS=$((CURRENT_BLOCKS + 1))
+            if [ "$NEXT_BLOCKS" -ge "$MAX_CONSECUTIVE_BLOCKS" ]; then
+              echo "Blocked $NEXT_BLOCKS batches in a row — stopping. Cron will retry later."
+              exit 0
+            fi
+            echo "Blocked — starting next batch immediately on a fresh runner ($NEXT_BLOCKS in a row)"
+          else
+            NEXT_BLOCKS=0
           fi
 
           echo "Batch $CURRENT_BATCH → Batch $NEXT_BATCH"
-          gh workflow run scraper.yml --ref "$REF_NAME" -f batch="$NEXT_BATCH"
+          gh workflow run scraper.yml --ref "$REF_NAME" -f batch="$NEXT_BATCH" -f blocks="$NEXT_BLOCKS"

@@ -1,7 +1,7 @@
 {
   "name": "zillow-full-scraper",
-  "version": "11.1.0",
-  "description": "Stealth Zillow scraper — full detail + page text to Google Sheets",
+  "version": "12.0.0",
+  "description": "Stealth Zillow scraper — headless real Chrome, no proxy, full detail + page text to Google Sheets",
   "main": "scraper.js",
   "scripts": {
     "start": "node scraper.js"

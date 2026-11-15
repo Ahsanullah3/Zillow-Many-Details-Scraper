@@ -11,10 +11,10 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const MAX_URLS_PER_RUN = 30;            // URLs attempted per process invocation
-const FLUSH_EVERY = 5;                  // save to Sheets every N rows
+const MAX_URLS_PER_RUN = 30;
+const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
-const MAX_CONSECUTIVE_BLOCK_STREAKS = 3; // 3 consecutive URL-blocks → exit for GH new batch
+const MAX_CONSECUTIVE_BLOCK_STREAKS = 3;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
@@ -105,7 +105,7 @@ async function saveWithRetry(sheet, retries = 3) {
 }
 
 // =========================================================
-// SAFE CELL ACCESS (avoids "Value has been changed" throw)
+// SAFE CELL ACCESS
 // =========================================================
 function safeValue(sheet, row, col) {
     try {
@@ -117,13 +117,17 @@ function safeValue(sheet, row, col) {
 }
 
 // =========================================================
-// FIND START ROW
+// FIND NEXT ROW — forward cursor, never repeats
 // =========================================================
-function findStartRow(sheet) {
-    for (let r = 1; r < sheet.rowCount; r++) {
+function findNextRow(sheet, afterRow) {
+    for (let r = afterRow + 1; r < sheet.rowCount; r++) {
         const url = safeValue(sheet, r, 0);
         if (!url || !url.includes("zillow.com")) continue;
-        if (isDoneStatus(safeValue(sheet, r, 17))) continue;
+        const status = safeValue(sheet, r, 17);
+        if (isDoneStatus(status)) continue;
+        // On very first scan (afterRow === -1): include blocked rows so they're retried once.
+        // Mid-run (afterRow >= 0): skip blocked rows so each URL is attempted only once per process.
+        if (afterRow !== -1 && isSkipStatus(status) && !RETRY_BLOCKED) continue;
         return r;
     }
     return -1;
@@ -196,7 +200,6 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        // Zoom 5% so whole page fits
         try {
             await page.evaluate((z) => {
                 document.documentElement.style.zoom = String(z);
@@ -213,7 +216,6 @@ async function scrapeOneUrl(browser, url) {
 
         await delay(ZOOM_WAIT);
 
-        // Click "Table view" if present
         await page.evaluate(() => {
             const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
                 .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
@@ -385,7 +387,6 @@ async function scrapeOneUrl(browser, url) {
 
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
-        // History
         let domRows = [];
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
         if (!domRows.length) {
@@ -416,7 +417,6 @@ async function scrapeOneUrl(browser, url) {
             }
         }
 
-        // Description JSON-LD fallback
         if (!data.description || data.description === 'N/A') {
             try {
                 const ldDesc = await page.evaluate(() => {
@@ -432,7 +432,6 @@ async function scrapeOneUrl(browser, url) {
             } catch (e) { data.description = data.description || 'N/A'; }
         }
 
-        // Facts & Features
         data.factsFeaturesText = "";
         try {
             data.factsFeaturesText = await page.evaluate(() => {
@@ -462,7 +461,7 @@ async function scrapeOneUrl(browser, url) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Stealth Scraper V17 — 1 URL/browser, safe cell reads, 3 blocks → handoff`);
+    console.log(`🚀 Stealth Scraper V18 — 1 URL/browser, forward cursor (no repeats), safe cells, 3 blocks → handoff`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -497,13 +496,13 @@ async function runScraper() {
         if (dirty > 0) {
             await saveWithRetry(sheet);
             dirty = 0;
-            // Re-sync so future getCell().value reads work
             try { await sheet.loadCells(); } catch (e) { console.warn(`⚠️ loadCells failed: ${e.message}`); }
         }
     };
 
     let attempted = 0, success = 0, blockStreak = 0, errorStreak = 0;
     let totalBlocks = 0, totalErrors = 0, totalSkipped = 0;
+    let lastTriedRow = -1;
 
     while (Date.now() - startTime < MAX_RUNTIME_MS) {
         if (attempted >= MAX_URLS_PER_RUN) {
@@ -515,14 +514,18 @@ async function runScraper() {
             break;
         }
 
-        const rowIndex = findStartRow(sheet);
-        if (rowIndex === -1) { console.log("🎉 All rows ✅ Done."); break; }
+        // Forward-only cursor: never re-select a row we already attempted this run
+        const rowIndex = findNextRow(sheet, lastTriedRow);
+        if (rowIndex === -1) {
+            console.log("🎉 No more rows to attempt in this run.");
+            break;
+        }
+        lastTriedRow = rowIndex;
 
         const url = String(safeValue(sheet, rowIndex, 0));
         const actualRow = rowIndex + 1;
         console.log(`\n🕵️ Row ${actualRow} (attempt ${attempted + 1}/${MAX_URLS_PER_RUN}): ${url}`);
 
-        // ==== FRESH BROWSER FOR THIS SINGLE URL ====
         console.log(`🌐 Launching fresh browser (no cookies, new profile)...`);
         let { browser } = await launchFreshBrowser();
 
@@ -614,7 +617,7 @@ async function runScraper() {
     console.log(`✅ Success: ${success} | 🚫 Blocked: ${totalBlocks} | 🛑 Errors: ${totalErrors} | ⏭️ Skipped: ${totalSkipped}`);
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
-    const remaining = findStartRow(sheet);
+    const remaining = findNextRow(sheet, -1);
     const hasMore = remaining !== -1;
     setOutput(hasMore, false);
     console.log(hasMore ? `🔄 More rows remain — next run resumes at row ${remaining + 1}.` : "🎉 Sheet fully processed!");

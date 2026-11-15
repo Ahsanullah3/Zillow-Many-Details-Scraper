@@ -15,7 +15,14 @@ puppeteer.use(AnonymizeUA({
 }));
 
 // =========================================================
-// 1. HELPERS
+// CONFIG
+// =========================================================
+const MAX_ROWS_PER_RUN = 5;         // no proxy → keep low to protect the IP
+const FLUSH_BATCH_SIZE = 3;         // smaller batches → more frequent saves
+const REQUIRED_COLS = 34;           // A..AH
+
+// =========================================================
+// HELPERS
 // =========================================================
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const jitter = (min, max) => min + Math.floor(Math.random() * (max - min));
@@ -33,14 +40,8 @@ const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
 ];
+const pickUA = () => USER_AGENTS[jitter(0, USER_AGENTS.length)];
 
-function pickUA() {
-    return USER_AGENTS[jitter(0, USER_AGENTS.length)];
-}
-
-// =========================================================
-// 2. GOOGLE SHEETS RETRY
-// =========================================================
 async function saveWithRetry(sheet, retries = 4) {
     for (let i = 0; i < retries; i++) {
         try {
@@ -59,22 +60,9 @@ async function saveWithRetry(sheet, retries = 4) {
 }
 
 // =========================================================
-// 3. PROXY CONFIG (from env)
+// BROWSER LAUNCH — HEADLESS + REAL CHROME
 // =========================================================
-function getProxyConfig() {
-    const server = process.env.PROXY_SERVER;          // e.g. http://host:port
-    if (!server) return null;
-    return {
-        server,
-        username: process.env.PROXY_USERNAME || undefined,
-        password: process.env.PROXY_PASSWORD || undefined,
-    };
-}
-
-// =========================================================
-// 4. BROWSER LAUNCH
-// =========================================================
-async function launchBrowser(proxy) {
+async function launchBrowser() {
     const args = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -83,34 +71,32 @@ async function launchBrowser(proxy) {
         '--disable-dev-shm-usage',
         '--lang=en-US,en',
         '--window-size=1366,768',
+        // NO --disable-gpu, NO --single-process
     ];
-    if (proxy) {
-        args.push(`--proxy-server=${proxy.server}`);
-    }
 
-    const browser = await puppeteer.launch({
+    const launchOpts = {
         headless: "new",
         args,
         ignoreDefaultArgs: ['--enable-automation'],
-    });
-    return browser;
+    };
+
+    // Use real Chrome if provided by CI / local env
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+        launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+        console.log(`🌐 Using real Chrome: ${launchOpts.executablePath}`);
+    } else {
+        console.log("🌐 Using Puppeteer-bundled Chromium (set PUPPETEER_EXECUTABLE_PATH for real Chrome)");
+    }
+
+    return puppeteer.launch(launchOpts);
 }
 
 // =========================================================
-// 5. PAGE STEALTH
+// PAGE STEALTH
 // =========================================================
-async function preparePage(browser, proxy) {
+async function preparePage(browser) {
     const page = await browser.newPage();
 
-    // Proxy auth
-    if (proxy && proxy.username) {
-        await page.authenticate({
-            username: proxy.username,
-            password: proxy.password,
-        });
-    }
-
-    // Random UA + viewport
     await page.setUserAgent(pickUA());
     await page.setViewport({
         width: jitter(1366, 1600),
@@ -118,26 +104,26 @@ async function preparePage(browser, proxy) {
         deviceScaleFactor: 1,
     });
 
-    // Block heavy resources
     await page.setRequestInterception(true);
     page.on('request', (req) => {
-        const type = req.resourceType();
-        if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
-            req.abort();
-        } else {
-            req.continue();
-        }
+        const t = req.resourceType();
+        if (['image', 'stylesheet', 'font', 'media'].includes(t)) req.abort();
+        else req.continue();
     });
 
-    // Extra JS-level masks
+    // JS-level fingerprint patches
     await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        // Chrome runtime
-        window.chrome = window.chrome || { runtime: {} };
-        // Language
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
         Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        // Permissions
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [
+                { name: 'Chrome PDF Plugin' },
+                { name: 'Chrome PDF Viewer' },
+                { name: 'Native Client' },
+            ],
+        });
+        window.chrome = window.chrome || { runtime: {} };
         const origQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (params) =>
             params.name === 'notifications'
@@ -145,7 +131,7 @@ async function preparePage(browser, proxy) {
                 : origQuery(params);
     });
 
-    // Block navigator.webdriver via CDP too
+    // CDP-level webdriver patch (belt & suspenders)
     const client = await page.target().createCDPSession();
     await client.send('Page.addScriptToEvaluateOnNewDocument', {
         source: `Object.defineProperty(navigator,'webdriver',{get:()=>undefined});`,
@@ -155,31 +141,24 @@ async function preparePage(browser, proxy) {
 }
 
 // =========================================================
-// 6. HUMAN-LIKE NAVIGATION
+// HUMAN NAVIGATION
 // =========================================================
 async function humanNavigate(page, url) {
     await delay(jitter(1500, 3500));
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
 
-    // Random mouse move
     try {
-        await page.mouse.move(
-            jitter(150, 900),
-            jitter(100, 700),
-            { steps: jitter(5, 15) }
-        );
+        await page.mouse.move(jitter(150, 900), jitter(100, 700), { steps: jitter(5, 15) });
     } catch (_) {}
-
-    // Random scroll
     try {
         await page.evaluate(() => window.scrollBy(0, 200 + Math.random() * 500));
     } catch (_) {}
 
-    await delay(jitter(1000, 2500));
+    await delay(jitter(1200, 2500));
 }
 
 // =========================================================
-// 7. EXTRACTION (runs inside page)
+// EXTRACTION (runs inside page context)
 // =========================================================
 function extractPageData() {
     const out = {
@@ -194,12 +173,10 @@ function extractPageData() {
 
     const cleanText = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    // Canonical URL
     out.canonicalUrl =
         document.querySelector('meta[property="og:url"]')?.content ||
         document.querySelector('link[rel="canonical"]')?.href || "";
 
-    // __NEXT_DATA__
     const nextDataScript = document.querySelector('script#__NEXT_DATA__');
     let p = null;
     if (nextDataScript) {
@@ -216,7 +193,6 @@ function extractPageData() {
 
     if (p) {
         out.price = p.price || "";
-
         out.street  = p.address?.streetAddress || p.streetAddress || "";
         out.city    = p.address?.city          || p.city          || "";
         out.state   = p.address?.state         || p.state         || "";
@@ -227,11 +203,8 @@ function extractPageData() {
         out.baths = p.bathrooms ?? p.resoFacts?.bathrooms ?? "";
         out.sqft = p.livingAreaValue ?? p.livingArea ?? p.resoFacts?.livingArea ?? "";
 
-        if (p.resoFacts?.pricePerSquareFoot) {
-            out.pricePerSqft = p.resoFacts.pricePerSquareFoot;
-        } else if (out.price && out.sqft) {
-            out.pricePerSqft = Math.round(Number(out.price) / Number(out.sqft));
-        }
+        if (p.resoFacts?.pricePerSquareFoot) out.pricePerSqft = p.resoFacts.pricePerSquareFoot;
+        else if (out.price && out.sqft) out.pricePerSqft = Math.round(Number(out.price) / Number(out.sqft));
 
         const lotStr = p.resoFacts?.lotSize || "";
         const lotAcres = p.lotAreaValue || "";
@@ -279,25 +252,19 @@ function extractPageData() {
             const lines = [];
             for (const tr of rows) {
                 const cells = Array.from(tr.querySelectorAll('th,td'))
-                    .map(c => cleanText(c.innerText))
-                    .filter(Boolean);
+                    .map(c => cleanText(c.innerText)).filter(Boolean);
                 if (cells.length) lines.push(cells.join(" | "));
             }
             out.priceHistoryText = lines.join("\n");
 
             for (const tr of rows) {
-                const cells = Array.from(tr.querySelectorAll('td'))
-                    .map(c => cleanText(c.innerText));
+                const cells = Array.from(tr.querySelectorAll('td')).map(c => cleanText(c.innerText));
                 if (cells.length >= 3) {
                     const date = cells[0];
                     const event = (cells[1] || "").toLowerCase();
                     const price = cells[2];
-                    if (event.includes("listed for sale") && !out.listedForSale) {
-                        out.listedForSale = `${date} (${price})`;
-                    }
-                    if (event.includes("sold") && !out.soldOn) {
-                        out.soldOn = date;
-                    }
+                    if (event.includes("listed for sale") && !out.listedForSale) out.listedForSale = `${date} (${price})`;
+                    if (event.includes("sold") && !out.soldOn) out.soldOn = date;
                 }
             }
         }
@@ -315,14 +282,12 @@ function extractPageData() {
                 const parent = sec.closest('[data-testid="category-group"]');
                 if (!parent) continue;
                 const facts = [];
-                const h6s = parent.querySelectorAll('h6');
-                for (const h6 of h6s) {
+                for (const h6 of parent.querySelectorAll('h6')) {
                     const cat = cleanText(h6.innerText);
                     const ul = h6.parentElement.querySelector('ul');
                     if (!ul) continue;
                     const items = Array.from(ul.querySelectorAll('li'))
-                        .map(li => cleanText(li.innerText))
-                        .filter(Boolean);
+                        .map(li => cleanText(li.innerText)).filter(Boolean);
                     if (items.length) facts.push(`${cat}: ${items.join("; ")}`);
                 }
                 if (facts.length) lines.push(`[${secName}]\n${facts.join("\n")}`);
@@ -345,10 +310,27 @@ function extractPageData() {
 }
 
 // =========================================================
-// 8. MAIN
+// BLOCK DETECTION
+// =========================================================
+function isBlocked(title, bodyText) {
+    const t = (title || "").toLowerCase();
+    const b = (bodyText || "").toLowerCase();
+    return (
+        t.includes("pardon our interruption") ||
+        t.includes("robot check") ||
+        t.includes("access denied") ||
+        t.includes("access to this page has been denied") ||
+        b.includes("pardon our interruption") ||
+        b.includes("press & hold to confirm") ||
+        b.includes("verify you are a human")
+    );
+}
+
+// =========================================================
+// MAIN
 // =========================================================
 async function runScraper() {
-    console.log("🚀 Starting Full-Detail Stealth Scraper V11.1 (Enhanced Stealth)...");
+    console.log("🚀 Starting Full-Detail Stealth Scraper V12 (headless + real Chrome, no proxy)...");
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     const serviceAccountAuth = new JWT({
@@ -361,7 +343,6 @@ async function runScraper() {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
-    const REQUIRED_COLS = 34; // A..AH = 34 cols
     if (sheet.columnCount < REQUIRED_COLS) {
         console.log(`📏 Expanding sheet columns from ${sheet.columnCount} to ${REQUIRED_COLS}...`);
         await sheet.resize({ rowCount: sheet.rowCount, columnCount: REQUIRED_COLS });
@@ -370,25 +351,37 @@ async function runScraper() {
     console.log(`📊 Sheet ready: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
 
     const setCell = (r, c, v) => {
-        if (c >= sheet.columnCount) {
-            console.warn(`⚠️ Skipping write to column ${c} (sheet has ${sheet.columnCount} cols)`);
-            return;
-        }
+        if (c >= sheet.columnCount) return;
         sheet.getCell(r, c).value = safeCell(v);
     };
 
-    const proxy = getProxyConfig();
-    if (proxy) console.log(`🌐 Proxy enabled: ${proxy.server}`);
-    else console.warn("⚠️ No proxy configured (PROXY_SERVER not set). Expect blocks.");
+    const browser = await launchBrowser();
 
-    const browser = await launchBrowser(proxy);
-
-    // One-time homepage warm-up to collect cookies
+    // Warm-up: clear cookies → Google referer → Zillow homepage
     try {
-        console.log("🍪 Warming up on homepage...");
-        const warm = await preparePage(browser, proxy);
+        console.log("🍪 Warming up...");
+        const warm = await preparePage(browser);
+        const client = await warm.target().createCDPSession();
+        await client.send('Network.clearBrowserCookies');
+
+        await warm.goto('https://www.google.com/search?q=zillow+havelock+nc', {
+            waitUntil: 'domcontentloaded', timeout: 60000,
+        });
+        await delay(jitter(2500, 4000));
+
         await warm.goto('https://www.zillow.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await delay(jitter(2500, 4500));
+        await delay(jitter(3000, 5000));
+
+        const warmTitle = await warm.title();
+        if (isBlocked(warmTitle, "")) {
+            console.log("🛑 Warm-up page is blocked. Aborting run to protect IP.");
+            await warm.close();
+            await browser.close();
+            if (process.env.GITHUB_OUTPUT) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=false\n");
+            }
+            return;
+        }
         await warm.close();
         console.log("🍪 Warm-up done.");
     } catch (e) {
@@ -397,18 +390,20 @@ async function runScraper() {
 
     let scrapeCount = 0;
     let rowsRemaining = false;
-    const FLUSH_BATCH_SIZE = 10;
+    let ipBlocked = false;
     let staged = [];
 
     for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
+        if (ipBlocked) break;
+
         const originalUrl = sheet.getCell(rowIndex, 0).value;
         const status = sheet.getCell(rowIndex, 17).value || "";
 
         if (!originalUrl) continue;
         if (!String(originalUrl).includes("zillow.com") || String(status).includes("✅")) continue;
 
-        if (scrapeCount >= 30) {
-            console.log("🛑 Reached 30 rows. Shutting down to rotate environment...");
+        if (scrapeCount >= MAX_ROWS_PER_RUN) {
+            console.log(`🛑 Reached ${MAX_ROWS_PER_RUN} rows. Stopping to protect IP...`);
             rowsRemaining = true;
             break;
         }
@@ -418,19 +413,23 @@ async function runScraper() {
 
         let page;
         try {
-            page = await preparePage(browser, proxy);
+            page = await preparePage(browser);
             await humanNavigate(page, originalUrl);
 
-            const pageTitle = await page.title();
-            if (pageTitle.includes("Pardon Our Interruption") || pageTitle.includes("Robot Check")) {
-                console.log(`❌ BLOCKED on Row ${actualRowNumber}`);
-                setCell(rowIndex, 17, "❌ BLOCKED (IP Burned)");
+            const title = await page.title();
+            let bodySnippet = "";
+            try { bodySnippet = await page.evaluate(() => (document.body?.innerText || "").slice(0, 500)); } catch (_) {}
+
+            if (isBlocked(title, bodySnippet)) {
+                console.log(`🛑 BLOCKED on Row ${actualRowNumber} — stopping entire run.`);
+                setCell(rowIndex, 17, "❌ BLOCKED (no proxy — IP flagged)");
+                ipBlocked = true;
+                rowsRemaining = false;
                 await saveWithRetry(sheet);
                 await page.close();
-                continue;
+                break;
             }
 
-            // Wait for meaningful content
             try {
                 await page.waitForFunction(() => {
                     const t = document.body.innerText || "";
@@ -438,15 +437,12 @@ async function runScraper() {
                 }, { timeout: 12000 });
             } catch (_) {}
 
-            // Expand "Show more" buttons
             try {
                 await page.evaluate(() => {
                     const btns = Array.from(document.querySelectorAll('button'));
                     for (const b of btns) {
                         const t = (b.innerText || "").toLowerCase();
-                        if (t.includes("show more") || t.includes("see all") || t.includes("view more")) {
-                            b.click();
-                        }
+                        if (t.includes("show more") || t.includes("see all") || t.includes("view more")) b.click();
                     }
                 });
                 await delay(jitter(600, 1400));
@@ -513,7 +509,7 @@ async function runScraper() {
             console.log("🔄 Remaining links found. Relaying trigger token...");
         } else {
             fs.appendFileSync(process.env.GITHUB_OUTPUT, "has_more=false\n");
-            console.log("🎉 Entire sheet processing completed!");
+            console.log("🎉 Run completed (or stopped by block).");
         }
     }
 }

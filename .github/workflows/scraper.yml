@@ -1,6 +1,6 @@
-name: 🚀 Edge Scraper V6
+name: 🚀 Stealth Scraper V7
 
-run-name: 🚀 Edge Scraper V6 (Batch ${{ inputs.batch || '1' }})
+run-name: 🚀 Stealth Scraper V7 (Batch ${{ inputs.batch || '1' }})
 
 on:
   schedule:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       batch:
-        description: "Batch number"
+        description: "The current batch number"
         required: false
         default: "1"
         type: string
@@ -27,24 +27,20 @@ permissions:
   actions: write
   contents: read
 
-concurrency:
-  group: zillow-scraper
-  cancel-in-progress: false
-
 env:
-  MAX_BATCHES: "40"            # hard cap on the whole chain
-  MAX_CONSECUTIVE_BLOCKS: "6"  # stop after this many blocked batches in a row
+  MAX_BATCHES: "40"
+  MAX_CONSECUTIVE_BLOCKS: "6"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js Environment
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -52,32 +48,21 @@ jobs:
       - name: Install Dependencies
         run: npm install
 
-      - name: Ensure Xvfb (virtual display)
-        run: |
-          if ! command -v xvfb-run >/dev/null; then
-            sudo apt-get update -y && sudo apt-get install -y xvfb
-          fi
-
-      - name: Setup Edge (Latest Dev)
-        id: setup-edge
-        uses: browser-actions/setup-edge@v1
+      - name: Setup Google Chrome Build Engine
+        uses: browser-actions/setup-chrome@v1
         with:
-          edge-version: 'dev'
+          chrome-version: stable
 
-      - name: Run Scraper
+      - name: Run Scraper Engine
         id: scraper_task
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-edge.outputs.edge-path }}
           RETRY_BLOCKED: ${{ inputs.retry_blocked == 'true' && '1' || '0' }}
-          HEADFUL: '1'                 # real (non-headless) window inside a virtual display
-          TIMEZONE: America/New_York
-        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm start
+        run: npm start
 
-      # Runs ONLY if the job is healthy: not cancelled, not failed,
-      # not timed out, and the scraper reported more rows.
-      - name: Evaluate Self-Reboot
+      # Only when healthy: not cancelled/failed/timed out, and more rows remain
+      - name: Evaluate Self-Reboot Sequence
         if: ${{ !cancelled() && success() && steps.scraper_task.outputs.has_more == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -91,21 +76,20 @@ jobs:
           NEXT_BATCH=$((CURRENT_BATCH + 1))
 
           if [ "$NEXT_BATCH" -gt "$MAX_BATCHES" ]; then
-            echo "Reached MAX_BATCHES ($MAX_BATCHES). Stopping; cron will resume later."
+            echo "Reached MAX_BATCHES ($MAX_BATCHES). Stopping; cron resumes later."
             exit 0
           fi
 
-          # Blocked -> retry immediately (new runner = new IP), but cap consecutive blocks
           if [ "$WAS_BLOCKED" = "true" ]; then
             NEXT_BLOCKS=$((CURRENT_BLOCKS + 1))
             if [ "$NEXT_BLOCKS" -ge "$MAX_CONSECUTIVE_BLOCKS" ]; then
-              echo "Blocked $NEXT_BLOCKS batches in a row — stopping. Cron will retry later."
+              echo "Blocked $NEXT_BLOCKS batches in a row — stopping. Cron retries later."
               exit 0
             fi
-            echo "Blocked — starting next batch immediately on a fresh runner ($NEXT_BLOCKS in a row)"
           else
             NEXT_BLOCKS=0
           fi
 
           echo "Batch $CURRENT_BATCH → Batch $NEXT_BATCH"
           gh workflow run scraper.yml --ref "$REF_NAME" -f batch="$NEXT_BATCH" -f blocks="$NEXT_BLOCKS"
+          sleep 5

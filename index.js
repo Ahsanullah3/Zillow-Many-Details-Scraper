@@ -7,20 +7,26 @@ const fs = require('fs');
 puppeteer.use(StealthPlugin());
 
 // =========================================================
-// CONFIG  (same lightweight approach as the working script)
+// CONFIG
 // =========================================================
-const MAX_ROWS_PER_RUN = 30;        // successful rows per batch (blocked rows don't count)
+const MAX_ROWS_PER_RUN = 30;
 const FLUSH_BATCH_SIZE = 8;
 const REQUIRED_COLS = 34;
-const MAX_BLOCK_STREAK = 3;         // blocks in a row => end batch, next batch continues with NEXT rows
+const MAX_BLOCK_STREAK = 3;
 const MAX_CONSECUTIVE_ERRORS = 3;
 const MAX_RUNTIME_MS = 12 * 60 * 1000;
-// Price history is read from the table already in the page and from the embedded data.
-// PRICE_HISTORY_DOM=1 additionally scrolls to the section if neither has it (riskier, OFF by default).
 const PRICE_HISTORY_DOM = process.env.PRICE_HISTORY_DOM === '1';
-// Rows marked blocked/error are skipped in every batch. RETRY_BLOCKED=1 retries them once.
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
+
+const HEADER_START_COL = 9; // column J
+const HEADERS = [
+    "Price", "Street", "City", "State", "Zipcode", "Final URL", "Agent Details", "Sold Price",
+    "Status", "Description", "Full Address", "Price Per Sqft", "Beds", "Baths", "Sqft", "Lot Size",
+    "Listed For Sale", "Sold On", "MLS", "Property Type", "Year Built", "HOA",
+    "Price History", "Facts & Features", "Page Text (Formatted)"
+];
+const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 const jitter = (min, max) => min + Math.floor(Math.random() * (max - min));
@@ -33,7 +39,7 @@ const safeCell = (v) => {
 };
 
 // =========================================================
-// GOOGLE API RETRY (500 error fix)
+// GOOGLE API RETRY
 // =========================================================
 async function saveWithRetry(sheet, retries = 3) {
     for (let i = 0; i < retries; i++) {
@@ -52,16 +58,11 @@ async function saveWithRetry(sheet, retries = 3) {
 }
 
 // =========================================================
-// PRICE HISTORY: parse the Zillow "Table.Root" (c11n) price-history table
-// Anchors on the component markup itself, not on the heading:
-//   table[data-c11n-component="Table.Root"] (.c11n_table__root) with Date | Event | Price headers
-//   row cells: [data-testid="date-info"], 2nd Table.Cell (event), [data-testid="price-money-cell"],
-//              [data-testid="percent-display"], next colspan row = "Source: ..."
+// PRICE HISTORY PARSER (in-page)
 // =========================================================
 function parseHistoryRowsInPage() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-    // Find the table by its column headers so other tables (taxes, etc.) are ignored
     const isHistoryTable = (t) => {
         const hs = Array.from(t.querySelectorAll('th')).map(x => clean(x.textContent).toLowerCase());
         return hs.includes('date') && hs.includes('event') && hs.includes('price');
@@ -76,7 +77,7 @@ function parseHistoryRowsInPage() {
     for (const tr of table.querySelectorAll('tr')) {
         const dateEl = tr.querySelector('[data-testid="date-info"]');
         const label = tr.getAttribute('label') || '';
-        if (!dateEl && !label) continue;               // header row / source row
+        if (!dateEl && !label) continue;
 
         const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
         const cells = tr.querySelectorAll('td[data-c11n-component="Table.Cell"], td');
@@ -94,11 +95,10 @@ function parseHistoryRowsInPage() {
         }
         if (!price && lm) price = clean(lm[3]).replace(/\s*\(.*\)\s*$/, '');
 
-        // Following colspan row: "Source: Hive MLS #123   Report a problem"
         let source = '';
         const next = tr.nextElementSibling;
         if (next && !next.querySelector('[data-testid="date-info"]') && !next.hasAttribute('label')) {
-            source = clean(next.textContent).replace(/\s*Report\s+a problem\s*$/i, '');
+            source = clean(next.textContent).replace(/\s*Report\s+a\s+problem\s*$/i, '');
         }
         rows.push({ date, event, price, change, ppsf, source });
     }
@@ -106,9 +106,12 @@ function parseHistoryRowsInPage() {
 }
 
 // =========================================================
-// EXTRACT (reads embedded Next.js state, like the working script)
+// EXTRACT
 // =========================================================
 async function extractPageData(page, originalUrl) {
+    // FIX: give the price-history table a chance to render before we format page text
+    await page.waitForSelector('[data-testid="date-info"]', { timeout: 4000 }).catch(() => {});
+
     const data = await page.evaluate(() => {
         const out = {
             price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -122,11 +125,28 @@ async function extractPageData(page, originalUrl) {
             .replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
         const money = (n) => (typeof n === 'number') ? '$' + n.toLocaleString('en-US') : (n || '');
 
-        // Turns the page into clean, readable text: headings as "## ...", list items as "- ...",
-        // table rows as "a | b | c", one block per line, junk (nav/footer/buttons/scripts) removed.
+        // -----------------------------------------------------
+        // FIXED formatPageText: skips nav/chrome, falls back to innerText
+        // -----------------------------------------------------
         const formatPageText = () => {
-            const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','NAV','FOOTER','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG']);
-            const INLINE = new Set(['A','SPAN','B','STRONG','EM','I','U','SMALL','LABEL','SUP','SUB','ABBR','TIME','MARK','CODE','FONT']);
+            const SKIP = new Set([
+                'SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE',
+                'BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG',
+                'VIDEO','AUDIO','CANVAS','OBJECT','EMBED'
+            ]);
+            const SKIP_IDS = new Set([
+                'pfs-nav-wrapper','page-header-container','sw-container',
+                'skip-topnav-target','__PFS_TOPNAV_DATA__',
+                'hdp-srp-split-page-frame-nav-styles',
+                'with-product-nav-styles','hdp-srp-split-no-search-layout-styles'
+            ]);
+            const SKIP_TESTIDS = new Set([
+                'topnav','back-link','desktop-action-bar','close-lightbox-button'
+            ]);
+            const INLINE = new Set([
+                'A','SPAN','B','STRONG','EM','I','U','SMALL','LABEL',
+                'SUP','SUB','ABBR','TIME','MARK','CODE','FONT','BR'
+            ]);
             const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
             const lines = [];
             let buf = '';
@@ -135,12 +155,24 @@ async function extractPageData(page, originalUrl) {
                 buf = '';
                 if (t) lines.push(prefix + t);
             };
+
+            const isChrome = (node) => {
+                if (node.id && SKIP_IDS.has(node.id)) return true;
+                const tid = node.getAttribute && node.getAttribute('data-testid');
+                if (tid && SKIP_TESTIDS.has(tid)) return true;
+                const cls = (node.className && String(node.className)) || '';
+                if (/\b(topnav|znav|pfs-nav|hdp-action-bar|layout-action-bar|with-product-nav__product-nav)\b/i.test(cls)) return true;
+                return false;
+            };
+
             const walk = (node) => {
                 if (node.nodeType === 3) { buf += ' ' + node.nodeValue; return; }
                 if (node.nodeType !== 1) return;
                 const tag = node.tagName.toUpperCase();
-                if (SKIP.has(tag) || node.hidden || node.getAttribute('aria-hidden') === 'true') return;
-                if (/display\s*:\s*none/i.test(node.getAttribute('style') || '')) return;
+                if (SKIP.has(tag)) return;
+                if (node.hidden || node.getAttribute('aria-hidden') === 'true') return;
+                if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(node.getAttribute('style') || '')) return;
+                if (isChrome(node)) return;
 
                 if (/^H[1-6]$/.test(tag)) {
                     flush();
@@ -171,7 +203,6 @@ async function extractPageData(page, originalUrl) {
             walk(document.body);
             flush();
 
-            // tidy: drop consecutive duplicate lines and collapse blank runs
             const res = [];
             for (const l of lines) {
                 const prev = res[res.length - 1];
@@ -180,7 +211,18 @@ async function extractPageData(page, originalUrl) {
                 res.push(l);
             }
             const head = [clean(document.title), location.href, '', '----------------------------------------', ''];
-            return head.concat(res).join('\n').trim();
+            const formatted = head.concat(res).join('\n').trim();
+
+            // Fallback: if the SPA shell hasn't hydrated, formatted text will be tiny.
+            if (formatted.length < 800) {
+                const fallback = (document.body.innerText || '')
+                    .replace(/\r/g, '')
+                    .replace(/[ \t]+\n/g, '\n')
+                    .replace(/\n{3,}/g, '\n\n')
+                    .trim();
+                return head.concat(['', fallback]).join('\n').trim();
+            }
+            return formatted;
         };
 
         out.canonicalUrl = document.querySelector('meta[property="og:url"]')?.content || "";
@@ -226,7 +268,6 @@ async function extractPageData(page, originalUrl) {
             else if (p.resoFacts?.hoaFeeTotal) out.hoa = p.resoFacts.hoaFeeTotal;
             else out.hoa = "No / None listed";
 
-            // Price history from the embedded data (no scrolling / extra requests)
             if (Array.isArray(p.priceHistory)) {
                 const fmtDate = (d) => {
                     if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth() + 1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
@@ -243,7 +284,6 @@ async function extractPageData(page, originalUrl) {
                 }));
             }
         } else {
-            // ---- Rental building page (fallback, like the working script)
             const b = cp?.initialReduxState?.gdp?.building;
             if (b) {
                 out.street = b.streetAddress || "";
@@ -255,6 +295,87 @@ async function extractPageData(page, originalUrl) {
             }
         }
 
+        // ---- DOM / JSON-LD fallback for SOLD & off-market pages
+        try {
+            const clean = (x) => (x || '').replace(/\s+/g, ' ').trim();
+            const num = (x) => { const m = String(x || '').replace(/,/g, '').match(/[\d.]+/); return m ? Number(m[0]) : ''; };
+            const empty = (v) => v === '' || v === null || v === undefined || v === 'N/A';
+            const $ = (sel) => document.querySelector(sel);
+
+            let ld = null;
+            for (const sc of document.querySelectorAll('script[type="application/ld+json"]')) {
+                try {
+                    const j = JSON.parse(sc.textContent);
+                    if ([].concat(j['@type'] || []).includes('RealEstateListing') || j.offers) { ld = j; break; }
+                } catch (e) {}
+            }
+            const item = ld?.offers?.itemOffered;
+            const addr = item?.address;
+
+            if (empty(out.street))  out.street  = addr?.streetAddress || '';
+            if (empty(out.city))    out.city    = addr?.addressLocality || '';
+            if (empty(out.state))   out.state   = addr?.addressRegion || '';
+            if (empty(out.zipcode)) out.zipcode = addr?.postalCode || '';
+            if (empty(out.street)) {
+                const parts = clean($('h1')?.textContent).split(',').map(clean);
+                if (parts.length >= 3) {
+                    out.street = parts[0]; out.city = parts[1];
+                    const m = parts[2].match(/^([A-Z]{2})\s+(\d{5})/);
+                    if (m) { out.state = m[1]; out.zipcode = m[2]; }
+                }
+            }
+            if (empty(out.canonicalUrl)) out.canonicalUrl = ld?.url || '';
+
+            if (empty(out.price)) out.price = ld?.offers?.price || num($('[data-testid="price"]')?.textContent);
+            if (empty(out.soldPrice)) {
+                const m = clean($('[data-testid="gallery-status-pill"]')?.textContent).match(/Sold for \$([\d,]+)/i);
+                if (m) out.soldPrice = Number(m[1].replace(/,/g, ''));
+            }
+
+            const head = {};
+            document.querySelectorAll('[data-testid="bed-bath-sqft-fact-container"]').forEach((c) => {
+                const sp = c.querySelectorAll('span');
+                if (sp.length >= 2) head[clean(sp[1].textContent).toLowerCase()] = clean(sp[0].textContent);
+            });
+            if (empty(out.beds))  out.beds  = num(head.beds)  || item?.numberOfBedrooms || '';
+            if (empty(out.baths)) out.baths = num(head.baths) || '';
+            if (empty(out.sqft))  out.sqft  = num(head.sqft)  || item?.floorSize?.value || '';
+
+            if (empty(out.description)) {
+                out.description = clean(ld?.description) ? String(ld.description).replace(/\r/g, '').trim()
+                    : clean($('[data-testid="description"] article')?.textContent) || 'N/A';
+            }
+
+            const fm = {};
+            document.querySelectorAll('[data-testid="fact-category"] li').forEach((li) => {
+                const t = clean(li.textContent), i = t.indexOf(': ');
+                if (i > 0) { const k = t.slice(0, i); if (!(k in fm)) fm[k] = t.slice(i + 2); }
+            });
+            if (empty(out.propertyType)) out.propertyType = fmtType(fm['Home type'] || fm['Property subtype'] || '');
+            if (empty(out.yearBuilt))    out.yearBuilt    = fm['Year built'] || '';
+            if (empty(out.lotSize))      out.lotSize      = fm['Size'] || '';
+            if (empty(out.pricePerSqft)) {
+                out.pricePerSqft = num(fm['Price per square foot']) ||
+                    ((out.price && out.sqft && Number(out.sqft) > 0) ? Math.round(Number(out.price) / Number(out.sqft)) : '');
+            }
+            if (empty(out.hoa)) {
+                if (fm['HOA fee'] || fm['HOA fee frequency']) out.hoa = fm['HOA fee'] || fm['HOA fee frequency'];
+                else if (/^no$/i.test(fm['Has HOA'] || '')) out.hoa = 'No / None listed';
+            }
+
+            if (empty(out.agentDetails)) {
+                const la = $('[data-testid="attribution-LISTING_AGENT"]');
+                const parts = la ? Array.from(la.querySelectorAll('span')).map((x) => clean(x.textContent).replace(/,$/, '')).filter(Boolean) : [];
+                const broker = clean($('[data-testid="attribution-BROKER"]')?.textContent);
+                out.agentDetails = [parts[0], broker, parts[1]].filter(Boolean).join(' | ');
+            }
+            if (empty(out.mls)) {
+                const info = clean($('[role="contentinfo"][aria-label="MLS information"]')?.textContent);
+                const m = info.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
+                if (m) out.mls = `${m[2]} - ${clean(m[1])}`;
+            }
+        } catch (e) {}
+
         out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(", ");
         try { out.pageText = formatPageText(); } catch (e) { out.pageText = document.body.innerText || ""; }
         return out;
@@ -262,17 +383,15 @@ async function extractPageData(page, originalUrl) {
 
     if (!data.canonicalUrl) data.canonicalUrl = originalUrl;
 
-    // ---- Price history: table in the page + embedded data; keep whichever has more rows
+    // ---- Price history: table + embedded, keep the richer one
     let domRows = [];
     try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
     const embRows = data.embeddedHistory || [];
 
     if (!domRows.length && !embRows.length) {
-        // Nothing yet: give the table a moment to render (no scrolling, no extra navigation)
         await page.waitForSelector('[data-testid="date-info"]', { timeout: 3000 }).catch(() => {});
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
         if (!domRows.length && PRICE_HISTORY_DOM) {
-            // Last resort (riskier): scroll the section into view to trigger lazy rendering
             try {
                 await page.evaluate(() => {
                     const h = Array.from(document.querySelectorAll('h2,h3'))
@@ -299,7 +418,7 @@ async function extractPageData(page, originalUrl) {
         }
     }
 
-    // Facts & Features (best-effort, from the HTML already loaded)
+    // Facts & Features (best-effort, from HTML already loaded)
     data.factsFeaturesText = "";
     try {
         const html = await page.content();
@@ -320,7 +439,7 @@ async function extractPageData(page, originalUrl) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log("🚀 Starting Stealth Scraper V7 (lightweight, skip-blocked)...");
+    console.log("🚀 Starting Stealth Scraper V8 (fixed page text)...");
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -346,7 +465,6 @@ async function runScraper() {
 
     const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
 
-    // Same launch as the working script: bundled Chrome, headless new, minimal args
     const browser = await puppeteer.launch({
         headless: "new",
         args: ['--no-sandbox', '--disable-setuid-sandbox'],
@@ -357,6 +475,23 @@ async function runScraper() {
     let blockStreak = 0, consecutiveErrors = 0, dirty = 0;
 
     const flush = async () => { if (dirty > 0) { await saveWithRetry(sheet); dirty = 0; } };
+
+    // ---- Headings
+    try {
+        HEADERS.forEach((title, i) => {
+            const col = HEADER_START_COL + i;
+            if (col >= sheet.columnCount) return;
+            const cell = sheet.getCell(0, col);
+            if (OVERWRITE_HEADERS || !cell.value) {
+                cell.value = title;
+                try { cell.textFormat = { bold: true }; } catch (e) {}
+                dirty++;
+            }
+        });
+        if (dirty) console.log(`🏷️ Added/updated ${dirty} heading cells`);
+    } catch (e) {
+        console.warn(`⚠️ Could not write headings: ${e.message}`);
+    }
 
     try {
         for (let rowIndex = 1; rowIndex < sheet.rowCount; rowIndex++) {
@@ -376,7 +511,6 @@ async function runScraper() {
             const actualRow = rowIndex + 1;
             console.log(`🕵️ Row ${actualRow}: ${url}`);
 
-            // New page per row, request blocking, short delay — same as the working script
             const page = await browser.newPage();
             try {
                 await page.setRequestInterception(true);
@@ -387,6 +521,14 @@ async function runScraper() {
 
                 await delay(jitter(500, 1000));
                 await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+                // FIX: wait for real property content to hydrate, not just the shell
+                await page.waitForSelector(
+                    '[data-testid="description"], [data-testid="fact-category"], ' +
+                    'script[type="application/ld+json"], [data-testid="gallery-status-pill"]',
+                    { timeout: 12000 }
+                ).catch(() => {});
+                await delay(1500);
 
                 const title = await page.title();
                 const hasNext = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
@@ -432,12 +574,13 @@ async function runScraper() {
                         setCell(rowIndex, 30, d.hoa);
                         setCell(rowIndex, 31, d.priceHistoryText);
                         setCell(rowIndex, 32, d.factsFeaturesText);
-                        setCell(rowIndex, 33, d.pageText);
+                        setCell(rowIndex, 33, d.pageText); // column AH
                         dirty++;
                         scrapeCount++;
                         blockStreak = 0;
                         consecutiveErrors = 0;
                         console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES' : 'NO'}`);
+                        console.log(`   📄 pageText: ${d.pageText ? d.pageText.length : 0} chars | desc: ${d.description ? d.description.length : 0} chars`);
                     }
                 }
             } catch (e) {
@@ -462,7 +605,6 @@ async function runScraper() {
 
     if (skipped) console.log(`⏭️ Skipped ${skipped} rows already marked blocked/error`);
     const hasMore = rowsRemaining || stoppedEarly;
-    // blocked=true only when this batch made zero progress because of blocks
     setOutput(hasMore, ipFlagged && scrapeCount === 0);
     console.log(hasMore ? "🔄 More rows remain — next batch will be triggered." : "🎉 Sheet fully processed!");
 }

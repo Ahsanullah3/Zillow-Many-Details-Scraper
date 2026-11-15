@@ -1,16 +1,20 @@
 {
-  "name": "github-stealth-scraper",
-  "version": "1.0.0",
-  "description": "Headless Real Estate Scraper",
+  "name": "zillow-full-scraper",
+  "version": "11.1.0",
+  "description": "Stealth Zillow scraper — full detail + page text to Google Sheets",
   "main": "scraper.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node scraper.js"
   },
   "dependencies": {
-    "google-auth-library": "latest",
-    "google-spreadsheet": "latest",
-    "puppeteer": "^24.15.0",
-    "puppeteer-extra": "latest",
-    "puppeteer-extra-plugin-stealth": "latest"
+    "google-auth-library": "^9.15.0",
+    "google-spreadsheet": "^4.1.4",
+    "puppeteer": "^23.10.4",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-anonymize-ua": "^2.4.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

@@ -33,7 +33,7 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout Repository
@@ -59,6 +59,7 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-edge.outputs.edge-path }}
+          BATCH_NUMBER: ${{ inputs.batch || '1' }}
         run: npm start
 
       # Runs ONLY if the job is healthy: not cancelled, not failed,

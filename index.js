@@ -11,12 +11,14 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const MAX_URLS_PER_RUN = 90;
+const CONCURRENCY = Number(process.env.CONCURRENCY || '5');   // URLs scraped at the same time
+const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
 const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
-const MAX_CONSECUTIVE_BLOCK_STREAKS = 5;
-const MAX_CONSECUTIVE_ERRORS = 5;
+const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '6');
+const MAX_CONSECUTIVE_ERRORS = 6;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
+const RECYCLE_BROWSER_EVERY = 10;      // each worker relaunches its browser after N URLs
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
@@ -25,11 +27,11 @@ const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.05');
 const VIEWPORT_W = 1400;
 const VIEWPORT_H = 900;
 
-const NAV_DELAY_MIN = 400;
-const NAV_DELAY_MAX = 900;
+const NAV_DELAY_MIN = 100;
+const NAV_DELAY_MAX = 500;
 const HYDRATE_TIMEOUT = 8000;
-const HYDRATE_SETTLE = 500;
-const ZOOM_WAIT = 1500;
+const HYDRATE_SETTLE = 250;
+const ZOOM_WAIT = 700;
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -50,51 +52,46 @@ const safeCell = (v) => {
     return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…[truncated]" : s;
 };
 
-// =========================================================
-// FRESH BROWSER LAUNCH + PURGE
-// =========================================================
-function makeFreshProfileDir() {
-    return path.join(os.tmpdir(), `zillow-profile-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-}
+const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
 
-async function launchFreshBrowser() {
-    const userDataDir = makeFreshProfileDir();
+// =========================================================
+// BROWSER LAUNCH (one per worker, fresh incognito context per URL)
+// =========================================================
+async function launchBrowser() {
+    const userDataDir = path.join(os.tmpdir(), `zillow-profile-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     const browser = await puppeteer.launch({
         headless: "new",
         userDataDir,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
             '--disable-blink-features=AutomationControlled',
             '--disable-features=IsolateOrigins,site-per-process',
             `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
-            '--incognito',
         ],
     });
-    return { browser, userDataDir };
+    browser.__userDataDir = userDataDir;
+    return browser;
 }
 
-async function purgeAndClose(browser) {
+async function closeBrowser(browser) {
     if (!browser) return;
-    try {
-        const pages = await browser.pages();
-        if (pages.length) {
-            const client = await pages[0].createCDPSession();
-            await client.send('Network.clearBrowserCookies').catch(() => {});
-            await client.send('Network.clearBrowserCache').catch(() => {});
-            await client.send('Storage.clearDataForOrigin', {
-                origin: 'https://www.zillow.com',
-                storageTypes: 'all',
-            }).catch(() => {});
-        }
-    } catch (e) {}
     try { await browser.close(); } catch (e) {}
+    try { if (browser.__userDataDir) fs.rmSync(browser.__userDataDir, { recursive: true, force: true }); } catch (e) {}
+}
+
+async function newContext(browser) {
+    return typeof browser.createBrowserContext === 'function'
+        ? browser.createBrowserContext()
+        : browser.createIncognitoBrowserContext();
 }
 
 // =========================================================
 // GOOGLE API RETRY
 // =========================================================
-async function saveWithRetry(sheet, retries = 3) {
+async function saveWithRetry(sheet, retries = 4) {
     for (let i = 0; i < retries; i++) {
         try { await sheet.saveUpdatedCells(); return; }
         catch (error) {
@@ -117,24 +114,24 @@ function safeValue(sheet, row, col) {
 }
 
 // =========================================================
-// FIND NEXT ROW — forward cursor, never repeats
+// FIND NEXT ROW — forward cursor; each row visited once per process
 // =========================================================
-function findNextRow(sheet, afterRow) {
+function findNextRow(sheet, afterRow, includeSkipped) {
     for (let r = afterRow + 1; r < sheet.rowCount; r++) {
         const url = safeValue(sheet, r, 0);
         if (!url || !url.includes("zillow.com")) continue;
         const status = safeValue(sheet, r, 17);
         if (isDoneStatus(status)) continue;
-        // On very first scan (afterRow === -1): include blocked rows so they're retried once.
-        // Mid-run (afterRow >= 0): skip blocked rows so each URL is attempted only once per process.
-        if (afterRow !== -1 && isSkipStatus(status) && !RETRY_BLOCKED) continue;
+        if (!includeSkipped && isSkipStatus(status)) continue;
         return r;
     }
     return -1;
 }
 
+const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
+
 // =========================================================
-// PRICE HISTORY PARSER
+// PRICE HISTORY PARSER (runs inside the page)
 // =========================================================
 function parseHistoryRowsInPage() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -176,15 +173,18 @@ function parseHistoryRowsInPage() {
 }
 
 // =========================================================
-// EXTRACT ONE URL
+// EXTRACT ONE URL (own incognito context => isolated cookies)
 // =========================================================
 async function scrapeOneUrl(browser, url) {
-    const page = await browser.newPage();
+    const ctx = await newContext(browser);
+    let page;
     try {
+        page = await ctx.newPage();
         await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H });
         await page.setRequestInterception(true);
         page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort().catch(() => {});
+            const type = req.resourceType();
+            if (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url())) req.abort().catch(() => {});
             else req.continue().catch(() => {});
         });
 
@@ -221,7 +221,6 @@ async function scrapeOneUrl(browser, url) {
                 .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
             if (tv) tv.click();
         }).catch(() => {});
-        await delay(400);
 
         await page.waitForFunction(() => {
             const tables = document.querySelectorAll('table');
@@ -229,7 +228,7 @@ async function scrapeOneUrl(browser, url) {
                 const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
                 return hs.includes('date') && hs.includes('event') && hs.includes('price');
             });
-        }, { timeout: 6000 }).catch(() => {});
+        }, { timeout: 5000 }).catch(() => {});
 
         const data = await page.evaluate(() => {
             const out = {
@@ -395,7 +394,7 @@ async function scrapeOneUrl(browser, url) {
                     .find(x => /price\s*history/i.test(x.textContent || ''));
                 if (h) h.scrollIntoView({ block: 'center' });
             }).catch(() => {});
-            await delay(1200);
+            await delay(600);
             try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
         }
 
@@ -452,7 +451,8 @@ async function scrapeOneUrl(browser, url) {
 
         return { blocked: false, data };
     } finally {
-        await page.close().catch(() => {});
+        if (page) await page.close().catch(() => {});
+        await ctx.close().catch(() => {});
     }
 }
 
@@ -461,7 +461,7 @@ async function scrapeOneUrl(browser, url) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Stealth Scraper V18 — 1 URL/browser, forward cursor (no repeats), safe cells, 3 blocks → handoff`);
+    console.log(`🚀 Stealth Scraper V19 — ${CONCURRENCY} URLs in parallel, shared forward cursor, batched sheet writes`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -479,148 +479,160 @@ async function runScraper() {
     await sheet.loadCells();
     console.log(`📊 Sheet: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
 
-    const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
-
-    let dirty = 0;
+    // ---- headers
     try {
+        let hd = 0;
         HEADERS.forEach((title, i) => {
             const col = HEADER_START_COL + i;
             if (col >= sheet.columnCount) return;
             const cell = sheet.getCell(0, col);
-            if (OVERWRITE_HEADERS || !cell.value) { cell.value = title; try { cell.textFormat = { bold: true }; } catch (e) {} dirty++; }
+            if (OVERWRITE_HEADERS || !cell.value) { cell.value = title; try { cell.textFormat = { bold: true }; } catch (e) {} hd++; }
         });
-        if (dirty) { await saveWithRetry(sheet); dirty = 0; await sheet.loadCells(); }
+        if (hd) await saveWithRetry(sheet);
     } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
 
-    const flush = async () => {
-        if (dirty > 0) {
+    // ---- write queue: cells are ONLY touched inside doFlush (serialized), so
+    //      parallel workers can never change cells while a save is in flight.
+    const queue = [];
+    const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
+    const applyEntry = ({ row, status, d }) => {
+        setCell(row, 17, status);
+        if (!d) return;
+        setCell(row, 9,  d.price);
+        setCell(row, 10, d.street);
+        setCell(row, 11, d.city);
+        setCell(row, 12, d.state);
+        setCell(row, 13, d.zipcode);
+        setCell(row, 14, d.canonicalUrl);
+        setCell(row, 15, d.agentDetails);
+        setCell(row, 16, d.soldPrice);
+        setCell(row, 18, d.description);
+        setCell(row, 19, d.fullAddress);
+        setCell(row, 20, d.pricePerSqft);
+        setCell(row, 21, d.beds);
+        setCell(row, 22, d.baths);
+        setCell(row, 23, d.sqft);
+        setCell(row, 24, d.lotSize);
+        setCell(row, 25, d.listedForSale);
+        setCell(row, 26, d.soldOn);
+        setCell(row, 27, d.mls);
+        setCell(row, 28, d.propertyType);
+        setCell(row, 29, d.yearBuilt);
+        setCell(row, 30, d.hoa);
+        setCell(row, 31, d.priceHistoryText);
+        setCell(row, 32, d.factsFeaturesText);
+        setCell(row, 33, d.pageText);
+    };
+    let flushChain = Promise.resolve();
+    const doFlush = async () => {
+        if (!queue.length) return;
+        const batch = queue.splice(0, queue.length);
+        batch.forEach(applyEntry);
+        try {
             await saveWithRetry(sheet);
-            dirty = 0;
-            try { await sheet.loadCells(); } catch (e) { console.warn(`⚠️ loadCells failed: ${e.message}`); }
+            console.log(`💾 Saved ${batch.length} row(s)`);
+        } catch (e) {
+            console.warn(`⚠️ Save failed (${e.message}) — cells stay pending and will be retried on next flush`);
         }
     };
+    const flush = () => (flushChain = flushChain.then(doFlush));
 
-    let attempted = 0, success = 0, blockStreak = 0, errorStreak = 0;
-    let totalBlocks = 0, totalErrors = 0, totalSkipped = 0;
-    let lastTriedRow = -1;
+    // ---- shared state
+    let claimed = 0, success = 0, blockStreak = 0, errorStreak = 0;
+    let totalBlocks = 0, totalErrors = 0;
+    let cursor = -1;
+    let stop = false, blockedExit = false;
+    const inflight = new Map(); // same URL appearing in several rows is scraped only once
 
-    while (Date.now() - startTime < MAX_RUNTIME_MS) {
-        if (attempted >= MAX_URLS_PER_RUN) {
-            console.log(`📦 Reached ${MAX_URLS_PER_RUN} URLs this run.`);
-            break;
-        }
-        if (errorStreak >= MAX_CONSECUTIVE_ERRORS) {
-            console.log(`🛑 ${MAX_CONSECUTIVE_ERRORS} consecutive errors. Stopping.`);
-            break;
-        }
+    const claimRow = () => {
+        const r = findNextRow(sheet, cursor, RETRY_BLOCKED);
+        if (r !== -1) cursor = r;      // claimed synchronously => no two workers get the same row
+        return r;
+    };
 
-        // Forward-only cursor: never re-select a row we already attempted this run
-        const rowIndex = findNextRow(sheet, lastTriedRow);
-        if (rowIndex === -1) {
-            console.log("🎉 No more rows to attempt in this run.");
-            break;
-        }
-        lastTriedRow = rowIndex;
 
-        const url = String(safeValue(sheet, rowIndex, 0));
-        const actualRow = rowIndex + 1;
-        console.log(`\n🕵️ Row ${actualRow} (attempt ${attempted + 1}/${MAX_URLS_PER_RUN}): ${url}`);
-
-        console.log(`🌐 Launching fresh browser (no cookies, new profile)...`);
-        let { browser } = await launchFreshBrowser();
-
+    async function worker(id) {
+        let browser = null, used = 0;
         try {
-            const result = await scrapeOneUrl(browser, url);
+            while (!stop) {
+                if (Date.now() - startTime >= MAX_RUNTIME_MS) break;
+                if (claimed >= MAX_URLS_PER_RUN) break;
+                if (errorStreak >= MAX_CONSECUTIVE_ERRORS) { stop = true; break; }
 
-            if (result.blocked) {
-                console.log(`❌ BLOCKED on Row ${actualRow}`);
-                setCell(rowIndex, 17, result.blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)");
-                dirty++;
-                blockStreak++;
-                errorStreak = 0;
-                totalBlocks++;
-                attempted++;
+                const rowIndex = claimRow();
+                if (rowIndex === -1) break;
+                claimed++;
+                const url = String(safeValue(sheet, rowIndex, 0));
+                const actualRow = rowIndex + 1;
+                console.log(`🕵️ [W${id}] Row ${actualRow} (${claimed}/${MAX_URLS_PER_RUN}): ${url}`);
 
-                console.log(`   Block streak: ${blockStreak}/${MAX_CONSECUTIVE_BLOCK_STREAKS}`);
-                if (blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS) {
-                    console.log(`\n🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive URL blocks.`);
-                    console.log(`📤 Purging browser and exiting so GitHub starts a new batch (fresh IP).`);
-                    try { await flush(); } catch (e) {}
-                    await purgeAndClose(browser);
-                    setOutput(true, true);
-                    process.exit(0);
+                let recycle = false;
+                try {
+                    if (!browser || used >= RECYCLE_BROWSER_EVERY) {
+                        await closeBrowser(browser);
+                        browser = await launchBrowser();
+                        used = 0;
+                    }
+                    used++;
+
+                    const key = urlKey(url);
+                    if (!inflight.has(key)) inflight.set(key, scrapeOneUrl(browser, url));
+                    const result = await inflight.get(key);
+
+                    if (result.blocked) {
+                        console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}`);
+                        queue.push({ row: rowIndex, status: result.blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)" });
+                        blockStreak++; errorStreak = 0; totalBlocks++;
+                        recycle = true;
+                        if (blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS) { stop = true; blockedExit = true; }
+                    } else {
+                        const d = result.data;
+                        if (!(d.price || d.fullAddress || d.description)) {
+                            console.log(`⚠️ [W${id}] Empty parse on Row ${actualRow}`);
+                            queue.push({ row: rowIndex, status: "⚠️ Empty parse (skipped)" });
+                            errorStreak++; totalErrors++;
+                        } else {
+                            queue.push({ row: rowIndex, status: "✅ Done", d });
+                            success++; blockStreak = 0; errorStreak = 0;
+                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? d.priceHistoryText.split('\n').length : 'NO'} | 🏷️ ${d.mls || '—'}`);
+                        }
+                    }
+                } catch (e) {
+                    console.error(`🛑 [W${id}] Error on Row ${actualRow}: ${e.message}`);
+                    queue.push({ row: rowIndex, status: "🛑 Error: " + String(e.message).slice(0, 100) });
+                    errorStreak++; totalErrors++;
+                    recycle = true;   // browser may be dead
+                } finally {
+                    // let a later duplicate-URL row retry if this one failed
+                    inflight.delete(urlKey(url));
                 }
-            } else {
-                const d = result.data;
-                if (!(d.price || d.fullAddress || d.description)) {
-                    console.log(`⚠️ Empty parse on Row ${actualRow}`);
-                    setCell(rowIndex, 17, "⚠️ Empty parse (skipped)");
-                    dirty++;
-                    errorStreak++;
-                    totalErrors++;
-                    attempted++;
-                } else {
-                    setCell(rowIndex, 9,  d.price);
-                    setCell(rowIndex, 10, d.street);
-                    setCell(rowIndex, 11, d.city);
-                    setCell(rowIndex, 12, d.state);
-                    setCell(rowIndex, 13, d.zipcode);
-                    setCell(rowIndex, 14, d.canonicalUrl);
-                    setCell(rowIndex, 15, d.agentDetails);
-                    setCell(rowIndex, 16, d.soldPrice);
-                    setCell(rowIndex, 17, "✅ Done");
-                    setCell(rowIndex, 18, d.description);
-                    setCell(rowIndex, 19, d.fullAddress);
-                    setCell(rowIndex, 20, d.pricePerSqft);
-                    setCell(rowIndex, 21, d.beds);
-                    setCell(rowIndex, 22, d.baths);
-                    setCell(rowIndex, 23, d.sqft);
-                    setCell(rowIndex, 24, d.lotSize);
-                    setCell(rowIndex, 25, d.listedForSale);
-                    setCell(rowIndex, 26, d.soldOn);
-                    setCell(rowIndex, 27, d.mls);
-                    setCell(rowIndex, 28, d.propertyType);
-                    setCell(rowIndex, 29, d.yearBuilt);
-                    setCell(rowIndex, 30, d.hoa);
-                    setCell(rowIndex, 31, d.priceHistoryText);
-                    setCell(rowIndex, 32, d.factsFeaturesText);
-                    setCell(rowIndex, 33, d.pageText);
-                    dirty++;
-                    success++;
-                    blockStreak = 0;
-                    errorStreak = 0;
-                    attempted++;
-                    console.log(`✔️ ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? 'YES (' + d.priceHistoryText.split('\n').length + ')' : 'NO'} | 🏷️ MLS: ${d.mls || '—'}`);
-                }
+
+                if (recycle) { await closeBrowser(browser); browser = null; }
+                if (queue.length >= FLUSH_EVERY) flush();
             }
-        } catch (e) {
-            console.error(`🛑 Error on Row ${actualRow}: ${e.message}`);
-            setCell(rowIndex, 17, "🛑 Error: " + e.message.slice(0, 100));
-            dirty++;
-            errorStreak++;
-            totalErrors++;
-            attempted++;
         } finally {
-            console.log(`🔒 Closing browser (1 URL done)`);
-            await purgeAndClose(browser);
-        }
-
-        if (dirty >= FLUSH_EVERY) {
-            console.log(`💾 Saving ${dirty} rows...`);
-            try { await flush(); } catch (e) {}
+            await closeBrowser(browser);
         }
     }
 
-    try { await flush(); } catch (e) {}
+    await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1)));
+    await flush();
 
     console.log(`\n📊 ─── RUN TOTALS ───`);
-    console.log(`✅ Success: ${success} | 🚫 Blocked: ${totalBlocks} | 🛑 Errors: ${totalErrors} | ⏭️ Skipped: ${totalSkipped}`);
+    console.log(`✅ Success: ${success} | 🚫 Blocked: ${totalBlocks} | 🛑 Errors: ${totalErrors}`);
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
-    const remaining = findNextRow(sheet, -1);
+    if (blockedExit) {
+        console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — exiting so GitHub starts a new batch (fresh IP).`);
+        setOutput(true, true);
+        return;
+    }
+
+    // Blocked/errored rows are NOT counted as "more work" (otherwise has_more would stay true forever).
+    const remaining = RETRY_BLOCKED ? findNextRow(sheet, cursor, true) : findNextRow(sheet, -1, false);
     const hasMore = remaining !== -1;
     setOutput(hasMore, false);
     console.log(hasMore ? `🔄 More rows remain — next run resumes at row ${remaining + 1}.` : "🎉 Sheet fully processed!");
 }
 
-runScraper().catch(err => { console.error("💥 Fatal:", err); process.exit(1); });
+runScraper().then(() => process.exit(0)).catch(err => { console.error("💥 Fatal:", err); process.exit(1); });

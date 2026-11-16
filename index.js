@@ -11,15 +11,18 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const CONCURRENCY = Number(process.env.CONCURRENCY || '5');   // URLs scraped at the same time
+const CONCURRENCY = Number(process.env.CONCURRENCY || '5');
 const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
 const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
 const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '6');
 const MAX_CONSECUTIVE_ERRORS = 6;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
-const RECYCLE_BROWSER_EVERY = 10;      // each worker relaunches its browser after N URLs
-const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';
+const RECYCLE_BROWSER_EVERY = 10;
+
+// RETRY_BLOCKED: default = include previously blocked rows on the very first scan.
+// Set RETRY_BLOCKED=0 to skip them.
+const RETRY_BLOCKED = process.env.RETRY_BLOCKED !== '0';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
@@ -27,11 +30,15 @@ const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.05');
 const VIEWPORT_W = 1400;
 const VIEWPORT_H = 900;
 
-const NAV_DELAY_MIN = 100;
-const NAV_DELAY_MAX = 500;
-const HYDRATE_TIMEOUT = 8000;
-const HYDRATE_SETTLE = 250;
-const ZOOM_WAIT = 700;
+// Settle / wait timings (tunable via env)
+const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '100');
+const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '500');
+const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '8000');
+const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '400');
+const ZOOM_SETTLE_MS = Number(process.env.ZOOM_SETTLE_MS || '1200');
+const HEADING_SETTLE_MS = Number(process.env.HEADING_SETTLE_MS || '1500');
+const TABLE_VIEW_SETTLE_MS = Number(process.env.TABLE_VIEW_SETTLE_MS || '1000');
+const TABLE_WAIT_MS = Number(process.env.TABLE_WAIT_MS || '15000');
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -55,7 +62,7 @@ const safeCell = (v) => {
 const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
 
 // =========================================================
-// BROWSER LAUNCH (one per worker, fresh incognito context per URL)
+// BROWSER LAUNCH
 // =========================================================
 async function launchBrowser() {
     const userDataDir = path.join(os.tmpdir(), `zillow-profile-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -114,7 +121,7 @@ function safeValue(sheet, row, col) {
 }
 
 // =========================================================
-// FIND NEXT ROW — forward cursor; each row visited once per process
+// FIND NEXT ROW
 // =========================================================
 function findNextRow(sheet, afterRow, includeSkipped) {
     for (let r = afterRow + 1; r < sheet.rowCount; r++) {
@@ -173,9 +180,104 @@ function parseHistoryRowsInPage() {
 }
 
 // =========================================================
-// EXTRACT ONE URL (own incognito context => isolated cookies)
+// HARDENED MOUNT: zoom + scroll + click Table view + wait + retry
+// =========================================================
+async function ensureHistoryMounted(page, tag) {
+    // Step 1: Zoom to fit + scroll to bottom (triggers IntersectionObserver)
+    try {
+        await page.evaluate((z) => {
+            document.documentElement.style.zoom = String(z);
+            if (document.body) document.body.style.zoom = String(z);
+            window.scrollTo(0, document.body.scrollHeight);
+        }, PAGE_ZOOM);
+    } catch (e) {}
+    await delay(ZOOM_SETTLE_MS);
+
+    // Step 2: Scroll "Price history" heading into view
+    await page.evaluate(() => {
+        const h = Array.from(document.querySelectorAll('h2,h3'))
+            .find(x => /price\s*history/i.test(x.textContent || ''));
+        if (h) h.scrollIntoView({ block: 'center', behavior: 'instant' });
+    }).catch(() => {});
+    await delay(HEADING_SETTLE_MS);
+
+    // Step 3: Click "Table view" if present
+    await page.evaluate(() => {
+        const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
+            .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
+        if (tv) tv.click();
+    }).catch(() => {});
+    await delay(TABLE_VIEW_SETTLE_MS);
+
+    // Step 4: Wait for table headers
+    let tableFound = false;
+    try {
+        await page.waitForFunction(
+            () => {
+                const tables = document.querySelectorAll('table');
+                return Array.from(tables).some(t => {
+                    const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
+                    return hs.includes('date') && hs.includes('event') && hs.includes('price');
+                });
+            },
+            { timeout: TABLE_WAIT_MS }
+        );
+        tableFound = true;
+        console.log(`   📊 [${tag}] Table mounted ✅`);
+    } catch (e) {
+        console.log(`   📊 [${tag}] Table NOT mounted after ${TABLE_WAIT_MS}ms ❌`);
+    }
+
+    // Step 5: If not found, run one more scroll + short wait (second chance)
+    if (!tableFound) {
+        await page.evaluate(() => {
+            const h = Array.from(document.querySelectorAll('h2,h3'))
+                .find(x => /price\s*history/i.test(x.textContent || ''));
+            if (h) h.scrollIntoView({ block: 'center' });
+        }).catch(() => {});
+        await delay(2000);
+        try {
+            await page.waitForFunction(
+                () => {
+                    const tables = document.querySelectorAll('table');
+                    return Array.from(tables).some(t => {
+                        const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
+                        return hs.includes('date') && hs.includes('event') && hs.includes('price');
+                    });
+                },
+                { timeout: 5000 }
+            );
+            tableFound = true;
+            console.log(`   📊 [${tag}] Table mounted (retry) ✅`);
+        } catch (e) {
+            console.log(`   📊 [${tag}] Table NOT mounted (retry) ❌`);
+        }
+    }
+
+    // Step 6: Debug if still not found
+    if (!tableFound) {
+        try {
+            const debug = await page.evaluate(() => ({
+                hasHeading: Array.from(document.querySelectorAll('h2,h3'))
+                    .some(h => /price history/i.test(h.textContent || '')),
+                dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
+                tableCount: document.querySelectorAll('table').length,
+                bodyHeight: document.body.scrollHeight,
+                viewportHeight: window.innerHeight,
+                zoom: document.documentElement.style.zoom,
+            }));
+            console.log(`   🔍 [${tag}] Debug: ${JSON.stringify(debug)}`);
+        } catch (e) {}
+    }
+
+    return tableFound;
+}
+
+// =========================================================
+// EXTRACT ONE URL
 // =========================================================
 async function scrapeOneUrl(browser, url) {
+    const tag = String(url).slice(-22);
     const ctx = await newContext(browser);
     let page;
     try {
@@ -200,36 +302,10 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        try {
-            await page.evaluate((z) => {
-                document.documentElement.style.zoom = String(z);
-                if (document.body) document.body.style.zoom = String(z);
-            }, PAGE_ZOOM);
-        } catch (e) {}
-        try {
-            const client = await page.createCDPSession();
-            await client.send('Emulation.setDeviceMetricsOverride', {
-                width: VIEWPORT_W, height: VIEWPORT_H,
-                deviceScaleFactor: 1, mobile: false, scale: PAGE_ZOOM,
-            });
-        } catch (e) {}
+        // ---- HARDENED MOUNT ----
+        const tableFound = await ensureHistoryMounted(page, tag);
 
-        await delay(ZOOM_WAIT);
-
-        await page.evaluate(() => {
-            const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
-                .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
-            if (tv) tv.click();
-        }).catch(() => {});
-
-        await page.waitForFunction(() => {
-            const tables = document.querySelectorAll('table');
-            return Array.from(tables).some(t => {
-                const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
-                return hs.includes('date') && hs.includes('event') && hs.includes('price');
-            });
-        }, { timeout: 5000 }).catch(() => {});
-
+        // ---- EXTRACT DOM FIELDS ----
         const data = await page.evaluate(() => {
             const out = {
                 price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -386,15 +462,18 @@ async function scrapeOneUrl(browser, url) {
 
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
+        // ---- PARSE HISTORY (retry once if empty) ----
         let domRows = [];
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
-        if (!domRows.length) {
+
+        if (!domRows.length && tableFound) {
+            // Table is mounted but parser returned nothing — try a final scroll+parse
             await page.evaluate(() => {
                 const h = Array.from(document.querySelectorAll('h2,h3'))
                     .find(x => /price\s*history/i.test(x.textContent || ''));
                 if (h) h.scrollIntoView({ block: 'center' });
             }).catch(() => {});
-            await delay(600);
+            await delay(1500);
             try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
         }
 
@@ -414,8 +493,12 @@ async function scrapeOneUrl(browser, url) {
                     if (m) { data.mls = `${m[2].replace(/Originating.*$/i, '').trim()} - ${m[1].trim()}`; break; }
                 }
             }
+            console.log(`   ✅ [${tag}] History: ${domRows.length} rows`);
+        } else {
+            console.log(`   ⚠️ [${tag}] History: EMPTY`);
         }
 
+        // ---- DESCRIPTION JSON-LD fallback ----
         if (!data.description || data.description === 'N/A') {
             try {
                 const ldDesc = await page.evaluate(() => {
@@ -431,6 +514,7 @@ async function scrapeOneUrl(browser, url) {
             } catch (e) { data.description = data.description || 'N/A'; }
         }
 
+        // ---- Facts & Features ----
         data.factsFeaturesText = "";
         try {
             data.factsFeaturesText = await page.evaluate(() => {
@@ -461,7 +545,7 @@ async function scrapeOneUrl(browser, url) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Stealth Scraper V19 — ${CONCURRENCY} URLs in parallel, shared forward cursor, batched sheet writes`);
+    console.log(`🚀 Stealth Scraper V20 — ${CONCURRENCY} workers, hardened history mount, batched writes`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -491,8 +575,7 @@ async function runScraper() {
         if (hd) await saveWithRetry(sheet);
     } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
 
-    // ---- write queue: cells are ONLY touched inside doFlush (serialized), so
-    //      parallel workers can never change cells while a save is in flight.
+    // ---- queue & flush
     const queue = [];
     const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
     const applyEntry = ({ row, status, d }) => {
@@ -532,7 +615,7 @@ async function runScraper() {
             await saveWithRetry(sheet);
             console.log(`💾 Saved ${batch.length} row(s)`);
         } catch (e) {
-            console.warn(`⚠️ Save failed (${e.message}) — cells stay pending and will be retried on next flush`);
+            console.warn(`⚠️ Save failed (${e.message})`);
         }
     };
     const flush = () => (flushChain = flushChain.then(doFlush));
@@ -542,14 +625,13 @@ async function runScraper() {
     let totalBlocks = 0, totalErrors = 0;
     let cursor = -1;
     let stop = false, blockedExit = false;
-    const inflight = new Map(); // same URL appearing in several rows is scraped only once
+    const inflight = new Map();
 
     const claimRow = () => {
-        const r = findNextRow(sheet, cursor, RETRY_BLOCKED);
-        if (r !== -1) cursor = r;      // claimed synchronously => no two workers get the same row
+        const r = findNextRow(sheet, cursor, claimed === 0 && RETRY_BLOCKED);
+        if (r !== -1) cursor = r;
         return r;
     };
-
 
     async function worker(id) {
         let browser = null, used = 0;
@@ -601,9 +683,8 @@ async function runScraper() {
                     console.error(`🛑 [W${id}] Error on Row ${actualRow}: ${e.message}`);
                     queue.push({ row: rowIndex, status: "🛑 Error: " + String(e.message).slice(0, 100) });
                     errorStreak++; totalErrors++;
-                    recycle = true;   // browser may be dead
+                    recycle = true;
                 } finally {
-                    // let a later duplicate-URL row retry if this one failed
                     inflight.delete(urlKey(url));
                 }
 
@@ -623,12 +704,11 @@ async function runScraper() {
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
     if (blockedExit) {
-        console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — exiting so GitHub starts a new batch (fresh IP).`);
+        console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — exiting so GitHub starts a new batch.`);
         setOutput(true, true);
         return;
     }
 
-    // Blocked/errored rows are NOT counted as "more work" (otherwise has_more would stay true forever).
     const remaining = RETRY_BLOCKED ? findNextRow(sheet, cursor, true) : findNextRow(sheet, -1, false);
     const hasMore = remaining !== -1;
     setOutput(hasMore, false);

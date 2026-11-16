@@ -4,7 +4,7 @@ run-name: 🚀 Stealth Scraper V23 (Batch ${{ inputs.batch || '1' }})
 
 on:
   schedule:
-    - cron: '0 */4 * * *'        # every 4 hours
+    - cron: '0 */4 * * *'
   workflow_dispatch:
     inputs:
       batch:
@@ -20,7 +20,7 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 70          # ← was 15; must match MAX_RUNTIME_MS
+    timeout-minutes: 70
     outputs:
       has_more: ${{ steps.scraper_task.outputs.has_more }}
       blocked:  ${{ steps.scraper_task.outputs.blocked }}
@@ -33,7 +33,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+          # ⚠️ REMOVED cache: 'npm' — it fails without a lockfile
 
       - name: Install Dependencies
         run: |
@@ -42,12 +42,6 @@ jobs:
           else
             npm install --no-audit --no-fund
           fi
-      # Optional: install headful Chrome only if you set CHROME_PATH.
-      # Puppeteer bundles its own Chromium, so this is optional.
-      # - name: Setup Chrome (optional headful)
-      #   uses: browser-actions/setup-chrome@v1
-      #   with:
-      #     chrome-version: stable
 
       - name: Run Scraper Engine
         id: scraper_task
@@ -55,14 +49,12 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          # ---- Tunables ----
           CONCURRENCY: '5'
           MAX_URLS_PER_RUN: '150'
           PAGE_ZOOM: '0.05'
-          BLOCK_RESOURCES: '0'      # full browser mode
+          BLOCK_RESOURCES: '0'
           RETRY_BLOCKED: '1'
           MAX_BLOCK_STREAK: '6'
-          # CHROME_PATH: /usr/bin/google-chrome  # only if using setup-chrome
 
       - name: Evaluate Self-Reboot Sequence
         if: steps.scraper_task.outputs.has_more == 'true'

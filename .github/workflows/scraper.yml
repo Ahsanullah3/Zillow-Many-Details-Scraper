@@ -42,7 +42,6 @@ jobs:
           else
             npm install --no-audit --no-fund
           fi
-
       # Optional: install headful Chrome only if you set CHROME_PATH.
       # Puppeteer bundles its own Chromium, so this is optional.
       # - name: Setup Chrome (optional headful)

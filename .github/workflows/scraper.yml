@@ -1,15 +1,14 @@
-name: 🚀 Stealth Scraper V6
+name: 🚀 Stealth Scraper V23
 
-# This dynamically names the run in the GitHub Actions UI!
-run-name: 🚀 Stealth Scraper V6 (Batch ${{ inputs.batch || '1' }})
+run-name: 🚀 Stealth Scraper V23 (Batch ${{ inputs.batch || '1' }})
 
 on:
   schedule:
-    - cron: '0 */4 * * *' 
-  workflow_dispatch: 
+    - cron: '0 */4 * * *'        # every 4 hours
+  workflow_dispatch:
     inputs:
       batch:
-        description: "The current batch number"
+        description: "Current batch number"
         required: false
         default: "1"
         type: string
@@ -21,44 +20,58 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 70          # ← was 15; must match MAX_RUNTIME_MS
+    outputs:
+      has_more: ${{ steps.scraper_task.outputs.has_more }}
+      blocked:  ${{ steps.scraper_task.outputs.blocked }}
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js Environment
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
       - name: Install Dependencies
-        run: npm install
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
 
-      # Installs a clean, stable runtime instance of Google Chrome
-      - name: Setup Google Chrome Build Engine
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
+      # Optional: install headful Chrome only if you set CHROME_PATH.
+      # Puppeteer bundles its own Chromium, so this is optional.
+      # - name: Setup Chrome (optional headful)
+      #   uses: browser-actions/setup-chrome@v1
+      #   with:
+      #     chrome-version: stable
 
       - name: Run Scraper Engine
-        id: scraper_task 
+        id: scraper_task
+        run: npm start
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-        run: npm start
+          # ---- Tunables ----
+          CONCURRENCY: '5'
+          MAX_URLS_PER_RUN: '150'
+          PAGE_ZOOM: '0.05'
+          BLOCK_RESOURCES: '0'      # full browser mode
+          RETRY_BLOCKED: '1'
+          MAX_BLOCK_STREAK: '6'
+          # CHROME_PATH: /usr/bin/google-chrome  # only if using setup-chrome
 
       - name: Evaluate Self-Reboot Sequence
         if: steps.scraper_task.outputs.has_more == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Grab the current batch number and add 1
           CURRENT_BATCH="${{ inputs.batch || '1' }}"
           NEXT_BATCH=$((CURRENT_BATCH + 1))
-          
-          echo "Batch $CURRENT_BATCH threshold hit. Rotating environment and triggering Batch $NEXT_BATCH..."
-          
-          # Pass the new batch number into the next run
-          gh workflow run scraper.yml --ref main -f batch=$NEXT_BATCH
+          echo "Batch $CURRENT_BATCH hit threshold. Triggering Batch $NEXT_BATCH..."
+          gh workflow run scraper.yml --ref main -f batch="$NEXT_BATCH"
           sleep 5

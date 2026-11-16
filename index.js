@@ -24,9 +24,13 @@ const RETRY_BLOCKED = process.env.RETRY_BLOCKED !== '0';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
+// ---- BLOCK_RESOURCES: 1 = block heavy assets (default), 0 = load everything
+const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES !== '0';
+console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON (images/css/fonts/media/ads blocked)' : 'OFF (load everything)'}`);
+
 const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.05');
-const VIEWPORT_W = 1400;
-const VIEWPORT_H = 900;
+const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
+const VIEWPORT_H = Number(process.env.VIEWPORT_H || '900');
 
 const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '100');
 const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '500');
@@ -63,22 +67,52 @@ const safeCell = (v) => {
 const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
 
 // =========================================================
-// BROWSER LAUNCH
+// BROWSER LAUNCH — all features enabled
 // =========================================================
 async function launchBrowser() {
     const userDataDir = path.join(os.tmpdir(), `zillow-profile-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
+        // ---- ENABLE EVERYTHING ----
+        '--enable-javascript',
+        '--enable-webgl',
+        '--enable-webgl2',
+        '--enable-accelerated-2d-canvas',
+        '--enable-accelerated-video-decode',
+        '--enable-features=NetworkService,NetworkServiceInProcess',
+        '--ignore-gpu-blocklist',
+        '--enable-gpu-rasterization',
+        '--enable-zero-copy',
+        '--enable-canvas-2d-layers',
+        '--enable-native-gpu-memory-buffers',
+        '--enable-features=CanvasOopRasterization',
+        // Media / DRM
+        '--autoplay-policy=no-user-gesture-required',
+        '--enable-features=MediaSessionService',
+        // WebRTC / WebSockets
+        '--enable-webrtc',
+        '--enable-websockets',
+        // DNS / networking
+        '--enable-dns-prefetch',
+        '--enable-quic',
+        // Modern JS features
+        '--js-flags=--harmony',
+        // Form/Storage
+        '--enable-features=StorageBuckets',
+        '--enable-features=FileSystemAccessAPI',
+    ];
+    // NOTE: removed --disable-gpu (was blocking WebGL) so hardware rendering
+    //       flags above take effect and canvas fingerprint looks real.
     const browser = await puppeteer.launch({
         headless: "new",
         userDataDir,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process',
-            `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
-        ],
+        args,
+        ignoreDefaultArgs: ['--disable-gpu'],  // ensure GPU isn't disabled
     });
     browser.__userDataDir = userDataDir;
     return browser;
@@ -332,7 +366,7 @@ async function ensureHistoryMounted(page, tag) {
         console.log(`   📊 [${tag}] Table NOT mounted after ${TABLE_WAIT_MS}ms ❌`);
     }
 
-    // Step 7: Second chance — See more again + retry
+    // Step 7: Second chance
     if (!tableFound) {
         await page.evaluate(() => {
             const buttons = Array.from(document.querySelectorAll(
@@ -397,13 +431,40 @@ async function scrapeOneUrl(browser, url) {
     let page;
     try {
         page = await ctx.newPage();
-        await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H });
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            const type = req.resourceType();
-            if (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url())) req.abort().catch(() => {});
-            else req.continue().catch(() => {});
+
+        // ---- Enable everything: JS, service workers, WebGL, etc.
+        await page.setJavaScriptEnabled(true);
+        try { await page.setBypassCSP(true); } catch (e) {}
+        await page.setViewport({
+            width: VIEWPORT_W,
+            height: VIEWPORT_H,
+            deviceScaleFactor: 1,
+            hasTouch: false,
+            isMobile: false,
         });
+
+        // ---- Conditional request interception ----
+        if (BLOCK_RESOURCES) {
+            await page.setRequestInterception(true);
+            page.on('request', (req) => {
+                const type = req.resourceType();
+                if (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url())) req.abort().catch(() => {});
+                else req.continue().catch(() => {});
+            });
+        } else {
+            // Load EVERYTHING — no blocking at all
+            await page.setRequestInterception(true);
+            page.on('request', (req) => req.continue().catch(() => {}));
+        }
+
+        // Small UA fix for headless mode — keep if you use headless
+        try {
+            await page.evaluateOnNewDocument(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                if (!window.chrome) window.chrome = {};
+                if (!window.chrome.runtime) window.chrome.runtime = {};
+            });
+        } catch (e) {}
 
         await delay(jitter(NAV_DELAY_MIN, NAV_DELAY_MAX));
         await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -703,7 +764,7 @@ async function scrapeOneUrl(browser, url) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Stealth Scraper V22 — ${CONCURRENCY} workers, "See more" click + hardened history + JSON fallback`);
+    console.log(`🚀 Stealth Scraper V23 — full browser (JS/WebGL/ServiceWorkers enabled), resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF'}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {

@@ -11,10 +11,10 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const MAX_URLS_PER_RUN = 30;
+const MAX_URLS_PER_RUN = 90;
 const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
-const MAX_CONSECUTIVE_BLOCK_STREAKS = 3;
+const MAX_CONSECUTIVE_BLOCK_STREAKS = 5;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED === '1';

@@ -20,8 +20,6 @@ const MAX_CONSECUTIVE_ERRORS = 6;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
 const RECYCLE_BROWSER_EVERY = 10;
 
-// RETRY_BLOCKED: default = include previously blocked rows on the very first scan.
-// Set RETRY_BLOCKED=0 to skip them.
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED !== '0';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
@@ -30,7 +28,6 @@ const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.05');
 const VIEWPORT_W = 1400;
 const VIEWPORT_H = 900;
 
-// Settle / wait timings (tunable via env)
 const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '100');
 const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '500');
 const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '8000');
@@ -142,7 +139,7 @@ function findNextRow(sheet, afterRow, includeSkipped) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// PRICE HISTORY PARSER (runs inside the page)
+// PRICE HISTORY PARSER
 // =========================================================
 function parseHistoryRowsInPage() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -184,13 +181,12 @@ function parseHistoryRowsInPage() {
 }
 
 // =========================================================
-// FALLBACK HISTORY PARSER (class-based, no data-testid required)
+// FALLBACK PARSER
 // =========================================================
 function fallbackHistoryParse() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const rows = [];
 
-    // Pattern A: any element with data-testid="date-info"
     document.querySelectorAll('[data-testid="date-info"]').forEach((dateEl) => {
         const tr = dateEl.closest('tr');
         if (!tr) return;
@@ -209,14 +205,13 @@ function fallbackHistoryParse() {
         rows.push({
             date: clean(dateEl.textContent),
             event: clean(cells[1]?.textContent),
-            price: price,
+            price,
             change,
             ppsf: '',
             source,
         });
     });
 
-    // Pattern B: any table with Date/Event/Price headers
     if (!rows.length) {
         document.querySelectorAll('table').forEach((tbl) => {
             const headers = Array.from(tbl.querySelectorAll('th')).map((x) => clean(x.textContent).toLowerCase());
@@ -240,10 +235,29 @@ function fallbackHistoryParse() {
 }
 
 // =========================================================
-// HARDENED MOUNT
+// HARDENED MOUNT (with See More click)
 // =========================================================
 async function ensureHistoryMounted(page, tag) {
-    // Step 1: Zoom to fit + scroll to bottom
+    // Step 0: Click ALL "See more" / collapsed buttons
+    try {
+        const clickedCount = await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll(
+                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
+            ));
+            let clicked = 0;
+            for (const btn of buttons) {
+                const txt = (btn.textContent || '').trim().toLowerCase();
+                if (txt.includes('see more') || txt.includes('show more') || txt.includes('view more') || txt === 'more') {
+                    try { btn.click(); clicked++; } catch (e) {}
+                }
+            }
+            return clicked;
+        });
+        if (clickedCount > 0) console.log(`   🔽 [${tag}] Clicked ${clickedCount} "See more" button(s)`);
+    } catch (e) {}
+    await delay(CLICK_EXPAND_SETTLE_MS);
+
+    // Step 1: Zoom + scroll bottom
     try {
         await page.evaluate((z) => {
             document.documentElement.style.zoom = String(z);
@@ -253,7 +267,7 @@ async function ensureHistoryMounted(page, tag) {
     } catch (e) {}
     await delay(ZOOM_SETTLE_MS);
 
-    // Step 2: Scroll "Price history" heading into view
+    // Step 2: Scroll heading
     await page.evaluate(() => {
         const h = Array.from(document.querySelectorAll('h2,h3'))
             .find(x => /price\s*history/i.test(x.textContent || ''));
@@ -261,7 +275,7 @@ async function ensureHistoryMounted(page, tag) {
     }).catch(() => {});
     await delay(HEADING_SETTLE_MS);
 
-    // Step 3: Click "Table view" if present
+    // Step 3: Click "Table view"
     await page.evaluate(() => {
         const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
             .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
@@ -269,7 +283,7 @@ async function ensureHistoryMounted(page, tag) {
     }).catch(() => {});
     await delay(TABLE_VIEW_SETTLE_MS);
 
-    // Step 4: Check if table is already there
+    // Step 4: Check table exists
     let tableFound = await page.evaluate(() => {
         const tables = document.querySelectorAll('table');
         return Array.from(tables).some(t => {
@@ -278,7 +292,7 @@ async function ensureHistoryMounted(page, tag) {
         });
     }).catch(() => false);
 
-    // Step 5: If not found, click the heading (expand) + scroll the table wrapper into view
+    // Step 5: Click heading + scroll wrapper
     if (!tableFound) {
         console.log(`   🔧 [${tag}] Clicking heading + scrolling table wrapper...`);
         await page.evaluate(() => {
@@ -291,7 +305,6 @@ async function ensureHistoryMounted(page, tag) {
             }
         }).catch(() => {});
         await delay(CLICK_EXPAND_SETTLE_MS);
-
         await page.evaluate(() => {
             const tbl = document.querySelector('table');
             if (tbl) { tbl.scrollIntoView({ block: 'center', behavior: 'instant' }); return; }
@@ -301,7 +314,7 @@ async function ensureHistoryMounted(page, tag) {
         await delay(SCROLL_WRAPPER_SETTLE_MS);
     }
 
-    // Step 6: Wait for table headers
+    // Step 6: Wait for table
     try {
         await page.waitForFunction(
             () => {
@@ -319,9 +332,18 @@ async function ensureHistoryMounted(page, tag) {
         console.log(`   📊 [${tag}] Table NOT mounted after ${TABLE_WAIT_MS}ms ❌`);
     }
 
-    // Step 7: Second chance — scroll heading + retry once
+    // Step 7: Second chance — See more again + retry
     if (!tableFound) {
         await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll(
+                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
+            ));
+            for (const btn of buttons) {
+                const txt = (btn.textContent || '').trim().toLowerCase();
+                if (txt.includes('see more') || txt.includes('show more')) {
+                    try { btn.click(); } catch (e) {}
+                }
+            }
             const h = Array.from(document.querySelectorAll('h2,h3'))
                 .find(x => /price\s*history/i.test(x.textContent || ''));
             if (h) h.scrollIntoView({ block: 'center' });
@@ -345,7 +367,7 @@ async function ensureHistoryMounted(page, tag) {
         }
     }
 
-    // Step 8: Debug if still not found
+    // Step 8: Debug
     if (!tableFound) {
         try {
             const debug = await page.evaluate(() => ({
@@ -353,9 +375,8 @@ async function ensureHistoryMounted(page, tag) {
                     .some(h => /price history/i.test(h.textContent || '')),
                 dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
                 tableCount: document.querySelectorAll('table').length,
-                tableHeaders: Array.from(document.querySelectorAll('table')).map(t =>
-                    Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim()).slice(0, 3)
-                ),
+                showMoreButtons: document.querySelectorAll('button[data-c11n-component="ShowHide.Button"]').length,
+                collapsedButtons: document.querySelectorAll('button[aria-expanded="false"]').length,
                 bodyHeight: document.body.scrollHeight,
                 viewportHeight: window.innerHeight,
                 zoom: document.documentElement.style.zoom,
@@ -392,14 +413,10 @@ async function scrapeOneUrl(browser, url) {
         const title = await page.title();
         const hasNext = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
         const blockedTitle = /pardon our interruption|robot check|access denied/i.test(title);
-        if (blockedTitle || !hasNext) {
-            return { blocked: true, blockedTitle };
-        }
+        if (blockedTitle || !hasNext) return { blocked: true, blockedTitle };
 
-        // ---- HARDENED MOUNT ----
         const tableFound = await ensureHistoryMounted(page, tag);
 
-        // ---- EXTRACT DOM FIELDS + JSON FALLBACK ----
         const data = await page.evaluate(() => {
             const out = {
                 price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -552,7 +569,7 @@ async function scrapeOneUrl(browser, url) {
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
-            // ---- FALLBACK: extract price history + derived fields from __NEXT_DATA__ ----
+            // JSON fallback
             try {
                 const nextData = JSON.parse(document.querySelector('script#__NEXT_DATA__')?.textContent || 'null');
                 const raw = nextData?.props?.pageProps?.componentProps?.gdpClientCache;
@@ -561,57 +578,37 @@ async function scrapeOneUrl(browser, url) {
                     for (const key of Object.keys(parsed)) {
                         const prop = parsed[key]?.property;
                         if (!prop) continue;
-
                         if (!out.price && prop.price) out.price = prop.price;
                         if (!out.soldPrice && prop.lastSoldPrice) out.soldPrice = prop.lastSoldPrice;
-
-                        const soldDate = prop.dateSold || prop.lastSoldDate || prop.soldDate;
-                        if (soldDate && !out.soldOn) {
-                            const d = new Date(soldDate);
-                            if (!isNaN(d)) out.soldOn = `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
-                        }
-
-                        const listedDate = prop.listedDate || prop.dateListed || prop.listingDate;
-                        if (listedDate && !out.listedForSale) {
-                            const d = new Date(listedDate);
-                            if (!isNaN(d)) out.listedForSale = `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()} ($${prop.price || '?'})`;
-                        }
-
+                        const sd = prop.dateSold || prop.lastSoldDate || prop.soldDate;
+                        if (sd && !out.soldOn) { const d = new Date(sd); if (!isNaN(d)) out.soldOn = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()}`; }
+                        const ld = prop.listedDate || prop.dateListed || prop.listingDate;
+                        if (ld && !out.listedForSale) { const d = new Date(ld); if (!isNaN(d)) out.listedForSale = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()} ($${prop.price || '?'})`; }
                         const ai = prop.attributionInfo;
                         if (ai) {
                             if (!out.mls && (ai.mlsId || ai.mlsName)) out.mls = [ai.mlsId, ai.mlsName].filter(Boolean).join(' - ');
                             if (!out.agentDetails) out.agentDetails = [ai.agentName, ai.brokerName, ai.agentPhoneNumber].filter(Boolean).join(' | ');
                         }
-
-                        // Build priceHistoryText from embedded priceHistory array
                         if (Array.isArray(prop.priceHistory) && prop.priceHistory.length > 0 && !out.priceHistoryText) {
                             const fmtDate = (d) => {
-                                if (typeof d === 'number') {
-                                    const x = new Date(d);
-                                    return `${x.getUTCMonth() + 1}/${x.getUTCDate()}/${x.getUTCFullYear()}`;
-                                }
+                                if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
                                 const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
                                 return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
                             };
-                            out.priceHistoryText = prop.priceHistory.map((h) => {
-                                const priceTxt = (typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || ''));
-                                const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0)
-                                    ? ` (${(h.priceChangeRate * 100).toFixed(1)}%)` : '';
+                            out.priceHistoryText = prop.priceHistory.map(h => {
+                                const priceTxt = typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || '');
+                                const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? ` (${(h.priceChangeRate*100).toFixed(1)}%)` : '';
                                 const source = h.source ? `Source: ${h.source}` : '';
                                 const ppsf = h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '';
                                 return [fmtDate(h.date), h.event, priceTxt + change, ppsf, source].filter(Boolean).join(' | ');
                             }).join('\n');
                             for (const h of prop.priceHistory) {
                                 const ev = String(h.event || '').toLowerCase();
-                                if (ev.includes('listed') && !out.listedForSale) {
-                                    out.listedForSale = `${fmtDate(h.date)} ($${h.price || '?'})`;
-                                }
-                                if (ev.includes('sold') && !out.soldOn) {
-                                    out.soldOn = fmtDate(h.date);
-                                }
+                                if (ev.includes('listed') && !out.listedForSale) out.listedForSale = `${fmtDate(h.date)} ($${h.price || '?'})`;
+                                if (ev.includes('sold') && !out.soldOn) out.soldOn = fmtDate(h.date);
                             }
                         }
-                        break; // only first property
+                        break;
                     }
                 }
             } catch (e) {}
@@ -621,12 +618,10 @@ async function scrapeOneUrl(browser, url) {
 
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
-        // ---- PARSE HISTORY (DOM first, then fallback, then JSON) ----
         let domRows = [];
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
 
         if (!domRows.length) {
-            // Fallback A: scroll heading + retry DOM parse
             await page.evaluate(() => {
                 const h = Array.from(document.querySelectorAll('h2,h3'))
                     .find(x => /price\s*history/i.test(x.textContent || ''));
@@ -637,7 +632,6 @@ async function scrapeOneUrl(browser, url) {
         }
 
         if (!domRows.length) {
-            // Fallback B: class-based parse
             try { domRows = await page.evaluate(fallbackHistoryParse); } catch (e) {}
             if (domRows.length) console.log(`   🔁 [${tag}] Fallback history found: ${domRows.length} rows`);
         }
@@ -664,7 +658,6 @@ async function scrapeOneUrl(browser, url) {
             console.log(`   ⚠️ [${tag}] History: EMPTY${data.priceHistoryText ? ' (JSON fallback OK)' : ''}`);
         }
 
-        // ---- DESCRIPTION JSON-LD fallback ----
         if (!data.description || data.description === 'N/A') {
             try {
                 const ldDesc = await page.evaluate(() => {
@@ -680,7 +673,6 @@ async function scrapeOneUrl(browser, url) {
             } catch (e) { data.description = data.description || 'N/A'; }
         }
 
-        // ---- Facts & Features ----
         data.factsFeaturesText = "";
         try {
             data.factsFeaturesText = await page.evaluate(() => {
@@ -711,7 +703,7 @@ async function scrapeOneUrl(browser, url) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Stealth Scraper V21 — ${CONCURRENCY} workers, hardened history + JSON fallback + table log`);
+    console.log(`🚀 Stealth Scraper V22 — ${CONCURRENCY} workers, "See more" click + hardened history + JSON fallback`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -729,7 +721,6 @@ async function runScraper() {
     await sheet.loadCells();
     console.log(`📊 Sheet: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
 
-    // ---- headers
     try {
         let hd = 0;
         HEADERS.forEach((title, i) => {
@@ -741,7 +732,6 @@ async function runScraper() {
         if (hd) await saveWithRetry(sheet);
     } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
 
-    // ---- queue & flush
     const queue = [];
     const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
     const applyEntry = ({ row, status, d }) => {
@@ -786,7 +776,6 @@ async function runScraper() {
     };
     const flush = () => (flushChain = flushChain.then(doFlush));
 
-    // ---- shared state
     let claimed = 0, success = 0, blockStreak = 0, errorStreak = 0;
     let totalBlocks = 0, totalErrors = 0;
     let totalWithHistory = 0, totalWithTableFound = 0;

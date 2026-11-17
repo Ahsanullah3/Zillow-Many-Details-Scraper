@@ -1,17 +1,19 @@
-name: 🚀 Chrome Stealth Scraper (SSH Debug)
+name: 🚀 Chrome Stealth Scraper
 
-run-name: 🚀 Zillow Scraper (SSH Debug) - Batch ${{ inputs.batch || '1' }}
+run-name: 🚀 Chrome Stealth Scraper (Batch ${{ inputs.batch || '1' }})
 
 on:
+  schedule:
+    - cron: '0 */4 * * *'
   workflow_dispatch:
     inputs:
       batch:
-        description: "Batch number"
+        description: "Current batch number"
         required: false
         default: "1"
         type: string
       debug_dump:
-        description: "Save debug files (1 = yes)"
+        description: "Save screenshot + HTML when history is missing/blocked (1 = yes)"
         required: false
         default: "0"
         type: string
@@ -20,13 +22,13 @@ permissions:
   actions: write
   contents: read
 
+# Only one run at a time; a newly queued run waits for the current one.
 concurrency:
-  group: zillow-scraper-ssh
+  group: zillow-scraper
   cancel-in-progress: false
 
 env:
-  MAX_BATCHES: '60'
-  MAX_SKIP_STREAK: '15'
+  MAX_BATCHES: '60'   # safety cap so a permanently blocked run can't loop forever
 
 jobs:
   scrape:
@@ -62,42 +64,22 @@ jobs:
       - name: Check system Chrome
         run: google-chrome --version
 
-      - name: Start Xvfb (virtual display for headful Chrome)
-        run: |
-          Xvfb :99 -screen 0 1400x900x24 &
-          sleep 2
-          echo "DISPLAY=:99" >> $GITHUB_ENV
-
-      # -----------------------------------------------------------
-      # This is the key step: it opens an SSH session.
-      # You will receive an SSH command in the logs.
-      # -----------------------------------------------------------
-      - name: Setup SSH Debug Session (action-tmate)
-        uses: mxschmitt/action-tmate@v3
-        with:
-          # Keep the session alive for the duration of the job
-          limit-access-to-actor: true
-        # The session starts immediately. You will see the SSH command
-        # in the workflow logs. Keep the session open while the next step runs.
-
-      - name: Run Scraper (with CDP access)
+      - name: Run Scraper Engine (real Chrome, headful under xvfb)
         id: scraper_task
-        run: node index.js
+        # Run node directly (not via npm) so cancel signals reach the script,
+        # which flushes pending rows before exiting.
+        run: xvfb-run -a --server-args="-screen 0 1400x900x24" node index.js
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           HEADFUL: '1'
           CHROME_PATH: /usr/bin/google-chrome
-          CONCURRENCY: '1'
-          MAX_URLS_PER_RUN: '3000'
-          BLOCK_RESOURCES: '0'
-          INCLUDE_PAGE_TEXT: '1'
+          CONCURRENCY: '3'
+          MAX_URLS_PER_RUN: '150'
+          BLOCK_RESOURCES: '1'
+          INCLUDE_PAGE_TEXT: '0'
           RETRY_BLOCKED: '1'
           MAX_BLOCK_STREAK: '6'
-          MAX_SKIP_STREAK: '15'
-          FINANCIAL_WAIT_MS: '12000'
-          FINANCIAL_RELOAD_WAIT_MS: '15000'
-          CDP_CAPTCHA_WAIT_MS: '300000'
           DEBUG_DUMP: ${{ inputs.debug_dump || '0' }}
 
       - name: Upload debug files
@@ -108,7 +90,8 @@ jobs:
           path: debug/
           if-no-files-found: ignore
 
-      - name: Evaluate Self-Reboot
+      # ---- SELF-REBOOT: only if NOT cancelled, has_more=true AND not blocked ----
+      - name: Evaluate Self-Reboot Sequence
         if: |
           !cancelled() &&
           steps.scraper_task.outputs.has_more == 'true' &&
@@ -118,14 +101,18 @@ jobs:
         run: |
           CURRENT_BATCH="${{ inputs.batch || '1' }}"
           NEXT_BATCH=$((CURRENT_BATCH + 1))
+
           if [ "$NEXT_BATCH" -gt "$MAX_BATCHES" ]; then
-            echo "Reached MAX_BATCHES ($MAX_BATCHES) — stopping."
+            echo "Reached MAX_BATCHES ($MAX_BATCHES) — not triggering another batch."
             exit 0
           fi
+
           echo "Batch $CURRENT_BATCH hit threshold. Triggering Batch $NEXT_BATCH..."
           gh workflow run scraper.yml --ref main -f batch="$NEXT_BATCH"
           sleep 5
 
+      # ---- CLEAN EXIT: runs even on cancel, logs the stop ----
       - name: Cleanup on Cancel
         if: cancelled()
-        run: echo "🛑 Workflow was cancelled — reboot skipped."
+        run: |
+          echo "🛑 Workflow was cancelled — self-reboot skipped."

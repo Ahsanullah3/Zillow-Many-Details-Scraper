@@ -1,6 +1,6 @@
-name: 🚀 Stealth Scraper V23
+name: 🚀 Chrome Stealth Scraper
 
-run-name: 🚀 Stealth Scraper V23 (Batch ${{ inputs.batch || '1' }})
+run-name: 🚀 Chrome Stealth Scraper (Batch ${{ inputs.batch || '1' }})
 
 on:
   schedule:
@@ -17,10 +17,13 @@ permissions:
   actions: write
   contents: read
 
-# Prevent overlapping runs (new run cancels old one automatically)
+# Only one run at a time; a newly queued run waits for the current one.
 concurrency:
   group: zillow-scraper
   cancel-in-progress: false
+
+env:
+  MAX_BATCHES: '60'   # safety cap so a permanently blocked run can't loop forever
 
 jobs:
   scrape:
@@ -39,6 +42,12 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Cache Puppeteer Chrome
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('package.json', 'package-lock.json') }}
+
       - name: Install Dependencies
         run: |
           if [ -f package-lock.json ]; then
@@ -49,19 +58,20 @@ jobs:
 
       - name: Run Scraper Engine
         id: scraper_task
-        # 👇 still runs even if the user cancels, so the scraper receives SIGTERM
-        # and can flush pending rows before exiting
-        continue-on-error: false
-        run: npm start
+        # Run node directly (not via npm) so cancel signals reach the script,
+        # which flushes pending rows before exiting.
+        run: node index.js
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           CONCURRENCY: '3'
           MAX_URLS_PER_RUN: '150'
-          PAGE_ZOOM: '1'
+          PAGE_ZOOM: '0.05'
           BLOCK_RESOURCES: '1'
           RETRY_BLOCKED: '1'
           MAX_BLOCK_STREAK: '6'
+          NAV_DELAY_MIN: '500'
+          NAV_DELAY_MAX: '2000'
 
       # ---- SELF-REBOOT: only if NOT cancelled AND has_more=true ----
       - name: Evaluate Self-Reboot Sequence
@@ -73,6 +83,19 @@ jobs:
         run: |
           CURRENT_BATCH="${{ inputs.batch || '1' }}"
           NEXT_BATCH=$((CURRENT_BATCH + 1))
+
+          if [ "$NEXT_BATCH" -gt "$MAX_BATCHES" ]; then
+            echo "Reached MAX_BATCHES ($MAX_BATCHES) — not triggering another batch."
+            exit 0
+          fi
+
+          # If this run ended because of blocks, wait a bit before the next
+          # batch starts on a fresh runner.
+          if [ "${{ steps.scraper_task.outputs.blocked }}" == "true" ]; then
+            echo "Run ended blocked — cooling down 120s before next batch."
+            sleep 120
+          fi
+
           echo "Batch $CURRENT_BATCH hit threshold. Triggering Batch $NEXT_BATCH..."
           gh workflow run scraper.yml --ref main -f batch="$NEXT_BATCH"
           sleep 5
@@ -82,5 +105,3 @@ jobs:
         if: cancelled()
         run: |
           echo "🛑 Workflow was cancelled — self-reboot skipped."
-          echo "   has_more=${{ steps.scraper_task.outputs.has_more }}"
-          echo "   blocked=${{ steps.scraper_task.outputs.blocked }}"

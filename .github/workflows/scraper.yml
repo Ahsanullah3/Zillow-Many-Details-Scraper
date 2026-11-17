@@ -75,7 +75,7 @@ jobs:
           HEADFUL: '1'
           CHROME_PATH: /usr/bin/google-chrome
           CONCURRENCY: '1'
-          MAX_URLS_PER_RUN: '30'
+          MAX_URLS_PER_RUN: '3000'
           BLOCK_RESOURCES: '1'
           INCLUDE_PAGE_TEXT: '0'
           RETRY_BLOCKED: '1'

@@ -326,18 +326,19 @@ async function ensureHistoryMounted(page, tag) {
         });
     }).catch(() => false);
 
-    // Step 5: Click heading + scroll wrapper
+    // Step 5: Click the "Hide" button + scroll wrapper  (price-history heading click REMOVED)
     if (!tableFound) {
-        console.log(`   🔧 [${tag}] Clicking heading + scrolling table wrapper...`);
-        await page.evaluate(() => {
-            const h = Array.from(document.querySelectorAll('h2,h3'))
-                .find(x => /price\s*history/i.test(x.textContent || ''));
-            if (h) {
-                h.click();
-                const parent = h.closest('[role="button"], button, details, summary, [data-testid*="card"]');
-                if (parent) try { parent.click(); } catch (e) {}
+        console.log(`   🔧 [${tag}] Clicking "Hide" button + scrolling table wrapper...`);
+        const hideClicked = await page.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button[data-c11n-component="TextButton.Root"]'))
+                .filter(b => ((b.querySelector('[data-c11n-component="TextButton.Label"]') || {}).textContent || '').trim().toLowerCase() === 'hide');
+            let n = 0;
+            for (const b of btns) {
+                try { b.scrollIntoView({ block: 'center' }); b.click(); n++; } catch (e) {}
             }
-        }).catch(() => {});
+            return n;
+        }).catch(() => 0);
+        if (hideClicked > 0) console.log(`   🙈 [${tag}] Clicked "Hide" button x${hideClicked}`);
         await delay(CLICK_EXPAND_SETTLE_MS);
         await page.evaluate(() => {
             const tbl = document.querySelector('table');

@@ -1,19 +1,16 @@
 {
   "name": "zillow-scraper",
-  "version": "2.1.0",
-  "private": true,
+  "version": "1.0.0",
+  "description": "Zillow detail-page scraper with CDP remote debugging for manual CAPTCHA solving",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "google-auth-library": "^9.14.1",
-    "google-spreadsheet": "^4.1.2",
-    "puppeteer": "^23.9.0",
+    "google-spreadsheet": "^4.1.4",
+    "google-auth-library": "^9.14.2",
+    "puppeteer": "^23.0.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }

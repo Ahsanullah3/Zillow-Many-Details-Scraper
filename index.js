@@ -20,19 +20,14 @@ const MAX_CONSECUTIVE_ERRORS = 6;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
 const RECYCLE_BROWSER_EVERY = 10;
 
-// Retry rows previously marked BLOCKED / Error AFTER all fresh rows are done (1 = yes)
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED !== '0';
 
-// Browser mode
-const HEADFUL = process.env.HEADFUL === '1';                 // run real (non-headless) Chrome; use xvfb-run on CI
-const CHROME_PATH = process.env.CHROME_PATH || '';           // e.g. /usr/bin/google-chrome
-const CHROME_CHANNEL = process.env.CHROME_CHANNEL || '';     // e.g. chrome
+const HEADFUL = process.env.HEADFUL === '1';
+const CHROME_PATH = process.env.CHROME_PATH || '';
+const CHROME_CHANNEL = process.env.CHROME_CHANNEL || '';
 
-// Resource blocking: images/media/fonts/ads only. CSS is kept so layout & lazy modules behave normally.
 const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES !== '0';
-// Page text is big and mostly boilerplate. Off by default.
 const INCLUDE_PAGE_TEXT = process.env.INCLUDE_PAGE_TEXT === '1';
-// Save screenshot + html when price history is missing
 const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';
 
 const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
@@ -41,8 +36,10 @@ const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '500');
 const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '2000');
 const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '10000');
 const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '500');
-const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '15000');
-const SHOW_MORE_SETTLE_MS = Number(process.env.SHOW_MORE_SETTLE_MS || '700');
+const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20000'); // ✅ FIX: raised
+const SHOW_MORE_SETTLE_MS = Number(process.env.SHOW_MORE_SETTLE_MS || '900'); // ✅ FIX: raised
+const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY || '350'); // ✅ FIX
+const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || '400'); // ✅ FIX
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -55,7 +52,7 @@ const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
 console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON (images/media/fonts/ads)' : 'OFF'} | headful: ${HEADFUL} | pageText: ${INCLUDE_PAGE_TEXT}`);
 
-const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
+const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history/i.test(String(st || '')); // ✅ FIX: retry "no history"
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
@@ -131,8 +128,6 @@ function safeValue(sheet, row, col) {
     }
 }
 
-// mode: 'fresh'   -> rows never processed (or not done and not skipped)
-//       'skipped' -> rows previously marked BLOCKED / Error / Empty parse
 function findNextRow(sheet, afterRow, mode) {
     for (let r = afterRow + 1; r < sheet.rowCount; r++) {
         const url = safeValue(sheet, r, 0);
@@ -150,63 +145,173 @@ function findNextRow(sheet, afterRow, mode) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// PRICE HISTORY (runs inside the browser)
+// ✅ FIX: SLOW SCROLL — loads lazy modules incl. price history
 // =========================================================
-async function getPriceHistory(page, tag) {
-    // 1. Scroll the page in normal steps so lazy modules mount
+async function slowScrollToBottom(page, tag) {
     try {
-        await page.evaluate(async () => {
-            const step = Math.floor(window.innerHeight * 0.8);
-            const max = document.body.scrollHeight + step;
-            for (let y = 0; y < max; y += step) {
-                window.scrollTo(0, y);
-                await new Promise(r => setTimeout(r, 200));
-            }
-        });
-    } catch (e) {}
+        // Reset to top first
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await delay(400);
 
-    // 2. Wait for the "Price history" section with a real table
+        // Progressive scroll with fixed step; re-read scrollHeight each iteration
+        // because lazy modules increase it as they mount.
+        let lastHeight = 0;
+        let stableRounds = 0;
+        const maxRounds = 80;
+        for (let round = 0; round < maxRounds; round++) {
+            const info = await page.evaluate((stepPx) => {
+                const before = window.scrollY;
+                window.scrollBy(0, stepPx);
+                return {
+                    y: window.scrollY,
+                    h: document.body.scrollHeight,
+                    inner: window.innerHeight,
+                };
+            }, SCROLL_STEP_PX).catch(() => null);
+            if (!info) break;
+
+            await delay(SCROLL_STEP_DELAY);
+
+            // If height grew since last round, reset stability counter
+            if (info.h !== lastHeight) {
+                lastHeight = info.h;
+                stableRounds = 0;
+            } else {
+                stableRounds++;
+            }
+
+            // Stop when we're at (or near) the bottom AND height has stopped growing
+            const atBottom = (info.y + info.inner) >= (info.h - 5);
+            if (atBottom && stableRounds >= 2) break;
+        }
+
+        // Final settle so any late-mounting module finishes
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await delay(800);
+
+        // Nudge back up a bit — some modules only render when scrolled INTO view again
+        await page.evaluate(() => window.scrollTo(0, Math.max(0, document.body.scrollHeight - window.innerHeight * 2)));
+        await delay(500);
+    } catch (e) {
+        console.log(`   ⚠️ [${tag}] slowScroll error: ${e.message}`);
+    }
+}
+
+// =========================================================
+// ✅ FIX: PRICE HISTORY — strict detection, safe expand, parse
+// =========================================================
+function findHistoryHandle() {
+    // Runs in-page. Returns handle info + table row count.
+    const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    const h = Array.from(document.querySelectorAll('h2,h3,h4'))
+        .find(x => norm(x.textContent) === 'price history');
+    if (!h) return { found: false, count: 0, hasButton: false };
+
+    // Walk up until we find an ancestor containing a <table>
+    let root = h.parentElement;
+    let table = null;
+    for (let i = 0; i < 5 && root; i++) {
+        table = root.querySelector('table');
+        if (table) break;
+        root = root.parentElement;
+    }
+    if (!table) return { found: true, count: 0, hasButton: false };
+
+    const count = table.querySelectorAll('tbody tr').length;
+    const btn = root.querySelector('tfoot[data-testid="table-see-more"] button, tfoot button');
+    const hasButton = !!btn && /show more|see more/i.test(btn.textContent || '');
+    return { found: true, count, hasButton };
+}
+
+async function getPriceHistory(page, tag) {
+    // 1. Slow scroll so lazy modules mount
+    await slowScrollToBottom(page, tag);
+
+    // 2. Wait for the section AND at least one body row
     const found = await page.waitForFunction(() => {
-        const h = Array.from(document.querySelectorAll('h2,h3'))
-            .find(x => /^price history$/i.test((x.textContent || '').trim()));
-        return !!(h && h.parentElement && h.parentElement.querySelector('table tbody tr'));
-    }, { timeout: HISTORY_WAIT_MS }).then(() => true).catch(() => false);
+        const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const h = Array.from(document.querySelectorAll('h2,h3,h4'))
+            .find(x => norm(x.textContent) === 'price history');
+        if (!h) return false;
+        let root = h.parentElement;
+        for (let i = 0; i < 5 && root; i++) {
+            const t = root.querySelector('table');
+            if (t && t.querySelectorAll('tbody tr').length > 0) return true;
+            root = root.parentElement;
+        }
+        return false;
+    }, { timeout: HISTORY_WAIT_MS, polling: 500 }).then(() => true).catch(() => false);
 
     if (!found) {
         console.log(`   📊 [${tag}] Price history section NOT found`);
         return { rows: [], found: false };
     }
 
-    // 3. Click "Show more" in the footer until it disappears
+    // 3. Safe "Show more" expansion: click until no growth or button gone
+    let prevCount = -1;
     let clicks = 0;
-    for (let i = 0; i < 20; i++) {
-        const clicked = await page.evaluate(() => {
-            const h = Array.from(document.querySelectorAll('h2,h3'))
-                .find(x => /^price history$/i.test((x.textContent || '').trim()));
-            const root = h && h.parentElement;
-            if (!root) return false;
-            const btn = Array.from(root.querySelectorAll('tfoot[data-testid="table-see-more"] button, tfoot button'))
-                .find(b => /show more|see more/i.test(b.textContent || ''));
-            if (!btn) return false;
-            btn.scrollIntoView({ block: 'center' });
-            btn.click();
-            return true;
-        }).catch(() => false);
-        if (!clicked) break;
+    for (let i = 0; i < 25; i++) {
+        const state = await page.evaluate(() => {
+            const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+            const h = Array.from(document.querySelectorAll('h2,h3,h4'))
+                .find(x => norm(x.textContent) === 'price history');
+            if (!h) return { count: 0, clicked: false };
+            let root = h.parentElement;
+            let table = null;
+            for (let j = 0; j < 5 && root; j++) {
+                table = root.querySelector('table');
+                if (table) break;
+                root = root.parentElement;
+            }
+            if (!table) return { count: 0, clicked: false };
+            const count = table.querySelectorAll('tbody tr').length;
+            const btn = root.querySelector('tfoot[data-testid="table-see-more"] button, tfoot button');
+            if (btn && /show more|see more/i.test(btn.textContent || '')) {
+                btn.scrollIntoView({ block: 'center' });
+                btn.click();
+                return { count, clicked: true };
+            }
+            return { count, clicked: false };
+        }).catch(() => ({ count: 0, clicked: false }));
+
+        if (!state.clicked) break;
         clicks++;
         await delay(SHOW_MORE_SETTLE_MS);
+
+        // If no new rows appeared after a click and we've clicked a few times, stop
+        if (state.count === prevCount && clicks >= 2) break;
+        prevCount = state.count;
     }
     if (clicks) console.log(`   🔽 [${tag}] Expanded price history (${clicks} click(s))`);
 
+    // Final nudge: scroll the section into view to force any deferred render
+    await page.evaluate(() => {
+        const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const h = Array.from(document.querySelectorAll('h2,h3,h4'))
+            .find(x => norm(x.textContent) === 'price history');
+        if (h) h.scrollIntoView({ block: 'start' });
+    }).catch(() => {});
+    await delay(600);
+
     // 4. Parse rows
     const rows = await page.evaluate(() => {
-        const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-        const h = Array.from(document.querySelectorAll('h2,h3'))
-            .find(x => /^price history$/i.test(clean(x.textContent)));
-        const table = h && h.parentElement && h.parentElement.querySelector('table');
+        const clean = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+        const norm = (s) => clean(s).toLowerCase();
+        const h = Array.from(document.querySelectorAll('h2,h3,h4'))
+            .find(x => norm(x.textContent) === 'price history');
+        if (!h) return [];
+        let root = h.parentElement;
+        let table = null;
+        for (let i = 0; i < 5 && root; i++) {
+            table = root.querySelector('table');
+            if (table) break;
+            root = root.parentElement;
+        }
         if (!table) return [];
+
         const out = [];
-        for (const tr of table.querySelectorAll('tbody tr')) {
+        const trs = Array.from(table.querySelectorAll('tbody tr'));
+        for (const tr of trs) {
             const dateEl = tr.querySelector('[data-testid="date-info"]');
             const label = tr.getAttribute('label') || '';
             if (!dateEl && !label) continue;
@@ -237,7 +342,9 @@ async function getPriceHistory(page, tag) {
             let source = '';
             const next = tr.nextElementSibling;
             if (next && !next.hasAttribute('label') && !next.querySelector('[data-testid="date-info"]')) {
-                source = clean(next.textContent).replace(/\s*Report\s+a\s+problem\s*$/i, '').replace(/\s*Report\s*$/i, '');
+                source = clean(next.textContent)
+                    .replace(/\s*Report\s+a\s+problem\s*$/i, '')
+                    .replace(/\s*Report\s*$/i, '');
             }
             out.push({ date, event, price, change, ppsf, source });
         }
@@ -278,7 +385,7 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        // ---- Price history (scroll, wait, expand, parse)
+        // ---- Price history (slow scroll, wait, expand, parse)
         const { rows: domRows, found: tableFound } = await getPriceHistory(page, tag);
 
         // ---- Main page data
@@ -290,7 +397,7 @@ async function scrapeOneUrl(browser, url) {
                 listedForSale: "", soldOn: "", mls: "", propertyType: "", yearBuilt: "",
                 hoa: "", priceHistoryText: "", pageText: "", factsFeaturesText: ""
             };
-            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const clean = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
             const num = (s) => {
                 const str = String(s || '').replace(/,/g, '').trim();
                 if (/^[-—–]+$/.test(str)) return '';
@@ -311,7 +418,7 @@ async function scrapeOneUrl(browser, url) {
             if (soldMatch) out.soldPrice = Number(soldMatch[1].replace(/,/g, ''));
             else if (/sold/i.test(pill) && out.price) out.soldPrice = out.price;
 
-            const h1 = clean(txt('h1').replace(/\u00A0/g, ' '));
+            const h1 = clean(txt('h1'));
             if (h1) {
                 const parts = h1.split(',').map(clean);
                 if (parts.length >= 3) {
@@ -322,7 +429,6 @@ async function scrapeOneUrl(browser, url) {
                 }
             }
 
-            // Beds / baths / sqft
             const factMap = {};
             $$('[data-testid="bed-bath-sqft-fact-container"]').forEach(c => {
                 const sp = c.querySelectorAll('span');
@@ -332,7 +438,6 @@ async function scrapeOneUrl(browser, url) {
             if (factMap.baths) out.baths = num(factMap.baths) || factMap.baths;
             if (factMap.sqft)  out.sqft  = num(factMap.sqft)  || factMap.sqft;
 
-            // At a glance
             const glance = $('[aria-label="At a glance facts"]');
             if (glance) {
                 for (const item of glance.querySelectorAll('[role="listitem"]')) {
@@ -348,7 +453,6 @@ async function scrapeOneUrl(browser, url) {
                 }
             }
 
-            // Facts & features map + formatted text (grouped by category)
             const fm = {};
             $$('[data-testid="fact-category"] li').forEach(li => {
                 const t = clean(li.textContent);
@@ -374,18 +478,15 @@ async function scrapeOneUrl(browser, url) {
             if (!out.lotSize && fm['Size']) out.lotSize = fm['Size'];
             if (!out.pricePerSqft && fm['Price per square foot']) out.pricePerSqft = num(fm['Price per square foot']);
 
-            // HOA
             const hasHoa = fm['Has HOA'];
             const hoaFee = fm['HOA fee'] || fm['HOA fee frequency'];
             if (hoaFee) out.hoa = hoaFee;
             else if (hasHoa) out.hoa = /^no/i.test(hasHoa) ? 'No' : `Yes (${hasHoa})`;
             else out.hoa = '';
 
-            // Description
             const descEl = $('[data-testid="description"] article') || $('[data-testid="description"]');
             if (descEl) out.description = clean(descEl.textContent) || 'N/A';
 
-            // Agent
             const la = $('[data-testid="attribution-LISTING_AGENT"]');
             if (la) {
                 const parts = Array.from(la.querySelectorAll('span')).map(x => clean(x.textContent).replace(/,$/, '')).filter(Boolean);
@@ -393,7 +494,6 @@ async function scrapeOneUrl(browser, url) {
                 out.agentDetails = [parts[0], broker, parts[1]].filter(Boolean).join(' | ');
             }
 
-            // MLS
             const mlsInfo = clean(txt('[role="contentinfo"][aria-label="MLS information"]'));
             if (mlsInfo) {
                 const src = mlsInfo.match(/Source:\s*(.+?)\s*,\s*MLS#?:/i);
@@ -401,7 +501,6 @@ async function scrapeOneUrl(browser, url) {
                 if (id) out.mls = `${id[1]} - ${src ? clean(src[1]) : ''}`.replace(/ - $/, '');
             }
 
-            // Optional page text
             if (INCLUDE_PAGE_TEXT) {
                 const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG','VIDEO','AUDIO','CANVAS','OBJECT','EMBED','FOOTER','NAV']);
                 const lines = [];
@@ -421,7 +520,7 @@ async function scrapeOneUrl(browser, url) {
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
-            // Optional JSON fallback (only if __NEXT_DATA__ exists)
+            // JSON fallback (Next.js data) — used only if DOM parse fails
             try {
                 const nd = $('script#__NEXT_DATA__');
                 const nextData = nd ? JSON.parse(nd.textContent || 'null') : null;
@@ -461,7 +560,7 @@ async function scrapeOneUrl(browser, url) {
 
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
-        // ---- Merge price history rows
+        // ---- Merge DOM price history (preferred over JSON fallback)
         if (domRows.length) {
             data.priceHistoryText = domRows.map(r => {
                 const priceTxt = (r.price || '') + (r.change ? ` (${r.change})` : '');
@@ -481,7 +580,7 @@ async function scrapeOneUrl(browser, url) {
             console.log(`   📊 [${tag}] History: ${domRows.length} row(s)`);
             domRows.forEach(r => console.log(`       ${r.date} | ${r.event} | ${r.price}${r.change ? ' (' + r.change + ')' : ''}`));
         } else {
-            console.log(`   ⚠️ [${tag}] History: EMPTY${data.priceHistoryText ? ' (JSON fallback used)' : ''}`);
+            console.log(`   ⚠️ [${tag}] History: EMPTY (tableFound=${tableFound})${data.priceHistoryText ? ' — JSON fallback used' : ''}`);
             if (DEBUG_DUMP) await dumpDebug(page, 'nohistory');
         }
 
@@ -524,7 +623,7 @@ async function dumpDebug(page, label) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Zillow Scraper V24 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
+    console.log(`🚀 Zillow Scraper V25 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -601,7 +700,7 @@ async function runScraper() {
     let totalBlocks = 0, totalErrors = 0;
     let totalWithHistory = 0, totalWithTableFound = 0;
     let cursor = -1;
-    let phase = 'fresh'; // 'fresh' first, then 'skipped' retries
+    let phase = 'fresh';
     let stop = false, blockedExit = false;
     const inflight = new Map();
 
@@ -654,16 +753,19 @@ async function runScraper() {
                     } else {
                         const d = result.data;
                         if (result.tableFound) totalWithTableFound++;
-                        if (d.priceHistoryText) totalWithHistory++;
+                        const hasHistory = !!(d.priceHistoryText && d.priceHistoryText.trim());
+                        if (hasHistory) totalWithHistory++;
 
                         if (!(d.price || d.fullAddress || d.description)) {
                             console.log(`⚠️ [W${id}] Empty parse on Row ${actualRow}`);
                             queue.push({ row: rowIndex, status: "⚠️ Empty parse (skipped)" });
                             errorStreak++; totalErrors++;
                         } else {
-                            queue.push({ row: rowIndex, status: "✅ Done", d });
+                            // ✅ FIX: honest status when history is missing
+                            const status = hasHistory ? "✅ Done" : "⚠️ Done (no history)";
+                            queue.push({ row: rowIndex, status, d });
                             success++; blockStreak = 0; errorStreak = 0;
-                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? d.priceHistoryText.split('\n').length : 'NO'} | 🏷️ ${d.mls || '—'}`);
+                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 🏷️ ${d.mls || '—'}`);
                         }
                     }
                 } catch (e) {
@@ -697,7 +799,6 @@ async function runScraper() {
         return;
     }
 
-    // Only fresh rows decide whether another batch is needed (prevents endless retry loops on stubborn blocked rows)
     const remaining = findNextRow(sheet, -1, 'fresh');
     const hasMore = remaining !== -1;
     setOutput(hasMore, false);

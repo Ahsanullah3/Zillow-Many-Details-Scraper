@@ -26,20 +26,23 @@ const HEADFUL = process.env.HEADFUL === '1';
 const CHROME_PATH = process.env.CHROME_PATH || '';
 const CHROME_CHANNEL = process.env.CHROME_CHANNEL || '';
 
-const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES !== '0';
-const INCLUDE_PAGE_TEXT = process.env.INCLUDE_PAGE_TEXT === '1';
+// ✅ Resource blocking OFF by default — images/fonts/CSS must load so React hydrates fully
+const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES === '1';
+// ✅ Page text ALWAYS captured (last column)
+const INCLUDE_PAGE_TEXT = true;
 const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';
 
 const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
 const VIEWPORT_H = Number(process.env.VIEWPORT_H || '900');
 const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '500');
 const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '2000');
-const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '10000');
-const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '500');
-const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20000'); // ✅ FIX: raised
-const SHOW_MORE_SETTLE_MS = Number(process.env.SHOW_MORE_SETTLE_MS || '900'); // ✅ FIX: raised
-const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY || '350'); // ✅ FIX
-const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || '400'); // ✅ FIX
+const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '12000');
+const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '800');
+const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20000');
+const HISTORY_FALLBACK_MS = Number(process.env.HISTORY_FALLBACK_MS || '8000');
+const SHOW_MORE_SETTLE_MS = Number(process.env.SHOW_MORE_SETTLE_MS || '900');
+const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY || '350');
+const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || '400');
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -50,19 +53,20 @@ const HEADERS = [
 ];
 const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
-console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON (images/media/fonts/ads)' : 'OFF'} | headful: ${HEADFUL} | pageText: ${INCLUDE_PAGE_TEXT}`);
+console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF (all resources load)'} | headful: ${HEADFUL} | pageText: ${INCLUDE_PAGE_TEXT ? 'ON' : 'OFF'}`);
 
-const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history/i.test(String(st || '')); // ✅ FIX: retry "no history"
+const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 const jitter = (min, max) => min + Math.floor(Math.random() * Math.max(1, max - min));
 
 const MAX_CELL_LEN = 49000;
-const safeCell = (v) => {
+const MAX_PAGETEXT_LEN = 49900;
+const safeCell = (v, limit = MAX_CELL_LEN) => {
     if (v === null || v === undefined) return "";
     const s = String(v);
-    return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…[truncated]" : s;
+    return s.length > limit ? s.slice(0, limit) + "…[truncated]" : s;
 };
 
 const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
@@ -145,34 +149,25 @@ function findNextRow(sheet, afterRow, mode) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// ✅ FIX: SLOW SCROLL — loads lazy modules incl. price history
+// ✅ SLOW SCROLL — loads lazy modules incl. price history
 // =========================================================
 async function slowScrollToBottom(page, tag) {
     try {
-        // Reset to top first
         await page.evaluate(() => window.scrollTo(0, 0));
         await delay(400);
 
-        // Progressive scroll with fixed step; re-read scrollHeight each iteration
-        // because lazy modules increase it as they mount.
         let lastHeight = 0;
         let stableRounds = 0;
-        const maxRounds = 80;
+        const maxRounds = 90;
         for (let round = 0; round < maxRounds; round++) {
             const info = await page.evaluate((stepPx) => {
-                const before = window.scrollY;
                 window.scrollBy(0, stepPx);
-                return {
-                    y: window.scrollY,
-                    h: document.body.scrollHeight,
-                    inner: window.innerHeight,
-                };
+                return { y: window.scrollY, h: document.body.scrollHeight, inner: window.innerHeight };
             }, SCROLL_STEP_PX).catch(() => null);
             if (!info) break;
 
             await delay(SCROLL_STEP_DELAY);
 
-            // If height grew since last round, reset stability counter
             if (info.h !== lastHeight) {
                 lastHeight = info.h;
                 stableRounds = 0;
@@ -180,16 +175,12 @@ async function slowScrollToBottom(page, tag) {
                 stableRounds++;
             }
 
-            // Stop when we're at (or near) the bottom AND height has stopped growing
             const atBottom = (info.y + info.inner) >= (info.h - 5);
             if (atBottom && stableRounds >= 2) break;
         }
 
-        // Final settle so any late-mounting module finishes
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
         await delay(800);
-
-        // Nudge back up a bit — some modules only render when scrolled INTO view again
         await page.evaluate(() => window.scrollTo(0, Math.max(0, document.body.scrollHeight - window.innerHeight * 2)));
         await delay(500);
     } catch (e) {
@@ -198,37 +189,14 @@ async function slowScrollToBottom(page, tag) {
 }
 
 // =========================================================
-// ✅ FIX: PRICE HISTORY — strict detection, safe expand, parse
+// ✅ PRICE HISTORY — heading + date-info fallback, safe expand, parse
 // =========================================================
-function findHistoryHandle() {
-    // Runs in-page. Returns handle info + table row count.
-    const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-    const h = Array.from(document.querySelectorAll('h2,h3,h4'))
-        .find(x => norm(x.textContent) === 'price history');
-    if (!h) return { found: false, count: 0, hasButton: false };
-
-    // Walk up until we find an ancestor containing a <table>
-    let root = h.parentElement;
-    let table = null;
-    for (let i = 0; i < 5 && root; i++) {
-        table = root.querySelector('table');
-        if (table) break;
-        root = root.parentElement;
-    }
-    if (!table) return { found: true, count: 0, hasButton: false };
-
-    const count = table.querySelectorAll('tbody tr').length;
-    const btn = root.querySelector('tfoot[data-testid="table-see-more"] button, tfoot button');
-    const hasButton = !!btn && /show more|see more/i.test(btn.textContent || '');
-    return { found: true, count, hasButton };
-}
-
 async function getPriceHistory(page, tag) {
     // 1. Slow scroll so lazy modules mount
     await slowScrollToBottom(page, tag);
 
-    // 2. Wait for the section AND at least one body row
-    const found = await page.waitForFunction(() => {
+    // 2. Try heading-based wait (preferred)
+    let found = await page.waitForFunction(() => {
         const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
         const h = Array.from(document.querySelectorAll('h2,h3,h4'))
             .find(x => norm(x.textContent) === 'price history');
@@ -242,30 +210,41 @@ async function getPriceHistory(page, tag) {
         return false;
     }, { timeout: HISTORY_WAIT_MS, polling: 500 }).then(() => true).catch(() => false);
 
+    // 3. Fallback: look for date-info cells anywhere on the page
     if (!found) {
-        console.log(`   📊 [${tag}] Price history section NOT found`);
+        found = await page.waitForFunction(() => {
+            return document.querySelectorAll('[data-testid="date-info"]').length > 0;
+        }, { timeout: HISTORY_FALLBACK_MS, polling: 500 }).then(() => true).catch(() => false);
+        if (found) console.log(`   📊 [${tag}] Heading missing but date-info cells found — using fallback locator`);
+    }
+
+    if (!found) {
+        console.log(`   📊 [${tag}] Price history DOM NOT found — will rely on JSON fallback`);
         return { rows: [], found: false };
     }
 
-    // 3. Safe "Show more" expansion: click until no growth or button gone
-    let prevCount = -1;
-    let clicks = 0;
+    // 4. Safe "Show more" expansion
+    let prevCount = -1, clicks = 0;
     for (let i = 0; i < 25; i++) {
         const state = await page.evaluate(() => {
             const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+            let table = null;
             const h = Array.from(document.querySelectorAll('h2,h3,h4'))
                 .find(x => norm(x.textContent) === 'price history');
-            if (!h) return { count: 0, clicked: false };
-            let root = h.parentElement;
-            let table = null;
-            for (let j = 0; j < 5 && root; j++) {
-                table = root.querySelector('table');
-                if (table) break;
-                root = root.parentElement;
+            if (h) {
+                let root = h.parentElement;
+                for (let j = 0; j < 5 && root; j++) { table = root.querySelector('table'); if (table) break; root = root.parentElement; }
+            }
+            if (!table) {
+                const cell = document.querySelector('[data-testid="date-info"]');
+                if (cell) table = cell.closest('table');
             }
             if (!table) return { count: 0, clicked: false };
+
             const count = table.querySelectorAll('tbody tr').length;
-            const btn = root.querySelector('tfoot[data-testid="table-see-more"] button, tfoot button');
+            const root2 = table.closest('div') || table.parentElement;
+            const btn = (root2 && root2.querySelector('tfoot[data-testid="table-see-more"] button, tfoot button')) ||
+                        document.querySelector('tfoot[data-testid="table-see-more"] button, tfoot button');
             if (btn && /show more|see more/i.test(btn.textContent || '')) {
                 btn.scrollIntoView({ block: 'center' });
                 btn.click();
@@ -277,41 +256,37 @@ async function getPriceHistory(page, tag) {
         if (!state.clicked) break;
         clicks++;
         await delay(SHOW_MORE_SETTLE_MS);
-
-        // If no new rows appeared after a click and we've clicked a few times, stop
         if (state.count === prevCount && clicks >= 2) break;
         prevCount = state.count;
     }
     if (clicks) console.log(`   🔽 [${tag}] Expanded price history (${clicks} click(s))`);
 
-    // Final nudge: scroll the section into view to force any deferred render
+    // Nudge scroll into view
     await page.evaluate(() => {
-        const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-        const h = Array.from(document.querySelectorAll('h2,h3,h4'))
-            .find(x => norm(x.textContent) === 'price history');
-        if (h) h.scrollIntoView({ block: 'start' });
+        const cell = document.querySelector('[data-testid="date-info"]');
+        if (cell) cell.scrollIntoView({ block: 'start' });
     }).catch(() => {});
     await delay(600);
 
-    // 4. Parse rows
+    // 5. Parse rows — via heading OR via any table containing date-info
     const rows = await page.evaluate(() => {
         const clean = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
         const norm = (s) => clean(s).toLowerCase();
+        let table = null;
         const h = Array.from(document.querySelectorAll('h2,h3,h4'))
             .find(x => norm(x.textContent) === 'price history');
-        if (!h) return [];
-        let root = h.parentElement;
-        let table = null;
-        for (let i = 0; i < 5 && root; i++) {
-            table = root.querySelector('table');
-            if (table) break;
-            root = root.parentElement;
+        if (h) {
+            let root = h.parentElement;
+            for (let i = 0; i < 5 && root; i++) { table = root.querySelector('table'); if (table) break; root = root.parentElement; }
+        }
+        if (!table) {
+            const cell = document.querySelector('[data-testid="date-info"]');
+            if (cell) table = cell.closest('table');
         }
         if (!table) return [];
 
         const out = [];
-        const trs = Array.from(table.querySelectorAll('tbody tr'));
-        for (const tr of trs) {
+        for (const tr of table.querySelectorAll('tbody tr')) {
             const dateEl = tr.querySelector('[data-testid="date-info"]');
             const label = tr.getAttribute('label') || '';
             if (!dateEl && !label) continue;
@@ -342,9 +317,7 @@ async function getPriceHistory(page, tag) {
             let source = '';
             const next = tr.nextElementSibling;
             if (next && !next.hasAttribute('label') && !next.querySelector('[data-testid="date-info"]')) {
-                source = clean(next.textContent)
-                    .replace(/\s*Report\s+a\s+problem\s*$/i, '')
-                    .replace(/\s*Report\s*$/i, '');
+                source = clean(next.textContent).replace(/\s*Report\s+a\s+problem\s*$/i, '').replace(/\s*Report\s*$/i, '');
             }
             out.push({ date, event, price, change, ppsf, source });
         }
@@ -365,16 +338,22 @@ async function scrapeOneUrl(browser, url) {
         page = await ctx.newPage();
         await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1, hasTouch: false, isMobile: false });
 
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            const type = req.resourceType();
-            if (BLOCK_RESOURCES && (['image', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url()))) req.abort().catch(() => {});
-            else req.continue().catch(() => {});
-        });
+        if (BLOCK_RESOURCES) {
+            await page.setRequestInterception(true);
+            page.on('request', (req) => {
+                const type = req.resourceType();
+                if (['image', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url())) req.abort().catch(() => {});
+                else req.continue().catch(() => {});
+            });
+        }
 
         await delay(jitter(NAV_DELAY_MIN, NAV_DELAY_MAX));
-        await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForSelector('[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"], h1', { timeout: HYDRATE_TIMEOUT }).catch(() => {});
+        // Give heavier (unblocked) page time to settle
+        if (typeof page.waitForNetworkIdle === 'function') {
+            await page.waitForNetworkIdle({ idleTime: 1200, timeout: 15000 }).catch(() => {});
+        }
         await delay(HYDRATE_SETTLE);
 
         const title = await page.title();
@@ -385,10 +364,10 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        // ---- Price history (slow scroll, wait, expand, parse)
+        // ---- Price history
         const { rows: domRows, found: tableFound } = await getPriceHistory(page, tag);
 
-        // ---- Main page data
+        // ---- Main page data (always captures pageText)
         const data = await page.evaluate((INCLUDE_PAGE_TEXT) => {
             const out = {
                 price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -501,26 +480,90 @@ async function scrapeOneUrl(browser, url) {
                 if (id) out.mls = `${id[1]} - ${src ? clean(src[1]) : ''}`.replace(/ - $/, '');
             }
 
+            // ✅ Page text — always captured, structured
             if (INCLUDE_PAGE_TEXT) {
-                const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG','VIDEO','AUDIO','CANVAS','OBJECT','EMBED','FOOTER','NAV']);
+                const SKIP = new Set([
+                    'SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON',
+                    'SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG',
+                    'VIDEO','AUDIO','CANVAS','OBJECT','EMBED'
+                ]);
+                const SKIP_TESTID = /topnav|desktop-action-bar|action-bar|footer|mobile-footer|neighborhood-ad|MstServicesAvailability|zhl-upsell|third-party|ad-frame|lightbox/i;
+
                 const lines = [];
-                const walk = (n) => {
-                    if (n.nodeType === 3) { const t = clean(n.nodeValue); if (t) lines.push(t); return; }
-                    if (n.nodeType !== 1) return;
-                    if (SKIP.has(n.tagName.toUpperCase())) return;
-                    if (n.getAttribute('aria-hidden') === 'true') return;
-                    const tid = n.getAttribute('data-testid');
-                    if (tid && /topnav|desktop-action-bar|footer|neighborhood-ad|MstServicesAvailability/i.test(tid)) return;
-                    for (const c of n.childNodes) walk(c);
+                const seen = new Set();
+                const push = (s) => {
+                    const t = clean(s);
+                    if (!t || t.length < 2) return;
+                    if (lines.length && lines[lines.length - 1] === t) return;
+                    const k = t.toLowerCase();
+                    if (t.length < 25 && seen.has(k)) return;
+                    if (t.length < 25) seen.add(k);
+                    lines.push(t);
                 };
-                const main = $('[data-test="hdp-not-for-sale-page-content"]') || $('#layout-wrapper') || document.body;
-                walk(main);
-                out.pageText = [clean(document.title), location.href, '', ...lines].join('\n');
+
+                const isHeading = (n) => /^H[1-6]$/.test(n.tagName);
+                const isBlock = (n) => /^(DIV|SECTION|ARTICLE|MAIN|ASIDE|HEADER|FOOTER|UL|OL|LI|P|TABLE|TBODY|THEAD|TR|TD|TH|DL|DT|DD|FIGURE|FIGCAPTION|BLOCKQUOTE|PRE)$/.test(n.tagName);
+
+                const walk = (n, depth) => {
+                    if (n.nodeType === 3) { push(n.nodeValue); return; }
+                    if (n.nodeType !== 1) return;
+                    const tag = n.tagName.toUpperCase();
+                    if (SKIP.has(tag)) return;
+                    if (n.getAttribute('aria-hidden') === 'true') return;
+                    if (n.hidden) return;
+                    const tid = n.getAttribute('data-testid') || '';
+                    if (tid && SKIP_TESTID.test(tid)) return;
+
+                    const aria = n.getAttribute('aria-label');
+                    const ariaText = aria && aria.length > 2 && aria.length < 120 ? clean(aria) : '';
+
+                    if (isHeading(n)) {
+                        const t = clean(n.textContent);
+                        if (t) { lines.push(''); lines.push(`## ${t}`); }
+                        return;
+                    }
+
+                    if (tag === 'TABLE') {
+                        for (const tr of n.querySelectorAll('tr')) {
+                            const cells = Array.from(tr.querySelectorAll('th,td'))
+                                .map(c => clean(c.textContent))
+                                .filter(Boolean);
+                            if (cells.length) push(cells.join(' | '));
+                        }
+                        return;
+                    }
+
+                    if (ariaText && !clean(n.textContent).startsWith(ariaText)) push(ariaText);
+
+                    for (const c of n.childNodes) walk(c, depth + 1);
+
+                    if (isBlock(n) && lines.length && lines[lines.length - 1] !== '') lines.push('');
+                };
+
+                const main = $('[data-test="hdp-not-for-sale-page-content"]')
+                    || $('#layout-wrapper .layout-container')
+                    || $('#layout-wrapper')
+                    || document.body;
+
+                walk(main, 0);
+
+                const compact = [];
+                for (const l of lines) {
+                    if (l === '' && compact[compact.length - 1] === '') continue;
+                    compact.push(l);
+                }
+
+                out.pageText = [
+                    `TITLE: ${clean(document.title)}`,
+                    `URL: ${location.href}`,
+                    '',
+                    ...compact
+                ].join('\n').trim();
             }
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
-            // JSON fallback (Next.js data) — used only if DOM parse fails
+            // JSON fallback #1: Next.js gdpClientCache
             try {
                 const nd = $('script#__NEXT_DATA__');
                 const nextData = nd ? JSON.parse(nd.textContent || 'null') : null;
@@ -555,6 +598,42 @@ async function scrapeOneUrl(browser, url) {
                 }
             } catch (e) {}
 
+            // ✅ JSON fallback #2: scan any JSON script for priceHistory array
+            try {
+                if (!out.priceHistoryText) {
+                    const scripts = document.querySelectorAll('script[type="application/json"], script[type="application/ld+json"]');
+                    for (const sc of scripts) {
+                        let j;
+                        try { j = JSON.parse(sc.textContent || 'null'); } catch (e) { continue; }
+                        const stack = [j];
+                        let found = false;
+                        while (stack.length && !found) {
+                            const cur = stack.pop();
+                            if (!cur || typeof cur !== 'object') continue;
+                            if (Array.isArray(cur.priceHistory) && cur.priceHistory.length) {
+                                const fmtDate = (d) => {
+                                    if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
+                                    const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+                                    return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
+                                };
+                                out.priceHistoryText = cur.priceHistory.map(h => {
+                                    const priceTxt = typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || '');
+                                    const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? ` (${(h.priceChangeRate*100).toFixed(1)}%)` : '';
+                                    const ppsf = h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '';
+                                    return [fmtDate(h.date), h.event, priceTxt + change, ppsf, h.source ? `Source: ${h.source}` : ''].filter(Boolean).join(' | ');
+                                }).join('\n');
+                                found = true;
+                                break;
+                            }
+                            for (const k of Object.keys(cur)) {
+                                if (cur[k] && typeof cur[k] === 'object') stack.push(cur[k]);
+                            }
+                        }
+                        if (found) break;
+                    }
+                }
+            } catch (e) {}
+
             return out;
         }, INCLUDE_PAGE_TEXT);
 
@@ -580,7 +659,21 @@ async function scrapeOneUrl(browser, url) {
             console.log(`   📊 [${tag}] History: ${domRows.length} row(s)`);
             domRows.forEach(r => console.log(`       ${r.date} | ${r.event} | ${r.price}${r.change ? ' (' + r.change + ')' : ''}`));
         } else {
+            // ✅ Diagnostics when history missing
+            const diag = await page.evaluate(() => {
+                const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+                const heads = Array.from(document.querySelectorAll('h1,h2,h3,h4'))
+                    .map(x => norm(x.textContent)).filter(Boolean).slice(0, 40);
+                return {
+                    heads,
+                    dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
+                    tableCount: document.querySelectorAll('table').length,
+                    hasNextData: !!document.querySelector('script#__NEXT_DATA__'),
+                };
+            }).catch(() => ({}));
             console.log(`   ⚠️ [${tag}] History: EMPTY (tableFound=${tableFound})${data.priceHistoryText ? ' — JSON fallback used' : ''}`);
+            console.log(`   🔎 [${tag}] diag: date-info=${diag.dateInfoCount} tables=${diag.tableCount} nextData=${diag.hasNextData}`);
+            console.log(`   🔎 [${tag}] headings: ${JSON.stringify(diag.heads || []).slice(0, 400)}`);
             if (DEBUG_DUMP) await dumpDebug(page, 'nohistory');
         }
 
@@ -623,7 +716,7 @@ async function dumpDebug(page, label) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Zillow Scraper V25 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
+    console.log(`🚀 Zillow Scraper V26 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -653,7 +746,7 @@ async function runScraper() {
     } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
 
     const queue = [];
-    const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
+    const setCell = (r, c, v, limit) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v, limit); };
     const applyEntry = ({ row, status, d }) => {
         setCell(row, 17, status);
         if (!d) return;
@@ -680,7 +773,7 @@ async function runScraper() {
         setCell(row, 30, d.hoa);
         setCell(row, 31, d.priceHistoryText);
         setCell(row, 32, d.factsFeaturesText);
-        setCell(row, 33, d.pageText);
+        setCell(row, 33, d.pageText, MAX_PAGETEXT_LEN); // ✅ last column
     };
     let flushChain = Promise.resolve();
     const doFlush = async () => {
@@ -761,11 +854,10 @@ async function runScraper() {
                             queue.push({ row: rowIndex, status: "⚠️ Empty parse (skipped)" });
                             errorStreak++; totalErrors++;
                         } else {
-                            // ✅ FIX: honest status when history is missing
                             const status = hasHistory ? "✅ Done" : "⚠️ Done (no history)";
                             queue.push({ row: rowIndex, status, d });
                             success++; blockStreak = 0; errorStreak = 0;
-                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 🏷️ ${d.mls || '—'}`);
+                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 📄 Text: ${d.pageText ? d.pageText.length : 0} chars | 🏷️ ${d.mls || '—'}`);
                         }
                     }
                 } catch (e) {

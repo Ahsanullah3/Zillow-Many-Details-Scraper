@@ -66,8 +66,8 @@ const VIEWPORT_H = Number(process.env.VIEWPORT_H || '900');
 
 const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '100');
 const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '500');
-const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '10000');
-const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '500');
+const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '8000');
+const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '400');
 const ZOOM_SETTLE_MS = Number(process.env.ZOOM_SETTLE_MS || '1200');
 const HEADING_SETTLE_MS = Number(process.env.HEADING_SETTLE_MS || '1500');
 const TABLE_VIEW_SETTLE_MS = Number(process.env.TABLE_VIEW_SETTLE_MS || '1000');
@@ -76,6 +76,10 @@ const CLICK_EXPAND_SETTLE_MS = Number(process.env.CLICK_EXPAND_SETTLE_MS || '100
 const SCROLL_WRAPPER_SETTLE_MS = Number(process.env.SCROLL_WRAPPER_SETTLE_MS || '1000');
 const RETRY_SCROLL_SETTLE_MS = Number(process.env.RETRY_SCROLL_SETTLE_MS || '2000');
 const RETRY_WAIT_MS = Number(process.env.RETRY_WAIT_MS || '5000');
+
+const HIDE_WAIT_MS = Number(process.env.HIDE_WAIT_MS || '3000');     // max wait for the "Hide" button to appear
+const HIDE_SETTLE_MS = Number(process.env.HIDE_SETTLE_MS || '800');
+const SHOW_MORE_LOOP = process.env.SHOW_MORE_LOOP !== '0';           // set 0 to disable the extra tfoot "Show more" loop
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -115,16 +119,23 @@ async function launchBrowser() {
         '--enable-webgl',
         '--enable-webgl2',
         '--enable-accelerated-2d-canvas',
+        '--enable-accelerated-video-decode',
+        '--enable-features=NetworkService,NetworkServiceInProcess',
         '--ignore-gpu-blocklist',
         '--enable-gpu-rasterization',
         '--enable-zero-copy',
         '--enable-canvas-2d-layers',
         '--enable-native-gpu-memory-buffers',
+        '--enable-features=CanvasOopRasterization',
         '--autoplay-policy=no-user-gesture-required',
+        '--enable-features=MediaSessionService',
         '--enable-webrtc',
         '--enable-websockets',
         '--enable-dns-prefetch',
         '--enable-quic',
+        '--js-flags=--harmony',
+        '--enable-features=StorageBuckets',
+        '--enable-features=FileSystemAccessAPI',
     ];
     const browser = await puppeteer.launch({
         headless: "new",
@@ -395,7 +406,7 @@ async function ensureHistoryMounted(page, tag) {
 
     let totalClicked = 0;
     let prevCount = await getRowCount();
-    for (let iter = 0; iter < 15; iter++) {
+    for (let iter = 0; iter < (SHOW_MORE_LOOP ? 15 : 0); iter++) {
         if (SHUTDOWN_REQUESTED) break;
         const clicked = await page.evaluate(() => {
             const btns = Array.from(document.querySelectorAll('tfoot[data-testid="table-see-more"] button'));
@@ -653,6 +664,34 @@ function extractMainDataInPage() {
 }
 
 // =========================================================
+// CLICK "Hide" BUTTON FIRST (before anything else on the page)
+// =========================================================
+async function clickHideFirst(page, tag) {
+    try {
+        await page.waitForFunction(() =>
+            Array.from(document.querySelectorAll('span[data-c11n-component="TextButton.Label"]'))
+                .some(sp => (sp.textContent || '').trim().toLowerCase() === 'hide'),
+            { timeout: HIDE_WAIT_MS }
+        );
+    } catch (e) { return 0; }   // button never appeared — carry on
+
+    const n = await page.evaluate(() => {
+        let clicked = 0;
+        const spans = Array.from(document.querySelectorAll('span[data-c11n-component="TextButton.Label"]'))
+            .filter(sp => (sp.textContent || '').trim().toLowerCase() === 'hide');
+        for (const sp of spans) {
+            const el = sp.closest('button, [role="button"], a') || sp;
+            try { el.click(); clicked++; } catch (e) {}
+        }
+        return clicked;
+    }).catch(() => 0);
+
+    if (n > 0) console.log(`   🙈 [${tag}] Clicked "Hide" x${n}`);
+    await delay(HIDE_SETTLE_MS);
+    return n;
+}
+
+// =========================================================
 // SCRAPE ONE URL
 // =========================================================
 async function scrapeOneUrl(browser, url, workerTag) {
@@ -663,20 +702,24 @@ async function scrapeOneUrl(browser, url, workerTag) {
         page = await ctx.newPage();
         await page.setJavaScriptEnabled(true);
         try { await page.setBypassCSP(true); } catch (e) {}
-        await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
+        await page.setViewport({
+            width: VIEWPORT_W,
+            height: VIEWPORT_H,
+            deviceScaleFactor: 1,
+            hasTouch: false,
+            isMobile: false,
+        });
 
-        if (BLOCK_RESOURCES) {
-            try {
-                await page.setRequestInterception(true);
-                page.on('request', (req) => {
-                    const type = req.resourceType();
-                    if (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url()))
-                        req.abort().catch(() => {});
-                    else req.continue().catch(() => {});
-                });
-            } catch (e) {
-                console.warn(`   ⚠️ [${tag}] Interception unavailable (${e.message})`);
-            }
+        try {
+            await page.setRequestInterception(true);
+            page.on('request', (req) => {
+                const type = req.resourceType();
+                if (BLOCK_RESOURCES && (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url())))
+                    req.abort().catch(() => {});
+                else req.continue().catch(() => {});
+            });
+        } catch (e) {
+            console.warn(`   ⚠️ [${tag}] Interception unavailable (${e.message})`);
         }
 
         try {
@@ -706,12 +749,13 @@ async function scrapeOneUrl(browser, url, workerTag) {
         }));
         const blockedTitle = /pardon our interruption|robot check|access denied|access to this page has been denied|press\s*&\s*hold|unusual traffic|captcha/i.test(title);
         // A real listing page always has __NEXT_DATA__ or a price/h1. Block pages have none.
-        const trulyBlocked = blockedTitle || (!probe.hasNext && !probe.hasPrice) || (!probe.hasH1 && probe.bodyLen < 500);
+        const trulyBlocked = blockedTitle || !probe.hasNext;
 
         console.log(`   🔎 [${tag}] probe: next=${probe.hasNext} price=${probe.hasPrice} h1=${probe.hasH1} bodyLen=${probe.bodyLen}`);
         if (trulyBlocked) return { blocked: true, blockedTitle };
 
         // ---- Mount price history, then extract everything ----
+        await clickHideFirst(page, tag);
         await ensureHistoryMounted(page, tag);
 
         const data = await page.evaluate(extractMainDataInPage);

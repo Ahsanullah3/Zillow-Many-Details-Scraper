@@ -91,8 +91,7 @@ async function detectCaptcha(page) {
 
 async function waitForManualCaptchaSolve(page, tag) {
     console.log(`   🖥️  [${tag}] CAPTCHA detected — MANUAL solve via CDP`);
-    console.log(`   🖥️  [${tag}] Open: http://<ngrok-address> in Chrome on your laptop`);
-    console.log(`   🖥️  [${tag}] Find this tab, solve "Press & Hold", script continues automatically`);
+    console.log(`   🖥️  [${tag}] Connect via SSH tunnel, then open http://127.0.0.1:9222 in your browser.`);
     console.log(`   ⏰ [${tag}] Max wait: ${CDP_CAPTCHA_WAIT_MS/1000}s`);
 
     const start = Date.now();
@@ -419,7 +418,6 @@ async function scrapeOneUrl(browser, url) {
         }
         await delay(HYDRATE_SETTLE);
 
-        // Captcha check → manual solve via CDP
         const captchaType = await detectCaptcha(page);
         if (captchaType) {
             const solved = await waitForManualCaptchaSolve(page, tag);
@@ -439,7 +437,6 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        // MANDATORY: Financial & listing details
         try {
             await page.evaluate(() => window.scrollTo(0, Math.min(document.body.scrollHeight, 2500)));
             await delay(800);
@@ -486,10 +483,8 @@ async function scrapeOneUrl(browser, url) {
             return { skip: true, reason: 'no-financial-details' };
         }
 
-        // Price history
         const { rows: domRows, found: tableFound } = await getPriceHistory(page, tag);
 
-        // Main page data
         const data = await page.evaluate((INCLUDE_PAGE_TEXT) => {
             const out = {
                 price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",

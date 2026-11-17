@@ -38,12 +38,8 @@ const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '500');
 const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '8000');
 const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '400');
 const ZOOM_SETTLE_MS = Number(process.env.ZOOM_SETTLE_MS || '1200');
-const HEADING_SETTLE_MS = Number(process.env.HEADING_SETTLE_MS || '1500');
-const TABLE_VIEW_SETTLE_MS = Number(process.env.TABLE_VIEW_SETTLE_MS || '1000');
 const TABLE_WAIT_MS = Number(process.env.TABLE_WAIT_MS || '15000');
 const CLICK_EXPAND_SETTLE_MS = Number(process.env.CLICK_EXPAND_SETTLE_MS || '1000');
-const SCROLL_WRAPPER_SETTLE_MS = Number(process.env.SCROLL_WRAPPER_SETTLE_MS || '1000');
-const RETRY_SCROLL_SETTLE_MS = Number(process.env.RETRY_SCROLL_SETTLE_MS || '2000');
 const RETRY_WAIT_MS = Number(process.env.RETRY_WAIT_MS || '5000');
 
 const HEADER_START_COL = 9;
@@ -270,32 +266,39 @@ function fallbackHistoryParse() {
 }
 
 // =========================================================
-// HARDENED MOUNT (with Show More click)
+// HARDENED MOUNT (with See More click)
 // =========================================================
 async function ensureHistoryMounted(page, tag) {
-    // Step 0: Click ALL "See more" / collapsed buttons
-    try {
-        const clickedCount = await page.evaluate(() => {
-            // Zillow's visible "Show more" label may be a span inside the actual button.
-            // Include that label selector, then normalize each match to its parent button.
-            const candidates = Array.from(document.querySelectorAll(
-                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"], span[data-c11n-component="TextButton.Label"]'
-            ));
-            const buttons = [...new Set(candidates.map(el => el.closest('button') || el))];
-            let clicked = 0;
-            for (const btn of buttons) {
-                const txt = (btn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                if (txt.includes('see more') || txt.includes('show more') || txt.includes('view more') || txt === 'more') {
-                    try { btn.click(); clicked++; } catch (e) {}
+    // Click only Zillow's explicit Show more / See more control.
+    const clickShowMore = async () => {
+        try {
+            return await page.evaluate(() => {
+                const labels = Array.from(document.querySelectorAll(
+                    'span[data-c11n-component="TextButton.Label"]'
+                ));
+                const buttons = [...new Set(labels.map(el => el.closest('button') || el))];
+                let clicked = 0;
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    if (text.includes('show more') || text.includes('see more')) {
+                        try { btn.click(); clicked++; } catch (e) {}
+                    }
                 }
-            }
-            return clicked;
-        });
-        if (clickedCount > 0) console.log(`   🔽 [${tag}] Clicked ${clickedCount} "See more" button(s)`);
-    } catch (e) {}
+                return clicked;
+            });
+        } catch (e) {
+            return 0;
+        }
+    };
+
+    const clickedCount = await clickShowMore();
+    if (clickedCount) {
+        console.log(`   🔽 [${tag}] Clicked ${clickedCount} Show more button(s)`);
+    }
     await delay(CLICK_EXPAND_SETTLE_MS);
 
-    // Step 1: Zoom + scroll bottom
+    // Keep the existing zoom and bottom-page scroll; no heading/table-view clicks
+    // and no heading or table-wrapper scrolling.
     try {
         await page.evaluate((z) => {
             document.documentElement.style.zoom = String(z);
@@ -305,117 +308,56 @@ async function ensureHistoryMounted(page, tag) {
     } catch (e) {}
     await delay(ZOOM_SETTLE_MS);
 
-    // Step 2: Scroll heading
-    await page.evaluate(() => {
-        const h = Array.from(document.querySelectorAll('h2,h3'))
-            .find(x => /price\s*history/i.test(x.textContent || ''));
-        if (h) h.scrollIntoView({ block: 'center', behavior: 'instant' });
-    }).catch(() => {});
-    await delay(HEADING_SETTLE_MS);
-
-    // Step 3: Click "Table view"
-    await page.evaluate(() => {
-        const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
-            .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
-        if (tv) tv.click();
-    }).catch(() => {});
-    await delay(TABLE_VIEW_SETTLE_MS);
-
-    // Step 4: Check table exists
-    let tableFound = await page.evaluate(() => {
-        const tables = document.querySelectorAll('table');
-        return Array.from(tables).some(t => {
-            const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
-            return hs.includes('date') && hs.includes('event') && hs.includes('price');
+    const tableExists = () => page.evaluate(() => {
+        return Array.from(document.querySelectorAll('table')).some(table => {
+            const headers = Array.from(table.querySelectorAll('th'))
+                .map(cell => (cell.textContent || '').trim().toLowerCase());
+            return headers.includes('date') && headers.includes('event') && headers.includes('price');
         });
     }).catch(() => false);
 
-    // Step 5: Click heading + scroll wrapper
+    let tableFound = await tableExists();
     if (!tableFound) {
-        console.log(`   🔧 [${tag}] Clicking heading + scrolling table wrapper...`);
-        await page.evaluate(() => {
-            const h = Array.from(document.querySelectorAll('h2,h3'))
-                .find(x => /price\s*history/i.test(x.textContent || ''));
-            if (h) {
-                h.click();
-                const parent = h.closest('[role="button"], button, details, summary, [data-testid*="card"]');
-                if (parent) try { parent.click(); } catch (e) {}
-            }
-        }).catch(() => {});
-        await delay(CLICK_EXPAND_SETTLE_MS);
-        await page.evaluate(() => {
-            const tbl = document.querySelector('table');
-            if (tbl) { tbl.scrollIntoView({ block: 'center', behavior: 'instant' }); return; }
-            const wrap = document.querySelector('[data-c11n-component="Table.Responsive"]');
-            if (wrap) wrap.scrollIntoView({ block: 'center', behavior: 'instant' });
-        }).catch(() => {});
-        await delay(SCROLL_WRAPPER_SETTLE_MS);
-    }
-
-    // Step 6: Wait for table
-    try {
-        await page.waitForFunction(
-            () => {
-                const tables = document.querySelectorAll('table');
-                return Array.from(tables).some(t => {
-                    const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
-                    return hs.includes('date') && hs.includes('event') && hs.includes('price');
-                });
-            },
-            { timeout: TABLE_WAIT_MS }
-        );
-        tableFound = true;
-        console.log(`   📊 [${tag}] Table mounted ✅`);
-    } catch (e) {
-        console.log(`   📊 [${tag}] Table NOT mounted after ${TABLE_WAIT_MS}ms ❌`);
-    }
-
-    // Step 7: Second chance
-    if (!tableFound) {
-        await page.evaluate(() => {
-            const candidates = Array.from(document.querySelectorAll(
-                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"], span[data-c11n-component="TextButton.Label"]'
-            ));
-            const buttons = [...new Set(candidates.map(el => el.closest('button') || el))];
-            for (const btn of buttons) {
-                const txt = (btn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                if (txt.includes('see more') || txt.includes('show more')) {
-                    try { btn.click(); } catch (e) {}
-                }
-            }
-            const h = Array.from(document.querySelectorAll('h2,h3'))
-                .find(x => /price\s*history/i.test(x.textContent || ''));
-            if (h) h.scrollIntoView({ block: 'center' });
-        }).catch(() => {});
-        await delay(RETRY_SCROLL_SETTLE_MS);
         try {
-            await page.waitForFunction(
-                () => {
-                    const tables = document.querySelectorAll('table');
-                    return Array.from(tables).some(t => {
-                        const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
-                        return hs.includes('date') && hs.includes('event') && hs.includes('price');
-                    });
-                },
-                { timeout: RETRY_WAIT_MS }
-            );
+            await page.waitForFunction(() => {
+                return Array.from(document.querySelectorAll('table')).some(table => {
+                    const headers = Array.from(table.querySelectorAll('th'))
+                        .map(cell => (cell.textContent || '').trim().toLowerCase());
+                    return headers.includes('date') && headers.includes('event') && headers.includes('price');
+                });
+            }, { timeout: TABLE_WAIT_MS });
             tableFound = true;
-            console.log(`   📊 [${tag}] Table mounted (retry) ✅`);
-        } catch (e) {
-            console.log(`   📊 [${tag}] Table NOT mounted (retry) ❌`);
-        }
+        } catch (e) {}
     }
 
-    // Step 8: Debug
+    // One retry of the explicit Show more control only.
     if (!tableFound) {
+        const retryClicked = await clickShowMore();
+        if (retryClicked) {
+            console.log(`   🔁 [${tag}] Retried Show more (${retryClicked} button(s))`);
+        }
+        await delay(CLICK_EXPAND_SETTLE_MS);
+        try {
+            await page.waitForFunction(() => {
+                return Array.from(document.querySelectorAll('table')).some(table => {
+                    const headers = Array.from(table.querySelectorAll('th'))
+                        .map(cell => (cell.textContent || '').trim().toLowerCase());
+                    return headers.includes('date') && headers.includes('event') && headers.includes('price');
+                });
+            }, { timeout: RETRY_WAIT_MS });
+            tableFound = true;
+        } catch (e) {}
+    }
+
+    if (tableFound) {
+        console.log(`   📊 [${tag}] Table mounted ✅`);
+    } else {
+        console.log(`   📊 [${tag}] Table NOT mounted ❌`);
         try {
             const debug = await page.evaluate(() => ({
-                hasHeading: Array.from(document.querySelectorAll('h2,h3'))
-                    .some(h => /price history/i.test(h.textContent || '')),
                 dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
                 tableCount: document.querySelectorAll('table').length,
-                showMoreButtons: document.querySelectorAll('button[data-c11n-component="ShowHide.Button"]').length,
-                collapsedButtons: document.querySelectorAll('button[aria-expanded="false"]').length,
+                showMoreLabels: document.querySelectorAll('span[data-c11n-component="TextButton.Label"]').length,
                 bodyHeight: document.body.scrollHeight,
                 viewportHeight: window.innerHeight,
                 zoom: document.documentElement.style.zoom,
@@ -686,16 +628,6 @@ async function scrapeOneUrl(browser, url) {
 
         let domRows = [];
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
-
-        if (!domRows.length) {
-            await page.evaluate(() => {
-                const h = Array.from(document.querySelectorAll('h2,h3'))
-                    .find(x => /price\s*history/i.test(x.textContent || ''));
-                if (h) h.scrollIntoView({ block: 'center' });
-            }).catch(() => {});
-            await delay(1500);
-            try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
-        }
 
         if (!domRows.length) {
             try { domRows = await page.evaluate(fallbackHistoryParse); } catch (e) {}

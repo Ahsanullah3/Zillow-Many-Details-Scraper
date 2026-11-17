@@ -17,6 +17,11 @@ permissions:
   actions: write
   contents: read
 
+# Prevent overlapping runs (new run cancels old one automatically)
+concurrency:
+  group: zillow-scraper
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -33,7 +38,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          # ⚠️ REMOVED cache: 'npm' — it fails without a lockfile
 
       - name: Install Dependencies
         run: |
@@ -45,19 +49,25 @@ jobs:
 
       - name: Run Scraper Engine
         id: scraper_task
+        # 👇 still runs even if the user cancels, so the scraper receives SIGTERM
+        # and can flush pending rows before exiting
+        continue-on-error: false
         run: npm start
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          CONCURRENCY: '5'
+          CONCURRENCY: '3'
           MAX_URLS_PER_RUN: '150'
-          PAGE_ZOOM: '0.05'
-          BLOCK_RESOURCES: '0'
+          PAGE_ZOOM: '1'
+          BLOCK_RESOURCES: '1'
           RETRY_BLOCKED: '1'
           MAX_BLOCK_STREAK: '6'
 
+      # ---- SELF-REBOOT: only if NOT cancelled AND has_more=true ----
       - name: Evaluate Self-Reboot Sequence
-        if: steps.scraper_task.outputs.has_more == 'true'
+        if: |
+          !cancelled() &&
+          steps.scraper_task.outputs.has_more == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -66,3 +76,11 @@ jobs:
           echo "Batch $CURRENT_BATCH hit threshold. Triggering Batch $NEXT_BATCH..."
           gh workflow run scraper.yml --ref main -f batch="$NEXT_BATCH"
           sleep 5
+
+      # ---- CLEAN EXIT: runs even on cancel, logs the stop ----
+      - name: Cleanup on Cancel
+        if: cancelled()
+        run: |
+          echo "🛑 Workflow was cancelled — self-reboot skipped."
+          echo "   has_more=${{ steps.scraper_task.outputs.has_more }}"
+          echo "   blocked=${{ steps.scraper_task.outputs.blocked }}"

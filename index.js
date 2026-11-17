@@ -27,7 +27,7 @@ const CHROME_PATH = process.env.CHROME_PATH || '';
 const CHROME_CHANNEL = process.env.CHROME_CHANNEL || '';
 
 // ✅ Resource blocking OFF by default — images/fonts/CSS must load so React hydrates fully
-const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES === '1';
+const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES === '0';
 // ✅ Page text ALWAYS captured (last column)
 const INCLUDE_PAGE_TEXT = true;
 const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';

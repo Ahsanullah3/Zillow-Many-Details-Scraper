@@ -87,13 +87,6 @@ jobs:
             exit 0
           fi
 
-          # If this run ended because of blocks, wait a bit before the next
-          # batch starts on a fresh runner.
-          if [ "${{ steps.scraper_task.outputs.blocked }}" == "true" ]; then
-            echo "Run ended blocked — cooling down 120s before next batch."
-            sleep 120
-          fi
-
           echo "Batch $CURRENT_BATCH hit threshold. Triggering Batch $NEXT_BATCH..."
           gh workflow run scraper.yml --ref main -f batch="$NEXT_BATCH"
           sleep 5

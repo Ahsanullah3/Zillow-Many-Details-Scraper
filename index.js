@@ -11,8 +11,8 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const CONCURRENCY = Number(process.env.CONCURRENCY || '1');
-const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '3000');
+const CONCURRENCY = Number(process.env.CONCURRENCY || '4');
+const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
 const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
 const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '6');
@@ -26,7 +26,9 @@ const HEADFUL = process.env.HEADFUL === '1';
 const CHROME_PATH = process.env.CHROME_PATH || '';
 const CHROME_CHANNEL = process.env.CHROME_CHANNEL || '';
 
-const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES === '1';
+// ✅ Resource blocking OFF by default — images/fonts/CSS must load so React hydrates fully
+const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES === '0';
+// ✅ Page text ALWAYS captured (last column)
 const INCLUDE_PAGE_TEXT = true;
 const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';
 
@@ -42,11 +44,6 @@ const SHOW_MORE_SETTLE_MS = Number(process.env.SHOW_MORE_SETTLE_MS || '900');
 const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY || '350');
 const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || '400');
 
-const FINANCIAL_WAIT_MS = Number(process.env.FINANCIAL_WAIT_MS || '12000');
-const FINANCIAL_RELOAD_WAIT_MS = Number(process.env.FINANCIAL_RELOAD_WAIT_MS || '15000');
-const MAX_SKIP_STREAK = Number(process.env.MAX_SKIP_STREAK || '15');
-const CDP_CAPTCHA_WAIT_MS = Number(process.env.CDP_CAPTCHA_WAIT_MS || '300000');
-
 const HEADER_START_COL = 9;
 const HEADERS = [
     "Price", "Street", "City", "State", "Zipcode", "Final URL", "Agent Details", "Sold Price",
@@ -56,9 +53,9 @@ const HEADERS = [
 ];
 const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
-console.log(`🧩 Block: ${BLOCK_RESOURCES ? 'ON' : 'OFF'} | headful: ${HEADFUL} | pageText: ON | CDP: 9222`);
+console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF (all resources load)'} | headful: ${HEADFUL} | pageText: ${INCLUDE_PAGE_TEXT ? 'ON' : 'OFF'}`);
 
-const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history|Skipped|⏭️/i.test(String(st || ''));
+const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
@@ -75,46 +72,7 @@ const safeCell = (v, limit = MAX_CELL_LEN) => {
 const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
 
 // =========================================================
-// CAPTCHA DETECTION + MANUAL SOLVE VIA CDP
-// =========================================================
-async function detectCaptcha(page) {
-    return page.evaluate(() => {
-        if (document.querySelector('.px-captcha-container')) return 'press-hold';
-        const iframe = document.querySelector('iframe[title*="Human verification" i], iframe[title*="captcha" i]');
-        if (iframe) return 'iframe';
-        const bodyText = document.body ? document.body.textContent : '';
-        if (/Press\s*&\s*Hold|confirm you are a human|not a bot/i.test(bodyText)) return 'text';
-        if (document.querySelector('.px-captcha-refid')) return 'refid';
-        return null;
-    }).catch(() => null);
-}
-
-async function waitForManualCaptchaSolve(page, tag) {
-    console.log(`   🖥️  [${tag}] CAPTCHA detected — MANUAL solve via CDP`);
-    console.log(`   🖥️  [${tag}] Connect via SSH tunnel, then open http://127.0.0.1:9222 in your browser.`);
-    console.log(`   ⏰ [${tag}] Max wait: ${CDP_CAPTCHA_WAIT_MS/1000}s`);
-
-    const start = Date.now();
-    while (Date.now() - start < CDP_CAPTCHA_WAIT_MS) {
-        const stillBlocked = await page.evaluate(() => {
-            return !!document.querySelector('.px-captcha-container, #px-captcha');
-        }).catch(() => true);
-
-        if (!stillBlocked) {
-            console.log(`   ✅ [${tag}] CAPTCHA solved manually — continuing`);
-            await delay(2000);
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-            await delay(2000);
-            return true;
-        }
-        await delay(3000);
-    }
-    console.log(`   ⏰ [${tag}] Manual solve timed out after ${CDP_CAPTCHA_WAIT_MS/1000}s`);
-    return false;
-}
-
-// =========================================================
-// BROWSER (with CDP debug port)
+// BROWSER
 // =========================================================
 async function launchBrowser() {
     const userDataDir = path.join(os.tmpdir(), `zillow-profile-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -126,8 +84,6 @@ async function launchBrowser() {
         `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
         '--autoplay-policy=no-user-gesture-required',
         '--lang=en-US,en',
-        '--remote-debugging-port=9222',
-        '--remote-debugging-address=0.0.0.0',
     ];
     const opts = {
         headless: HEADFUL ? false : true,
@@ -193,32 +149,7 @@ function findNextRow(sheet, afterRow, mode) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// MANDATORY SECTION — "Financial & listing details"
-// =========================================================
-async function hasFinancialDetails(page) {
-    return page.evaluate(() => {
-        const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-        const h3s = Array.from(document.querySelectorAll('[data-testid="category-group"] h3, h3'));
-        return h3s.some(h => {
-            const t = norm(h.textContent);
-            return t.includes('financial') && t.includes('listing details');
-        });
-    }).catch(() => false);
-}
-
-async function waitForFinancialDetails(page, timeoutMs) {
-    return page.waitForFunction(() => {
-        const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-        const h3s = Array.from(document.querySelectorAll('[data-testid="category-group"] h3, h3'));
-        return h3s.some(h => {
-            const t = norm(h.textContent);
-            return t.includes('financial') && t.includes('listing details');
-        });
-    }, { timeout: timeoutMs, polling: 400 }).then(() => true).catch(() => false);
-}
-
-// =========================================================
-// SLOW SCROLL
+// ✅ SLOW SCROLL — loads lazy modules incl. price history
 // =========================================================
 async function slowScrollToBottom(page, tag) {
     try {
@@ -258,11 +189,13 @@ async function slowScrollToBottom(page, tag) {
 }
 
 // =========================================================
-// PRICE HISTORY
+// ✅ PRICE HISTORY — heading + date-info fallback, safe expand, parse
 // =========================================================
 async function getPriceHistory(page, tag) {
+    // 1. Slow scroll so lazy modules mount
     await slowScrollToBottom(page, tag);
 
+    // 2. Try heading-based wait (preferred)
     let found = await page.waitForFunction(() => {
         const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
         const h = Array.from(document.querySelectorAll('h2,h3,h4'))
@@ -277,18 +210,20 @@ async function getPriceHistory(page, tag) {
         return false;
     }, { timeout: HISTORY_WAIT_MS, polling: 500 }).then(() => true).catch(() => false);
 
+    // 3. Fallback: look for date-info cells anywhere on the page
     if (!found) {
         found = await page.waitForFunction(() => {
             return document.querySelectorAll('[data-testid="date-info"]').length > 0;
         }, { timeout: HISTORY_FALLBACK_MS, polling: 500 }).then(() => true).catch(() => false);
-        if (found) console.log(`   📊 [${tag}] Heading missing but date-info cells found`);
+        if (found) console.log(`   📊 [${tag}] Heading missing but date-info cells found — using fallback locator`);
     }
 
     if (!found) {
-        console.log(`   📊 [${tag}] Price history DOM NOT found`);
+        console.log(`   📊 [${tag}] Price history DOM NOT found — will rely on JSON fallback`);
         return { rows: [], found: false };
     }
 
+    // 4. Safe "Show more" expansion
     let prevCount = -1, clicks = 0;
     for (let i = 0; i < 25; i++) {
         const state = await page.evaluate(() => {
@@ -326,12 +261,14 @@ async function getPriceHistory(page, tag) {
     }
     if (clicks) console.log(`   🔽 [${tag}] Expanded price history (${clicks} click(s))`);
 
+    // Nudge scroll into view
     await page.evaluate(() => {
         const cell = document.querySelector('[data-testid="date-info"]');
         if (cell) cell.scrollIntoView({ block: 'start' });
     }).catch(() => {});
     await delay(600);
 
+    // 5. Parse rows — via heading OR via any table containing date-info
     const rows = await page.evaluate(() => {
         const clean = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
         const norm = (s) => clean(s).toLowerCase();
@@ -413,21 +350,11 @@ async function scrapeOneUrl(browser, url) {
         await delay(jitter(NAV_DELAY_MIN, NAV_DELAY_MAX));
         await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForSelector('[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"], h1', { timeout: HYDRATE_TIMEOUT }).catch(() => {});
+        // Give heavier (unblocked) page time to settle
         if (typeof page.waitForNetworkIdle === 'function') {
             await page.waitForNetworkIdle({ idleTime: 1200, timeout: 15000 }).catch(() => {});
         }
         await delay(HYDRATE_SETTLE);
-
-        const captchaType = await detectCaptcha(page);
-        if (captchaType) {
-            const solved = await waitForManualCaptchaSolve(page, tag);
-            if (!solved) {
-                if (DEBUG_DUMP) await dumpDebug(page, 'captcha-timeout');
-                return { blocked: true, blockedTitle: 'captcha-timeout' };
-            }
-            await page.waitForSelector('[data-testid="price"], h1', { timeout: 15000 }).catch(() => {});
-            await delay(1000);
-        }
 
         const title = await page.title();
         const hasContent = await page.evaluate(() => !!document.querySelector('h1, [data-testid="price"]'));
@@ -437,54 +364,10 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        try {
-            await page.evaluate(() => window.scrollTo(0, Math.min(document.body.scrollHeight, 2500)));
-            await delay(800);
-        } catch (e) {}
-
-        let hasFinancial = await waitForFinancialDetails(page, FINANCIAL_WAIT_MS);
-
-        if (!hasFinancial) {
-            console.log(`   🔁 [${tag}] "Financial & listing details" MISSING — reloading once...`);
-            try {
-                await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-                await page.waitForSelector('[data-testid="price"], h1', { timeout: HYDRATE_TIMEOUT }).catch(() => {});
-                if (typeof page.waitForNetworkIdle === 'function') {
-                    await page.waitForNetworkIdle({ idleTime: 1200, timeout: 15000 }).catch(() => {});
-                }
-                await delay(HYDRATE_SETTLE);
-
-                const captchaAfterReload = await page.evaluate(() => !!document.querySelector('.px-captcha-container'));
-                if (captchaAfterReload) {
-                    console.log(`   🧩 [${tag}] Captcha after reload — waiting for manual solve`);
-                    const solved2 = await waitForManualCaptchaSolve(page, tag);
-                    if (!solved2) {
-                        if (DEBUG_DUMP) await dumpDebug(page, 'reload-captcha');
-                        return { blocked: true, blockedTitle: 'captcha-after-reload' };
-                    }
-                }
-
-                try {
-                    await page.evaluate(() => window.scrollTo(0, Math.min(document.body.scrollHeight, 2500)));
-                    await delay(1000);
-                } catch (e) {}
-
-                hasFinancial = await waitForFinancialDetails(page, FINANCIAL_RELOAD_WAIT_MS);
-                console.log(`   🔁 [${tag}] After reload: Financial details ${hasFinancial ? 'FOUND ✅' : 'STILL MISSING ❌'}`);
-            } catch (e) {
-                console.log(`   ⚠️ [${tag}] Reload failed: ${e.message}`);
-                hasFinancial = false;
-            }
-        }
-
-        if (!hasFinancial) {
-            console.log(`   ⏭️ [${tag}] "Financial & listing details" still missing — SKIPPING row`);
-            if (DEBUG_DUMP) await dumpDebug(page, 'no-financial-details');
-            return { skip: true, reason: 'no-financial-details' };
-        }
-
+        // ---- Price history
         const { rows: domRows, found: tableFound } = await getPriceHistory(page, tag);
 
+        // ---- Main page data (always captures pageText)
         const data = await page.evaluate((INCLUDE_PAGE_TEXT) => {
             const out = {
                 price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -597,6 +480,7 @@ async function scrapeOneUrl(browser, url) {
                 if (id) out.mls = `${id[1]} - ${src ? clean(src[1]) : ''}`.replace(/ - $/, '');
             }
 
+            // ✅ Page text — always captured, structured
             if (INCLUDE_PAGE_TEXT) {
                 const SKIP = new Set([
                     'SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON',
@@ -679,6 +563,7 @@ async function scrapeOneUrl(browser, url) {
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
+            // JSON fallback #1: Next.js gdpClientCache
             try {
                 const nd = $('script#__NEXT_DATA__');
                 const nextData = nd ? JSON.parse(nd.textContent || 'null') : null;
@@ -713,6 +598,7 @@ async function scrapeOneUrl(browser, url) {
                 }
             } catch (e) {}
 
+            // ✅ JSON fallback #2: scan any JSON script for priceHistory array
             try {
                 if (!out.priceHistoryText) {
                     const scripts = document.querySelectorAll('script[type="application/json"], script[type="application/ld+json"]');
@@ -753,6 +639,7 @@ async function scrapeOneUrl(browser, url) {
 
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
+        // ---- Merge DOM price history (preferred over JSON fallback)
         if (domRows.length) {
             data.priceHistoryText = domRows.map(r => {
                 const priceTxt = (r.price || '') + (r.change ? ` (${r.change})` : '');
@@ -772,6 +659,7 @@ async function scrapeOneUrl(browser, url) {
             console.log(`   📊 [${tag}] History: ${domRows.length} row(s)`);
             domRows.forEach(r => console.log(`       ${r.date} | ${r.event} | ${r.price}${r.change ? ' (' + r.change + ')' : ''}`));
         } else {
+            // ✅ Diagnostics when history missing
             const diag = await page.evaluate(() => {
                 const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
                 const heads = Array.from(document.querySelectorAll('h1,h2,h3,h4'))
@@ -785,9 +673,11 @@ async function scrapeOneUrl(browser, url) {
             }).catch(() => ({}));
             console.log(`   ⚠️ [${tag}] History: EMPTY (tableFound=${tableFound})${data.priceHistoryText ? ' — JSON fallback used' : ''}`);
             console.log(`   🔎 [${tag}] diag: date-info=${diag.dateInfoCount} tables=${diag.tableCount} nextData=${diag.hasNextData}`);
+            console.log(`   🔎 [${tag}] headings: ${JSON.stringify(diag.heads || []).slice(0, 400)}`);
             if (DEBUG_DUMP) await dumpDebug(page, 'nohistory');
         }
 
+        // ---- Description fallback from JSON-LD
         if (!data.description || data.description === 'N/A') {
             try {
                 const ldDesc = await page.evaluate(() => {
@@ -826,7 +716,7 @@ async function dumpDebug(page, label) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Zillow Scraper CDP | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN} | CDP port 9222`);
+    console.log(`🚀 Zillow Scraper V26 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -883,7 +773,7 @@ async function runScraper() {
         setCell(row, 30, d.hoa);
         setCell(row, 31, d.priceHistoryText);
         setCell(row, 32, d.factsFeaturesText);
-        setCell(row, 33, d.pageText, MAX_PAGETEXT_LEN);
+        setCell(row, 33, d.pageText, MAX_PAGETEXT_LEN); // ✅ last column
     };
     let flushChain = Promise.resolve();
     const doFlush = async () => {
@@ -902,8 +792,6 @@ async function runScraper() {
     let claimed = 0, success = 0, blockStreak = 0, errorStreak = 0;
     let totalBlocks = 0, totalErrors = 0;
     let totalWithHistory = 0, totalWithTableFound = 0;
-    let totalSkipped = 0;
-    let skipStreak = 0;
     let cursor = -1;
     let phase = 'fresh';
     let stop = false, blockedExit = false;
@@ -914,7 +802,7 @@ async function runScraper() {
         if (r === -1 && phase === 'fresh' && RETRY_BLOCKED) {
             phase = 'skipped';
             cursor = -1;
-            console.log('🔁 Fresh rows done — retrying skipped rows');
+            console.log('🔁 Fresh rows done — retrying previously skipped rows');
             r = findNextRow(sheet, cursor, phase);
         }
         if (r !== -1) cursor = r;
@@ -950,23 +838,11 @@ async function runScraper() {
                     const result = await inflight.get(key);
 
                     if (result.blocked) {
-                        console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}${result.blockedTitle ? ` (${result.blockedTitle})` : ''}`);
-                        queue.push({ row: rowIndex, status: result.blockedTitle === 'captcha-timeout' ? "🧩 CAPTCHA timeout (skipped)" : "❌ BLOCKED (skipped)" });
+                        console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}`);
+                        queue.push({ row: rowIndex, status: result.blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)" });
                         blockStreak++; errorStreak = 0; totalBlocks++;
                         recycle = true;
                         if (blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS) { stop = true; blockedExit = true; }
-                    } else if (result.skip) {
-                        console.log(`   ⏭️ [W${id}] SKIP Row ${actualRow} — ${result.reason}`);
-                        queue.push({ row: rowIndex, status: "⏭️ Skipped (missing Financial & listing details)" });
-                        totalSkipped++;
-                        skipStreak++;
-                        blockStreak = 0;
-                        errorStreak = 0;
-                        recycle = true;
-                        if (skipStreak >= MAX_SKIP_STREAK) {
-                            console.log(`🛑 ${MAX_SKIP_STREAK} consecutive skips — stopping.`);
-                            stop = true;
-                        }
                     } else {
                         const d = result.data;
                         if (result.tableFound) totalWithTableFound++;
@@ -980,7 +856,7 @@ async function runScraper() {
                         } else {
                             const status = hasHistory ? "✅ Done" : "⚠️ Done (no history)";
                             queue.push({ row: rowIndex, status, d });
-                            success++; blockStreak = 0; errorStreak = 0; skipStreak = 0;
+                            success++; blockStreak = 0; errorStreak = 0;
                             console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 📄 Text: ${d.pageText ? d.pageText.length : 0} chars | 🏷️ ${d.mls || '—'}`);
                         }
                     }
@@ -1005,7 +881,7 @@ async function runScraper() {
     await flush();
 
     console.log(`\n📊 ─── RUN TOTALS ───`);
-    console.log(`✅ Success: ${success} | 🚫 Blocked: ${totalBlocks} | 🛑 Errors: ${totalErrors} | ⏭️ Skipped: ${totalSkipped}`);
+    console.log(`✅ Success: ${success} | 🚫 Blocked: ${totalBlocks} | 🛑 Errors: ${totalErrors}`);
     console.log(`📊 Rows with history: ${totalWithHistory} | 📊 History-section rows: ${totalWithTableFound}`);
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 

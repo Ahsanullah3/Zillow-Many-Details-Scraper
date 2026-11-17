@@ -1,6 +1,6 @@
-name: 🚀 Chrome Stealth Scraper (CDP)
+name: 🚀 Chrome Stealth Scraper (SSH Debug)
 
-run-name: 🚀 Chrome Stealth Scraper CDP (Batch ${{ inputs.batch || '1' }})
+run-name: 🚀 Zillow Scraper (SSH Debug) - Batch ${{ inputs.batch || '1' }}
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: zillow-scraper
+  group: zillow-scraper-ssh
   cancel-in-progress: false
 
 env:
@@ -44,17 +44,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      - name: Install ngrok and jq
-        run: |
-          # Install jq (for parsing ngrok API JSON)
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq
-
-          # Install ngrok
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update -qq && sudo apt-get install -y -qq ngrok
 
       - name: Cache Puppeteer Chrome
         uses: actions/cache@v4
@@ -79,40 +68,17 @@ jobs:
           sleep 2
           echo "DISPLAY=:99" >> $GITHUB_ENV
 
-      - name: Start ngrok tunnel for CDP port 9222
-        id: ngrok
-        run: |
-          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-          ngrok tcp 9222 --log=stdout > /tmp/ngrok.log 2>&1 &
-
-          # Wait up to 30 seconds for the tunnel to appear in the local ngrok API
-          NGROK_ADDR=""
-          for i in {1..30}; do
-            sleep 1
-            NGROK_ADDR=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url' 2>/dev/null | sed 's|tcp://||')
-            if [ -n "$NGROK_ADDR" ] && [ "$NGROK_ADDR" != "null" ]; then
-              break
-            fi
-          done
-
-          if [ -z "$NGROK_ADDR" ] || [ "$NGROK_ADDR" = "null" ]; then
-            echo "❌ Failed to get ngrok URL after 30 seconds. Dumping log:"
-            cat /tmp/ngrok.log
-            exit 1
-          fi
-
-          echo "CDP_ADDRESS=$NGROK_ADDR" >> $GITHUB_OUTPUT
-          echo ""
-          echo "=========================================="
-          echo "🔗 CDP Address: $NGROK_ADDR"
-          echo ""
-          echo "📋 To solve CAPTCHAs:"
-          echo "  1. Open Chrome on your laptop"
-          echo "  2. Go to: http://$NGROK_ADDR"
-          echo "  3. Find the Zillow tab"
-          echo "  4. Press & Hold to solve"
-          echo "=========================================="
-          echo ""
+      # -----------------------------------------------------------
+      # This is the key step: it opens an SSH session.
+      # You will receive an SSH command in the logs.
+      # -----------------------------------------------------------
+      - name: Setup SSH Debug Session (action-tmate)
+        uses: mxschmitt/action-tmate@v3
+        with:
+          # Keep the session alive for the duration of the job
+          limit-access-to-actor: true
+        # The session starts immediately. You will see the SSH command
+        # in the workflow logs. Keep the session open while the next step runs.
 
       - name: Run Scraper (with CDP access)
         id: scraper_task
@@ -162,5 +128,4 @@ jobs:
 
       - name: Cleanup on Cancel
         if: cancelled()
-        run: |
-          echo "🛑 Workflow was cancelled — self-reboot skipped."
+        run: echo "🛑 Workflow was cancelled — reboot skipped."

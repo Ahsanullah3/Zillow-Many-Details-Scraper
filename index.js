@@ -15,7 +15,7 @@ puppeteer.use(StealthPlugin());
 const CONCURRENCY = Number(process.env.CONCURRENCY || '5');
 const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
 const FLUSH_EVERY = 5;
-const REQUIRED_COLS = 34;
+const REQUIRED_COLS = 35;
 const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '6');
 const MAX_CONSECUTIVE_ERRORS = 6;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
@@ -47,7 +47,7 @@ const HEADERS = [
     "Price", "Street", "City", "State", "Zipcode", "Final URL", "Agent Details", "Sold Price",
     "Status", "Description", "Full Address", "Price Per Sqft", "Beds", "Baths", "Sqft", "Lot Size",
     "Listed For Sale", "Sold On", "MLS", "Property Type", "Year Built", "HOA",
-    "Price History", "Facts & Features", "Page Text (Formatted)"
+    "Price History", "Facts & Features", "Page Text (Formatted)", "Fact Category Details"
 ];
 const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
@@ -431,7 +431,7 @@ async function scrapeOneUrl(browser, url) {
                 agentDetails: "", soldPrice: "", canonicalUrl: "", description: "",
                 pricePerSqft: "", beds: "", baths: "", sqft: "", lotSize: "",
                 listedForSale: "", soldOn: "", mls: "", propertyType: "", yearBuilt: "",
-                hoa: "", priceHistoryText: "", pageText: ""
+                hoa: "", priceHistoryText: "", pageText: "", factCategoryDetails: ""
             };
             const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
             const num = (s) => {
@@ -487,11 +487,21 @@ async function scrapeOneUrl(browser, url) {
             }
 
             const fm = {};
-            $$('[data-testid="fact-category"] li').forEach(li => {
-                const t = clean(li.textContent);
+            const factCategoryItems = $$('[data-testid="fact-category"] li')
+                .map(li => clean(li.textContent))
+                .filter(Boolean);
+
+            // Preserve every Zillow fact-category item as its own line in a separate sheet column.
+            out.factCategoryDetails = [...new Set(factCategoryItems)].join('\n');
+
+            factCategoryItems.forEach(t => {
                 const i = t.indexOf(': ');
-                if (i > 0) { const k = t.slice(0, i); if (!(k in fm)) fm[k] = t.slice(i + 2); }
+                if (i > 0) {
+                    const k = t.slice(0, i);
+                    if (!(k in fm)) fm[k] = t.slice(i + 2);
+                }
             });
+
             if (!out.propertyType && (fm['Home type'] || fm['Property subtype'])) out.propertyType = fm['Home type'] || fm['Property subtype'];
             if (!out.yearBuilt && fm['Year built']) out.yearBuilt = fm['Year built'];
             if (!out.lotSize && fm['Size']) out.lotSize = fm['Size'];
@@ -530,8 +540,15 @@ async function scrapeOneUrl(browser, url) {
                 const SKIP_IDS = new Set(['pfs-nav-wrapper','page-header-container','sw-container','skip-topnav-target','__PFS_TOPNAV_DATA__','hdp-srp-split-page-frame-nav-styles','with-product-nav-styles','hdp-srp-split-no-search-layout-styles']);
                 const SKIP_TESTIDS = new Set(['topnav','back-link','desktop-action-bar','close-lightbox-button']);
                 const INLINE = new Set(['A','SPAN','B','STRONG','EM','I','U','SMALL','LABEL','SUP','SUB','ABBR','TIME','MARK','CODE','FONT','BR']);
-                const lines = []; let buf = '';
-                const flush = (prefix = '') => { const t = clean(buf); buf = ''; if (t) lines.push(prefix + t); };
+                const lines = [];
+                let buf = '';
+
+                const flush = (prefix = '') => {
+                    const t = clean(buf);
+                    buf = '';
+                    if (t) lines.push(prefix + t);
+                };
+
                 const isChrome = (n) => {
                     if (n.id && SKIP_IDS.has(n.id)) return true;
                     const tid = n.getAttribute && n.getAttribute('data-testid');
@@ -539,25 +556,61 @@ async function scrapeOneUrl(browser, url) {
                     const cls = (n.className && String(n.className)) || '';
                     return /\b(topnav|znav|pfs-nav|hdp-action-bar|layout-action-bar|with-product-nav__product-nav)\b/i.test(cls);
                 };
+
                 const walk = (n) => {
-                    if (n.nodeType === 3) { buf += ' ' + n.nodeValue; return; }
+                    if (n.nodeType === 3) {
+                        buf += ' ' + n.nodeValue;
+                        return;
+                    }
                     if (n.nodeType !== 1) return;
+
                     const tag = n.tagName.toUpperCase();
                     if (SKIP.has(tag)) return;
                     if (n.hidden || n.getAttribute('aria-hidden') === 'true') return;
                     if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(n.getAttribute('style') || '')) return;
                     if (isChrome(n)) return;
-                    if (/^H[1-6]$/.test(tag)) { flush(); const t = clean(n.textContent); if (t) { lines.push(''); lines.push('## ' + t); } return; }
-                    if (tag === 'TR') { flush(); const cells = Array.from(n.children).filter(c => /^(TD|TH)$/i.test(c.tagName)).map(c => clean(c.textContent)).filter(Boolean); if (cells.length) lines.push(cells.join(' | ')); return; }
-                    if (tag === 'BR') { flush(); return; }
-                    if (tag === 'LI') { flush(); for (const c of n.childNodes) walk(c); flush('- '); return; }
+
+                    if (/^H[1-6]$/.test(tag)) {
+                        flush();
+                        const t = clean(n.textContent);
+                        if (t) {
+                            lines.push('');
+                            lines.push('## ' + t);
+                        }
+                        return;
+                    }
+
+                    if (tag === 'TR') {
+                        flush();
+                        const cells = Array.from(n.children)
+                            .filter(c => /^(TD|TH)$/i.test(c.tagName))
+                            .map(c => clean(c.textContent))
+                            .filter(Boolean);
+                        if (cells.length) lines.push(cells.join(' | '));
+                        return;
+                    }
+
+                    if (tag === 'BR') {
+                        flush();
+                        return;
+                    }
+
+                    if (tag === 'LI') {
+                        flush();
+                        for (const c of n.childNodes) walk(c);
+                        flush('- ');
+                        return;
+                    }
+
                     const inline = INLINE.has(tag);
                     if (!inline) flush();
                     for (const c of n.childNodes) walk(c);
                     if (!inline) flush();
                 };
+
                 walk(document.body);
                 flush();
+
                 const res = [];
                 for (const l of lines) {
                     const prev = res[res.length - 1];
@@ -565,15 +618,27 @@ async function scrapeOneUrl(browser, url) {
                     if (l !== '' && l === prev) continue;
                     res.push(l);
                 }
+
                 const head = [clean(document.title), location.href, '', '----------------------------------------', ''];
                 const formatted = head.concat(res).join('\n').trim();
+
                 if (formatted.length < 800) {
-                    const fb = (document.body.innerText || '').replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+                    const fb = (document.body.innerText || '')
+                        .replace(/\r/g, '')
+                        .replace(/[ \t]+\n/g, '\n')
+                        .replace(/\n{3,}/g, '\n\n')
+                        .trim();
                     return head.concat(['', fb]).join('\n').trim();
                 }
+
                 return formatted;
             };
-            try { out.pageText = formatPageText(); } catch (e) { out.pageText = document.body.innerText || ''; }
+
+            try {
+                out.pageText = formatPageText();
+            } catch (e) {
+                out.pageText = document.body.innerText || '';
+            }
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
@@ -581,28 +646,45 @@ async function scrapeOneUrl(browser, url) {
             try {
                 const nextData = JSON.parse(document.querySelector('script#__NEXT_DATA__')?.textContent || 'null');
                 const raw = nextData?.props?.pageProps?.componentProps?.gdpClientCache;
+
                 if (raw) {
                     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+
                     for (const key of Object.keys(parsed)) {
                         const prop = parsed[key]?.property;
                         if (!prop) continue;
+
                         if (!out.price && prop.price) out.price = prop.price;
                         if (!out.soldPrice && prop.lastSoldPrice) out.soldPrice = prop.lastSoldPrice;
+
                         const sd = prop.dateSold || prop.lastSoldDate || prop.soldDate;
-                        if (sd && !out.soldOn) { const d = new Date(sd); if (!isNaN(d)) out.soldOn = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()}`; }
+                        if (sd && !out.soldOn) {
+                            const d = new Date(sd);
+                            if (!isNaN(d)) out.soldOn = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+                        }
+
                         const ld = prop.listedDate || prop.dateListed || prop.listingDate;
-                        if (ld && !out.listedForSale) { const d = new Date(ld); if (!isNaN(d)) out.listedForSale = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()} ($${prop.price || '?'})`; }
+                        if (ld && !out.listedForSale) {
+                            const d = new Date(ld);
+                            if (!isNaN(d)) out.listedForSale = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()} ($${prop.price || '?'})`;
+                        }
+
                         const ai = prop.attributionInfo;
                         if (ai) {
                             if (!out.mls && (ai.mlsId || ai.mlsName)) out.mls = [ai.mlsId, ai.mlsName].filter(Boolean).join(' - ');
                             if (!out.agentDetails) out.agentDetails = [ai.agentName, ai.brokerName, ai.agentPhoneNumber].filter(Boolean).join(' | ');
                         }
+
                         if (Array.isArray(prop.priceHistory) && prop.priceHistory.length > 0 && !out.priceHistoryText) {
                             const fmtDate = (d) => {
-                                if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
+                                if (typeof d === 'number') {
+                                    const x = new Date(d);
+                                    return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`;
+                                }
                                 const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
                                 return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
                             };
+
                             out.priceHistoryText = prop.priceHistory.map(h => {
                                 const priceTxt = typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || '');
                                 const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? ` (${(h.priceChangeRate*100).toFixed(1)}%)` : '';
@@ -610,12 +692,14 @@ async function scrapeOneUrl(browser, url) {
                                 const ppsf = h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '';
                                 return [fmtDate(h.date), h.event, priceTxt + change, ppsf, source].filter(Boolean).join(' | ');
                             }).join('\n');
+
                             for (const h of prop.priceHistory) {
                                 const ev = String(h.event || '').toLowerCase();
                                 if (ev.includes('listed') && !out.listedForSale) out.listedForSale = `${fmtDate(h.date)} ($${h.price || '?'})`;
                                 if (ev.includes('sold') && !out.soldOn) out.soldOn = fmtDate(h.date);
                             }
                         }
+
                         break;
                     }
                 }
@@ -627,10 +711,14 @@ async function scrapeOneUrl(browser, url) {
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
         let domRows = [];
-        try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
+        try {
+            domRows = await page.evaluate(parseHistoryRowsInPage);
+        } catch (e) {}
 
         if (!domRows.length) {
-            try { domRows = await page.evaluate(fallbackHistoryParse); } catch (e) {}
+            try {
+                domRows = await page.evaluate(fallbackHistoryParse);
+            } catch (e) {}
             if (domRows.length) console.log(`   🔁 [${tag}] Fallback history found: ${domRows.length} rows`);
         }
 
@@ -639,17 +727,23 @@ async function scrapeOneUrl(browser, url) {
                 const priceTxt = r.price + (r.change ? ` (${r.change})` : '');
                 return [r.date, r.event, priceTxt, r.ppsf, r.source].filter(Boolean).join(' | ');
             }).join('\n');
+
             for (const r of domRows) {
                 const ev = String(r.event || '').toLowerCase();
                 if (ev.includes('listed for sale') && !data.listedForSale) data.listedForSale = `${r.date} (${r.price})`;
                 if (ev.includes('sold') && !data.soldOn) data.soldOn = r.date;
             }
+
             if (!data.mls) {
                 for (const r of domRows) {
                     const m = String(r.source || '').match(/Source:\s*(.+?MLS)\s*#\s*([A-Za-z0-9-]+)/i);
-                    if (m) { data.mls = `${m[2].replace(/Originating.*$/i, '').trim()} - ${m[1].trim()}`; break; }
+                    if (m) {
+                        data.mls = `${m[2].replace(/Originating.*$/i, '').trim()} - ${m[1].trim()}`;
+                        break;
+                    }
                 }
             }
+
             console.log(`   📊 [${tag}] History: ${domRows.length} row(s)`);
             domRows.forEach(r => console.log(`       ${r.date} | ${r.event} | ${r.price}${r.change ? ' (' + r.change + ')' : ''}`));
         } else {
@@ -668,7 +762,9 @@ async function scrapeOneUrl(browser, url) {
                     return "";
                 });
                 data.description = ldDesc || 'N/A';
-            } catch (e) { data.description = data.description || 'N/A'; }
+            } catch (e) {
+                data.description = data.description || 'N/A';
+            }
         }
 
         data.factsFeaturesText = "";
@@ -678,6 +774,7 @@ async function scrapeOneUrl(browser, url) {
                 const h = Array.from(document.querySelectorAll('h2,h3'))
                     .find(x => /^Facts\s*&\s*[Ff]eatures$/i.test(clean(x.textContent)));
                 if (!h || !h.parentElement) return "";
+
                 const lines = [];
                 h.parentElement.querySelectorAll('*').forEach(el => {
                     if (/^(P|LI|SPAN|DIV|H[1-6])$/i.test(el.tagName)) {
@@ -710,12 +807,23 @@ async function runScraper() {
     };
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-    const auth = new JWT({ email: creds.client_email, key: creds.private_key, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+    const auth = new JWT({
+        email: creds.client_email,
+        key: creds.private_key,
+        scopes: ['https://www.googleapis.com/auth/spreadsheets']
+    });
+
     const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, auth);
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
 
-    if (sheet.columnCount < REQUIRED_COLS) await sheet.resize({ rowCount: sheet.rowCount, columnCount: REQUIRED_COLS });
+    if (sheet.columnCount < REQUIRED_COLS) {
+        await sheet.resize({
+            rowCount: sheet.rowCount,
+            columnCount: REQUIRED_COLS
+        });
+    }
+
     await sheet.loadCells();
     console.log(`📊 Sheet: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
 
@@ -724,17 +832,32 @@ async function runScraper() {
         HEADERS.forEach((title, i) => {
             const col = HEADER_START_COL + i;
             if (col >= sheet.columnCount) return;
+
             const cell = sheet.getCell(0, col);
-            if (OVERWRITE_HEADERS || !cell.value) { cell.value = title; try { cell.textFormat = { bold: true }; } catch (e) {} hd++; }
+            if (OVERWRITE_HEADERS || !cell.value) {
+                cell.value = title;
+                try {
+                    cell.textFormat = { bold: true };
+                } catch (e) {}
+                hd++;
+            }
         });
+
         if (hd) await saveWithRetry(sheet);
-    } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
+    } catch (e) {
+        console.warn(`⚠️ Headings: ${e.message}`);
+    }
 
     const queue = [];
-    const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
+
+    const setCell = (r, c, v) => {
+        if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v);
+    };
+
     const applyEntry = ({ row, status, d }) => {
         setCell(row, 17, status);
         if (!d) return;
+
         setCell(row, 9,  d.price);
         setCell(row, 10, d.street);
         setCell(row, 11, d.city);
@@ -759,12 +882,17 @@ async function runScraper() {
         setCell(row, 31, d.priceHistoryText);
         setCell(row, 32, d.factsFeaturesText);
         setCell(row, 33, d.pageText);
+        setCell(row, 34, d.factCategoryDetails);
     };
+
     let flushChain = Promise.resolve();
+
     const doFlush = async () => {
         if (!queue.length) return;
+
         const batch = queue.splice(0, queue.length);
         batch.forEach(applyEntry);
+
         try {
             await saveWithRetry(sheet);
             console.log(`💾 Saved ${batch.length} row(s)`);
@@ -772,13 +900,22 @@ async function runScraper() {
             console.warn(`⚠️ Save failed (${e.message})`);
         }
     };
+
     const flush = () => (flushChain = flushChain.then(doFlush));
 
-    let claimed = 0, success = 0, blockStreak = 0, errorStreak = 0;
-    let totalBlocks = 0, totalErrors = 0;
-    let totalWithHistory = 0, totalWithTableFound = 0;
+    let claimed = 0;
+    let success = 0;
+    let blockStreak = 0;
+    let errorStreak = 0;
+    let totalBlocks = 0;
+    let totalErrors = 0;
+    let totalWithHistory = 0;
+    let totalWithTableFound = 0;
+
     let cursor = -1;
-    let stop = false, blockedExit = false;
+    let stop = false;
+    let blockedExit = false;
+
     const inflight = new Map();
 
     const claimRow = () => {
@@ -788,64 +925,117 @@ async function runScraper() {
     };
 
     async function worker(id) {
-        let browser = null, used = 0;
+        let browser = null;
+        let used = 0;
+
         try {
             while (!stop) {
                 if (Date.now() - startTime >= MAX_RUNTIME_MS) break;
                 if (claimed >= MAX_URLS_PER_RUN) break;
-                if (errorStreak >= MAX_CONSECUTIVE_ERRORS) { stop = true; break; }
+                if (errorStreak >= MAX_CONSECUTIVE_ERRORS) {
+                    stop = true;
+                    break;
+                }
 
                 const rowIndex = claimRow();
                 if (rowIndex === -1) break;
+
                 claimed++;
+
                 const url = String(safeValue(sheet, rowIndex, 0));
                 const actualRow = rowIndex + 1;
+
                 console.log(`🕵️ [W${id}] Row ${actualRow} (${claimed}/${MAX_URLS_PER_RUN}): ${url}`);
 
                 let recycle = false;
+
                 try {
                     if (!browser || used >= RECYCLE_BROWSER_EVERY) {
                         await closeBrowser(browser);
                         browser = await launchBrowser();
                         used = 0;
                     }
+
                     used++;
 
                     const key = urlKey(url);
-                    if (!inflight.has(key)) inflight.set(key, scrapeOneUrl(browser, url));
+                    if (!inflight.has(key)) {
+                        inflight.set(key, scrapeOneUrl(browser, url));
+                    }
+
                     const result = await inflight.get(key);
 
                     if (result.blocked) {
                         console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}`);
-                        queue.push({ row: rowIndex, status: result.blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)" });
-                        blockStreak++; errorStreak = 0; totalBlocks++;
+
+                        queue.push({
+                            row: rowIndex,
+                            status: result.blockedTitle
+                                ? "❌ BLOCKED (skipped)"
+                                : "🚫 No data - blocked? (skipped)"
+                        });
+
+                        blockStreak++;
+                        errorStreak = 0;
+                        totalBlocks++;
                         recycle = true;
-                        if (blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS) { stop = true; blockedExit = true; }
+
+                        if (blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS) {
+                            stop = true;
+                            blockedExit = true;
+                        }
                     } else {
                         const d = result.data;
+
                         if (result.tableFound) totalWithTableFound++;
                         if (d.priceHistoryText) totalWithHistory++;
 
                         if (!(d.price || d.fullAddress || d.description)) {
                             console.log(`⚠️ [W${id}] Empty parse on Row ${actualRow}`);
-                            queue.push({ row: rowIndex, status: "⚠️ Empty parse (skipped)" });
-                            errorStreak++; totalErrors++;
+
+                            queue.push({
+                                row: rowIndex,
+                                status: "⚠️ Empty parse (skipped)"
+                            });
+
+                            errorStreak++;
+                            totalErrors++;
                         } else {
-                            queue.push({ row: rowIndex, status: "✅ Done", d });
-                            success++; blockStreak = 0; errorStreak = 0;
-                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? d.priceHistoryText.split('\n').length : 'NO'} | 🏷️ ${d.mls || '—'}`);
+                            queue.push({
+                                row: rowIndex,
+                                status: "✅ Done",
+                                d
+                            });
+
+                            success++;
+                            blockStreak = 0;
+                            errorStreak = 0;
+
+                            console.log(
+                                `✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? d.priceHistoryText.split('\n').length : 'NO'} | 🏷️ ${d.mls || '—'}`
+                            );
                         }
                     }
                 } catch (e) {
                     console.error(`🛑 [W${id}] Error on Row ${actualRow}: ${e.message}`);
-                    queue.push({ row: rowIndex, status: "🛑 Error: " + String(e.message).slice(0, 100) });
-                    errorStreak++; totalErrors++;
+
+                    queue.push({
+                        row: rowIndex,
+                        status: "🛑 Error: " + String(e.message).slice(0, 100)
+                    });
+
+                    errorStreak++;
+                    totalErrors++;
                     recycle = true;
                 } finally {
                     inflight.delete(urlKey(url));
                 }
 
-                if (recycle) { await closeBrowser(browser); browser = null; }
+                if (recycle) {
+                    await closeBrowser(browser);
+                    browser = null;
+                }
+
                 if (queue.length >= FLUSH_EVERY) flush();
             }
         } finally {
@@ -853,7 +1043,10 @@ async function runScraper() {
         }
     }
 
-    await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1)));
+    await Promise.all(
+        Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1))
+    );
+
     await flush();
 
     console.log(`\n📊 ─── RUN TOTALS ───`);
@@ -862,15 +1055,32 @@ async function runScraper() {
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
     if (blockedExit) {
-        console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — exiting so GitHub starts a new batch.`);
+        console.log(
+            `🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — exiting so GitHub starts a new batch.`
+        );
+
         setOutput(true, true);
         return;
     }
 
-    const remaining = RETRY_BLOCKED ? findNextRow(sheet, cursor, true) : findNextRow(sheet, -1, false);
+    const remaining = RETRY_BLOCKED
+        ? findNextRow(sheet, cursor, true)
+        : findNextRow(sheet, -1, false);
+
     const hasMore = remaining !== -1;
+
     setOutput(hasMore, false);
-    console.log(hasMore ? `🔄 More rows remain — next run resumes at row ${remaining + 1}.` : "🎉 Sheet fully processed!");
+
+    console.log(
+        hasMore
+            ? `🔄 More rows remain — next run resumes at row ${remaining + 1}.`
+            : "🎉 Sheet fully processed!"
+    );
 }
 
-runScraper().then(() => process.exit(0)).catch(err => { console.error("💥 Fatal:", err); process.exit(1); });
+runScraper()
+    .then(() => process.exit(0))
+    .catch(err => {
+        console.error("💥 Fatal:", err);
+        process.exit(1);
+    });

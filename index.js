@@ -1,14 +1,3 @@
-// =========================================================
-// ZILLOW SCRAPER — CHROME-ONLY, STEALTH, PARALLEL WORKERS
-// - puppeteer-extra + stealth plugin (restored)
-// - N parallel Chrome workers, each claims a DIFFERENT row
-// - Optional SHARD_INDEX / SHARD_COUNT to split rows across
-//   multiple GitHub Actions jobs running at the same time
-// - Price history: zoom trick + Table view + expanders + looped
-//   "Show more" (no GraphQL fallback — it triggered blocks)
-// - Graceful cancel on SIGTERM/SIGINT/SIGHUP
-// =========================================================
-
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const puppeteer = require('puppeteer-extra');
@@ -20,45 +9,24 @@ const path = require('path');
 puppeteer.use(StealthPlugin());
 
 // =========================================================
-// GRACEFUL CANCEL
-// =========================================================
-let SHUTDOWN_REQUESTED = false;
-const shutdown = (signal) => {
-    if (SHUTDOWN_REQUESTED) return;
-    SHUTDOWN_REQUESTED = true;
-    console.log(`\n🛑 Received ${signal} — shutting down cleanly...`);
-    setTimeout(() => {
-        console.log('💥 Forcing exit after 8s grace period');
-        process.exit(0);
-    }, 8000).unref();
-};
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('SIGHUP',  () => shutdown('SIGHUP'));
-
-// =========================================================
 // CONFIG
 // =========================================================
-const CONCURRENCY = Number(process.env.CONCURRENCY || '5');          // parallel Chrome workers per job
+const CONCURRENCY = Number(process.env.CONCURRENCY || '5');
 const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
-const FLUSH_EVERY = Number(process.env.FLUSH_EVERY || '5');
+const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
 const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '6');
 const MAX_CONSECUTIVE_ERRORS = 6;
-const MAX_RUNTIME_MS = Number(process.env.MAX_RUNTIME_MS || 60 * 60 * 1000);
-const RECYCLE_BROWSER_EVERY = Number(process.env.RECYCLE_BROWSER_EVERY || '10');
-
-// ---- Sharding: run several Actions jobs at once, each on different rows ----
-// Job k of N processes only rows where (rowIndex % N) === k
-const SHARD_COUNT = Math.max(1, Number(process.env.SHARD_COUNT || '1'));
-const SHARD_INDEX = Number(process.env.SHARD_INDEX || '0');
+const MAX_RUNTIME_MS = 60 * 60 * 1000;
+const RECYCLE_BROWSER_EVERY = 10;
 
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED !== '0';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
+// ---- BLOCK_RESOURCES: 1 = block heavy assets (default), 0 = load everything
 const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES !== '0';
-console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF'}`);
+console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON (images/css/fonts/media/ads blocked)' : 'OFF (load everything)'}`);
 
 const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.05');
 const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
@@ -77,10 +45,6 @@ const SCROLL_WRAPPER_SETTLE_MS = Number(process.env.SCROLL_WRAPPER_SETTLE_MS || 
 const RETRY_SCROLL_SETTLE_MS = Number(process.env.RETRY_SCROLL_SETTLE_MS || '2000');
 const RETRY_WAIT_MS = Number(process.env.RETRY_WAIT_MS || '5000');
 
-const HIDE_WAIT_MS = Number(process.env.HIDE_WAIT_MS || '3000');     // max wait for the "Hide" button to appear
-const HIDE_SETTLE_MS = Number(process.env.HIDE_SETTLE_MS || '800');
-const SHOW_MORE_LOOP = process.env.SHOW_MORE_LOOP !== '0';           // set 0 to disable the extra tfoot "Show more" loop
-
 const HEADER_START_COL = 9;
 const HEADERS = [
     "Price", "Street", "City", "State", "Zipcode", "Final URL", "Agent Details", "Sold Price",
@@ -90,6 +54,9 @@ const HEADERS = [
 ];
 const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
+const jitter = (min, max) => min + Math.floor(Math.random() * (max - min));
+
 const MAX_CELL_LEN = 49000;
 const safeCell = (v) => {
     if (v === null || v === undefined) return "";
@@ -97,17 +64,13 @@ const safeCell = (v) => {
     return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…[truncated]" : s;
 };
 
-// (reverted to the original list — datagrail/consentjs/pubnub are no longer blocked)
 const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
 
-const delay = (ms) => new Promise(r => setTimeout(r, ms));
-const jitter = (min, max) => min + Math.floor(Math.random() * (max - min));
-
 // =========================================================
-// BROWSER (Chrome only)
+// BROWSER LAUNCH — all features enabled
 // =========================================================
 async function launchBrowser() {
-    const userDataDir = path.join(os.tmpdir(), `zl-chrome-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const userDataDir = path.join(os.tmpdir(), `zillow-profile-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     const args = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -115,6 +78,7 @@ async function launchBrowser() {
         '--disable-blink-features=AutomationControlled',
         '--disable-features=IsolateOrigins,site-per-process',
         `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
+        // ---- ENABLE EVERYTHING ----
         '--enable-javascript',
         '--enable-webgl',
         '--enable-webgl2',
@@ -127,21 +91,28 @@ async function launchBrowser() {
         '--enable-canvas-2d-layers',
         '--enable-native-gpu-memory-buffers',
         '--enable-features=CanvasOopRasterization',
+        // Media / DRM
         '--autoplay-policy=no-user-gesture-required',
         '--enable-features=MediaSessionService',
+        // WebRTC / WebSockets
         '--enable-webrtc',
         '--enable-websockets',
+        // DNS / networking
         '--enable-dns-prefetch',
         '--enable-quic',
+        // Modern JS features
         '--js-flags=--harmony',
+        // Form/Storage
         '--enable-features=StorageBuckets',
         '--enable-features=FileSystemAccessAPI',
     ];
+    // NOTE: removed --disable-gpu (was blocking WebGL) so hardware rendering
+    //       flags above take effect and canvas fingerprint looks real.
     const browser = await puppeteer.launch({
         headless: "new",
         userDataDir,
         args,
-        ignoreDefaultArgs: ['--disable-gpu'],
+        ignoreDefaultArgs: ['--disable-gpu'],  // ensure GPU isn't disabled
     });
     browser.__userDataDir = userDataDir;
     return browser;
@@ -160,7 +131,7 @@ async function newContext(browser) {
 }
 
 // =========================================================
-// GOOGLE SHEETS HELPERS
+// GOOGLE API RETRY
 // =========================================================
 async function saveWithRetry(sheet, retries = 4) {
     for (let i = 0; i < retries; i++) {
@@ -172,16 +143,23 @@ async function saveWithRetry(sheet, retries = 4) {
     }
 }
 
+// =========================================================
+// SAFE CELL ACCESS
+// =========================================================
 function safeValue(sheet, row, col) {
     try {
         const v = sheet.getCell(row, col).value;
         return v === null || v === undefined ? "" : String(v);
-    } catch (e) { return ""; }
+    } catch (e) {
+        return "";
+    }
 }
 
+// =========================================================
+// FIND NEXT ROW
+// =========================================================
 function findNextRow(sheet, afterRow, includeSkipped) {
     for (let r = afterRow + 1; r < sheet.rowCount; r++) {
-        if (SHARD_COUNT > 1 && (r % SHARD_COUNT) !== SHARD_INDEX) continue;
         const url = safeValue(sheet, r, 0);
         if (!url || !url.includes("zillow.com")) continue;
         const status = safeValue(sheet, r, 17);
@@ -192,8 +170,10 @@ function findNextRow(sheet, afterRow, includeSkipped) {
     return -1;
 }
 
+const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
+
 // =========================================================
-// IN-PAGE: PRICE HISTORY PARSER
+// PRICE HISTORY PARSER
 // =========================================================
 function parseHistoryRowsInPage() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -201,40 +181,20 @@ function parseHistoryRowsInPage() {
         const hs = Array.from(t.querySelectorAll('th')).map(x => clean(x.textContent).toLowerCase());
         return hs.includes('date') && hs.includes('event') && hs.includes('price');
     };
-
     const table = Array.from(document.querySelectorAll(
         'table[data-c11n-component="Table.Root"], table.c11n_table__root, table'
     )).find(isHistoryTable);
     if (!table) return [];
 
     const rows = [];
-    const tbody = table.querySelector('tbody') || table;
-    const dataRows = Array.from(tbody.querySelectorAll('tr'));
-
-    const isDataRow = (tr) =>
-        !!tr.querySelector('[data-testid="date-info"]') || !!tr.getAttribute('label');
-    const isSourceRow = (tr) =>
-        !isDataRow(tr) && !!tr.querySelector('td[colspan]');
-
-    for (let i = 0; i < dataRows.length; i++) {
-        const tr = dataRows[i];
-        if (!isDataRow(tr)) continue;
-
-        const label = tr.getAttribute('label') || '';
-        let lblDate = '', lblEvent = '', lblPrice = '';
-        const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
-        if (lm) {
-            lblDate = clean(lm[1]);
-            lblEvent = clean(lm[2]);
-            lblPrice = clean(lm[3]);
-        }
-
+    for (const tr of table.querySelectorAll('tr')) {
         const dateEl = tr.querySelector('[data-testid="date-info"]');
-        const date = clean(dateEl?.textContent) || lblDate;
-
-        const cells = tr.querySelectorAll('td');
-        const event = clean(cells[1]?.textContent) || lblEvent;
-
+        const label = tr.getAttribute('label') || '';
+        if (!dateEl && !label) continue;
+        const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
+        const cells = tr.querySelectorAll('td[data-c11n-component="Table.Cell"], td');
+        const date = clean(dateEl?.textContent) || (lm ? clean(lm[1]) : '');
+        const event = clean(cells[1]?.textContent) || (lm ? clean(lm[2]) : '');
         let price = '', change = '', ppsf = '';
         const priceCell = tr.querySelector('[data-testid="price-money-cell"]');
         if (priceCell) {
@@ -243,61 +203,78 @@ function parseHistoryRowsInPage() {
             const lastTxt = clean(priceCell.lastElementChild?.textContent);
             if (/sqft/i.test(lastTxt)) ppsf = lastTxt;
         }
-
-        if (!price && lblPrice) {
-            const pm = lblPrice.match(/^(\$[\d,]+)(?:\s*\(([-+]?\d+(?:\.\d+)?%)\))?/);
-            if (pm) { price = pm[1]; if (!change && pm[2]) change = pm[2]; }
-            else price = lblPrice;
-        }
-        if (!change && lblPrice) {
-            const cm = lblPrice.match(/\(([-+]?\d+(?:\.\d+)?%)\)/);
-            if (cm) change = cm[1];
-        }
-
+        if (!price && lm) price = clean(lm[3]).replace(/\s*\(.*\)\s*$/, '');
         let source = '';
-        for (let j = i + 1; j < dataRows.length; j++) {
-            const nxt = dataRows[j];
-            if (isDataRow(nxt)) break;
-            if (isSourceRow(nxt)) {
-                source = clean(nxt.textContent)
-                    .replace(/\s*Report\s*a\s+problem\s*$/i, '')
-                    .replace(/\s+/g, ' ').trim();
-                break;
-            }
+        const next = tr.nextElementSibling;
+        if (next && !next.querySelector('[data-testid="date-info"]') && !next.hasAttribute('label')) {
+            source = clean(next.textContent).replace(/\s*Report\s+a\s+problem\s*$/i, '');
         }
-
-        if (!date && !event && !price) continue;
         rows.push({ date, event, price, change, ppsf, source });
     }
     return rows;
 }
 
 // =========================================================
-// MOUNT PRICE HISTORY (zoom + Table view + expanders) THEN LOOP "SHOW MORE"
+// FALLBACK PARSER
 // =========================================================
-const IN_PAGE_HAS_TABLE = () => {
-    const tables = document.querySelectorAll('table');
-    return Array.from(tables).some(t => {
-        const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
-        return hs.includes('date') && hs.includes('event') && hs.includes('price');
-    });
-};
+function fallbackHistoryParse() {
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const rows = [];
 
-async function waitForHistoryTable(page, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-        if (SHUTDOWN_REQUESTED) return false;
-        const ok = await page.evaluate(IN_PAGE_HAS_TABLE).catch(() => false);
-        if (ok) return true;
-        await delay(500);
+    document.querySelectorAll('[data-testid="date-info"]').forEach((dateEl) => {
+        const tr = dateEl.closest('tr');
+        if (!tr) return;
+        const cells = tr.querySelectorAll('td');
+        const priceCell = tr.querySelector('[data-testid="price-money-cell"]');
+        let price = '', change = '';
+        if (priceCell) {
+            price = clean(priceCell.querySelector('span > span')?.textContent);
+            change = clean(priceCell.querySelector('[data-testid="percent-display"]')?.textContent);
+        }
+        let source = '';
+        const next = tr.nextElementSibling;
+        if (next && !next.querySelector('[data-testid="date-info"]') && !next.hasAttribute('label')) {
+            source = clean(next.textContent).replace(/\s*Report\s+a\s+problem\s*$/i, '');
+        }
+        rows.push({
+            date: clean(dateEl.textContent),
+            event: clean(cells[1]?.textContent),
+            price,
+            change,
+            ppsf: '',
+            source,
+        });
+    });
+
+    if (!rows.length) {
+        document.querySelectorAll('table').forEach((tbl) => {
+            const headers = Array.from(tbl.querySelectorAll('th')).map((x) => clean(x.textContent).toLowerCase());
+            if (!(headers.includes('date') && headers.includes('event') && headers.includes('price'))) return;
+            tbl.querySelectorAll('tbody tr').forEach((tr) => {
+                const cells = Array.from(tr.querySelectorAll('td')).map((c) => clean(c.textContent));
+                if (cells.length < 3) return;
+                rows.push({
+                    date: cells[0],
+                    event: cells[1],
+                    price: cells[2].replace(/\s*\(.*\)\s*$/, ''),
+                    change: (cells[2].match(/\(([^)]+)\)/) || [])[1] || '',
+                    ppsf: '',
+                    source: '',
+                });
+            });
+        });
     }
-    return false;
+
+    return rows;
 }
 
+// =========================================================
+// HARDENED MOUNT (with See More click)
+// =========================================================
 async function ensureHistoryMounted(page, tag) {
-    // Step 0: expand collapsed sections
+    // Step 0: Click ALL "See more" / collapsed buttons
     try {
-        const n = await page.evaluate(() => {
+        const clickedCount = await page.evaluate(() => {
             const buttons = Array.from(document.querySelectorAll(
                 'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
             ));
@@ -310,11 +287,11 @@ async function ensureHistoryMounted(page, tag) {
             }
             return clicked;
         });
-        if (n > 0) console.log(`   🔽 [${tag}] Expanded ${n} collapsed section(s)`);
+        if (clickedCount > 0) console.log(`   🔽 [${tag}] Clicked ${clickedCount} "See more" button(s)`);
     } catch (e) {}
     await delay(CLICK_EXPAND_SETTLE_MS);
 
-    // Step 1: zoom out + scroll to bottom so lazy sections mount
+    // Step 1: Zoom + scroll bottom
     try {
         await page.evaluate((z) => {
             document.documentElement.style.zoom = String(z);
@@ -324,7 +301,7 @@ async function ensureHistoryMounted(page, tag) {
     } catch (e) {}
     await delay(ZOOM_SETTLE_MS);
 
-    // Step 2: scroll to Price history heading
+    // Step 2: Scroll heading
     await page.evaluate(() => {
         const h = Array.from(document.querySelectorAll('h2,h3'))
             .find(x => /price\s*history/i.test(x.textContent || ''));
@@ -332,7 +309,7 @@ async function ensureHistoryMounted(page, tag) {
     }).catch(() => {});
     await delay(HEADING_SETTLE_MS);
 
-    // Step 3: click "Table view"
+    // Step 3: Click "Table view"
     await page.evaluate(() => {
         const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
             .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
@@ -340,11 +317,18 @@ async function ensureHistoryMounted(page, tag) {
     }).catch(() => {});
     await delay(TABLE_VIEW_SETTLE_MS);
 
-    // Step 4: is the table there?
-    let tableFound = await page.evaluate(IN_PAGE_HAS_TABLE).catch(() => false);
+    // Step 4: Check table exists
+    let tableFound = await page.evaluate(() => {
+        const tables = document.querySelectorAll('table');
+        return Array.from(tables).some(t => {
+            const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
+            return hs.includes('date') && hs.includes('event') && hs.includes('price');
+        });
+    }).catch(() => false);
 
-    // Step 5: click heading + scroll wrapper
+    // Step 5: Click heading + scroll wrapper
     if (!tableFound) {
+        console.log(`   🔧 [${tag}] Clicking heading + scrolling table wrapper...`);
         await page.evaluate(() => {
             const h = Array.from(document.querySelectorAll('h2,h3'))
                 .find(x => /price\s*history/i.test(x.textContent || ''));
@@ -364,342 +348,91 @@ async function ensureHistoryMounted(page, tag) {
         await delay(SCROLL_WRAPPER_SETTLE_MS);
     }
 
-    // Step 6: wait for table
-    if (!tableFound) tableFound = await waitForHistoryTable(page, TABLE_WAIT_MS);
+    // Step 6: Wait for table
+    try {
+        await page.waitForFunction(
+            () => {
+                const tables = document.querySelectorAll('table');
+                return Array.from(tables).some(t => {
+                    const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
+                    return hs.includes('date') && hs.includes('event') && hs.includes('price');
+                });
+            },
+            { timeout: TABLE_WAIT_MS }
+        );
+        tableFound = true;
+        console.log(`   📊 [${tag}] Table mounted ✅`);
+    } catch (e) {
+        console.log(`   📊 [${tag}] Table NOT mounted after ${TABLE_WAIT_MS}ms ❌`);
+    }
 
-    // Step 7: second chance
-    if (!tableFound && !SHUTDOWN_REQUESTED) {
+    // Step 7: Second chance
+    if (!tableFound) {
         await page.evaluate(() => {
             const buttons = Array.from(document.querySelectorAll(
                 'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
             ));
             for (const btn of buttons) {
                 const txt = (btn.textContent || '').trim().toLowerCase();
-                if (txt.includes('see more') || txt.includes('show more')) { try { btn.click(); } catch (e) {} }
+                if (txt.includes('see more') || txt.includes('show more')) {
+                    try { btn.click(); } catch (e) {}
+                }
             }
             const h = Array.from(document.querySelectorAll('h2,h3'))
                 .find(x => /price\s*history/i.test(x.textContent || ''));
             if (h) h.scrollIntoView({ block: 'center' });
         }).catch(() => {});
         await delay(RETRY_SCROLL_SETTLE_MS);
-        tableFound = await waitForHistoryTable(page, RETRY_WAIT_MS);
+        try {
+            await page.waitForFunction(
+                () => {
+                    const tables = document.querySelectorAll('table');
+                    return Array.from(tables).some(t => {
+                        const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
+                        return hs.includes('date') && hs.includes('event') && hs.includes('price');
+                    });
+                },
+                { timeout: RETRY_WAIT_MS }
+            );
+            tableFound = true;
+            console.log(`   📊 [${tag}] Table mounted (retry) ✅`);
+        } catch (e) {
+            console.log(`   📊 [${tag}] Table NOT mounted (retry) ❌`);
+        }
     }
 
+    // Step 8: Debug
     if (!tableFound) {
-        console.log(`   ❌ [${tag}] History table NOT mounted`);
-        return false;
+        try {
+            const debug = await page.evaluate(() => ({
+                hasHeading: Array.from(document.querySelectorAll('h2,h3'))
+                    .some(h => /price history/i.test(h.textContent || '')),
+                dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
+                tableCount: document.querySelectorAll('table').length,
+                showMoreButtons: document.querySelectorAll('button[data-c11n-component="ShowHide.Button"]').length,
+                collapsedButtons: document.querySelectorAll('button[aria-expanded="false"]').length,
+                bodyHeight: document.body.scrollHeight,
+                viewportHeight: window.innerHeight,
+                zoom: document.documentElement.style.zoom,
+            }));
+            console.log(`   🔍 [${tag}] Debug: ${JSON.stringify(debug)}`);
+        } catch (e) {}
     }
-    console.log(`   📊 [${tag}] History table mounted ✅`);
 
-    // Step 8: loop "Show more" inside the history table
-    const getRowCount = () => page.evaluate(() => {
-        const t = Array.from(document.querySelectorAll('table')).find(t => {
-            const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
-            return hs.includes('date') && hs.includes('event') && hs.includes('price');
-        });
-        if (!t) return -1;
-        const tbody = t.querySelector('tbody') || t;
-        return Array.from(tbody.querySelectorAll('tr')).filter(tr =>
-            tr.querySelector('[data-testid="date-info"]') || tr.getAttribute('label')
-        ).length;
-    }).catch(() => -1);
-
-    let totalClicked = 0;
-    let prevCount = await getRowCount();
-    for (let iter = 0; iter < (SHOW_MORE_LOOP ? 15 : 0); iter++) {
-        if (SHUTDOWN_REQUESTED) break;
-        const clicked = await page.evaluate(() => {
-            const btns = Array.from(document.querySelectorAll('tfoot[data-testid="table-see-more"] button'));
-            let n = 0;
-            for (const btn of btns) {
-                const txt = (btn.textContent || '').trim().toLowerCase();
-                if (/show\s*more|see\s*more|view\s*more/.test(txt)) {
-                    try { btn.scrollIntoView({ block: 'center' }); btn.click(); n++; } catch (e) {}
-                }
-            }
-            return n;
-        }).catch(() => 0);
-        if (clicked === 0) break;
-        totalClicked += clicked;
-
-        const waitDeadline = Date.now() + 4000;
-        let grew = false;
-        while (Date.now() < waitDeadline) {
-            if (SHUTDOWN_REQUESTED) break;
-            await delay(300 + jitter(0, 200));
-            const c = await getRowCount();
-            if (c > prevCount) { grew = true; prevCount = c; break; }
-        }
-        if (!grew) break;
-        await delay(jitter(200, 600));
-    }
-    console.log(`   🔽 [${tag}] Show more: ${totalClicked} click(s), ${prevCount} rows total`);
-    return true;
+    return tableFound;
 }
 
 // =========================================================
-// IN-PAGE: MAIN DATA EXTRACTOR
+// EXTRACT ONE URL
 // =========================================================
-function extractMainDataInPage() {
-    const out = {
-        price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
-        agentDetails: "", soldPrice: "", canonicalUrl: "", description: "",
-        pricePerSqft: "", beds: "", baths: "", sqft: "", lotSize: "",
-        listedForSale: "", soldOn: "", mls: "", propertyType: "", yearBuilt: "",
-        hoa: "", priceHistoryText: "", factsFeaturesText: "", pageText: ""
-    };
-    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const num = (s) => {
-        const str = String(s || '').replace(/,/g, '').trim();
-        if (/^[-—–]+$/.test(str)) return '';
-        const m = str.match(/-?\d+(\.\d+)?/);
-        return m ? Number(m[0]) : '';
-    };
-    const $ = (sel, root = document) => root.querySelector(sel);
-    const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
-    const metaGet = (p) => document.querySelector(`meta[property="${p}"]`)?.content || '';
-
-    out.canonicalUrl = $('meta[property="og:url"]')?.content || $('link[rel="canonical"]')?.href || location.href;
-    out.price = num(clean($('[data-testid="price"]')?.textContent));
-
-    const pill = clean($('[data-testid="gallery-status-pill"]')?.textContent);
-    const soldMatch = pill.match(/Sold\s+for\s+\$([\d,]+)/i);
-    if (soldMatch) out.soldPrice = Number(soldMatch[1].replace(/,/g, ''));
-    else if (/sold/i.test(pill) && out.price) out.soldPrice = out.price;
-
-    const h1 = clean($('h1')?.textContent).replace(/\u00A0/g, ' ');
-    if (h1) {
-        const parts = h1.split(',').map(clean);
-        if (parts.length >= 3) {
-            out.street = parts[0];
-            out.city = parts[1];
-            const stZip = parts[2].match(/^([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/);
-            if (stZip) { out.state = stZip[1]; out.zipcode = stZip[2]; }
-        }
-    }
-
-    const factMap = {};
-    $$('[data-testid="bed-bath-sqft-fact-container"]').forEach(c => {
-        const sp = c.querySelectorAll('span');
-        if (sp.length >= 2) factMap[clean(sp[1].textContent).toLowerCase()] = clean(sp[0].textContent);
-    });
-    if (factMap.beds)  out.beds  = num(factMap.beds)  || factMap.beds;
-    if (factMap.baths) out.baths = num(factMap.baths) || factMap.baths;
-    if (factMap.sqft)  out.sqft  = num(factMap.sqft)  || factMap.sqft;
-
-    const glance = $('[aria-label="At a glance facts"]');
-    if (glance) {
-        for (const item of glance.querySelectorAll('[role="listitem"]')) {
-            const t = clean(item.textContent);
-            if (!t) continue;
-            const lotM = t.match(/^([\d.,]+)\s*Acres?\s+Lot$/i);
-            if (lotM && !out.lotSize) out.lotSize = `${lotM[1]} Acres`;
-            const yearM = t.match(/^Built\s+in\s+(\d{4})$/i);
-            if (yearM && !out.yearBuilt) out.yearBuilt = yearM[1];
-            if (!out.propertyType && /^(Single Family|Multi Family|Condo|Townhouse|Manufactured|Mobile|Apartment|Land|Vacant)/i.test(t)) out.propertyType = t;
-            const ppsfM = t.match(/\$([\d,]+)\s*\/\s*sqft/i);
-            if (ppsfM && !out.pricePerSqft) out.pricePerSqft = Number(ppsfM[1].replace(/,/g, ''));
-        }
-    }
-
-    const fm = {};
-    $$('[data-testid="fact-category"] li').forEach(li => {
-        const t = clean(li.textContent);
-        const i = t.indexOf(': ');
-        if (i > 0) { const k = t.slice(0, i); if (!(k in fm)) fm[k] = t.slice(i + 2); }
-    });
-    if (!out.propertyType && (fm['Home type'] || fm['Property subtype'])) out.propertyType = fm['Home type'] || fm['Property subtype'];
-    if (!out.yearBuilt && fm['Year built']) out.yearBuilt = fm['Year built'];
-    if (!out.lotSize && fm['Size']) out.lotSize = fm['Size'];
-    if (!out.pricePerSqft && fm['Price per square foot']) out.pricePerSqft = num(fm['Price per square foot']);
-    if (!out.hoa) {
-        if (fm['HOA fee'] || fm['HOA fee frequency']) out.hoa = fm['HOA fee'] || fm['HOA fee frequency'];
-        else out.hoa = 'No / None listed';
-    }
-
-    const descEl = $('[data-testid="description"] article') || $('[data-testid="description"]');
-    if (descEl) out.description = clean(descEl.textContent) || 'N/A';
-
-    const la = $('[data-testid="attribution-LISTING_AGENT"]');
-    if (la) {
-        const parts = Array.from(la.querySelectorAll('span')).map(x => clean(x.textContent).replace(/,$/, '')).filter(Boolean);
-        const broker = clean($('[data-testid="attribution-BROKER"]')?.textContent);
-        out.agentDetails = [parts[0], broker, parts[1]].filter(Boolean).join(' | ');
-    }
-
-    const mlsInfo = clean($('[role="contentinfo"][aria-label="MLS information"]')?.textContent);
-    if (mlsInfo) {
-        let m = mlsInfo.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
-        if (m) out.mls = `${m[2].replace(/Originating.*$/i, '').trim()} - ${clean(m[1])}`;
-        else {
-            m = mlsInfo.match(/MLS#?:\s*([A-Za-z0-9-]+)\s*(?:Originating\s+MLS:?\s*([A-Za-z .]+))?/i);
-            if (m) {
-                const id = m[1].replace(/Originating.*$/i, '').trim();
-                const src = m[2] ? clean(m[2]) : 'Hive MLS';
-                out.mls = `${id} - ${src}`;
-            }
-        }
-    }
-
-    const formatPageText = () => {
-        const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG','VIDEO','AUDIO','CANVAS','OBJECT','EMBED']);
-        const SKIP_IDS = new Set(['pfs-nav-wrapper','page-header-container','sw-container','skip-topnav-target','__PFS_TOPNAV_DATA__','hdp-srp-split-page-frame-nav-styles','with-product-nav-styles','hdp-srp-split-no-search-layout-styles']);
-        const SKIP_TESTIDS = new Set(['topnav','back-link','desktop-action-bar','close-lightbox-button']);
-        const INLINE = new Set(['A','SPAN','B','STRONG','EM','I','U','SMALL','LABEL','SUP','SUB','ABBR','TIME','MARK','CODE','FONT','BR']);
-        const lines = []; let buf = '';
-        const flush = (prefix = '') => { const t = clean(buf); buf = ''; if (t) lines.push(prefix + t); };
-        const isChrome = (n) => {
-            if (n.id && SKIP_IDS.has(n.id)) return true;
-            const tid = n.getAttribute && n.getAttribute('data-testid');
-            if (tid && SKIP_TESTIDS.has(tid)) return true;
-            const cls = (n.className && String(n.className)) || '';
-            return /\b(topnav|znav|pfs-nav|hdp-action-bar|layout-action-bar|with-product-nav__product-nav)\b/i.test(cls);
-        };
-        const walk = (n) => {
-            if (n.nodeType === 3) { buf += ' ' + n.nodeValue; return; }
-            if (n.nodeType !== 1) return;
-            const tag = n.tagName.toUpperCase();
-            if (SKIP.has(tag)) return;
-            if (n.hidden || n.getAttribute('aria-hidden') === 'true') return;
-            if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(n.getAttribute('style') || '')) return;
-            if (isChrome(n)) return;
-            if (/^H[1-6]$/.test(tag)) { flush(); const t = clean(n.textContent); if (t) { lines.push(''); lines.push('## ' + t); } return; }
-            if (tag === 'TR') { flush(); const cells = Array.from(n.children).filter(c => /^(TD|TH)$/i.test(c.tagName)).map(c => clean(c.textContent)).filter(Boolean); if (cells.length) lines.push(cells.join(' | ')); return; }
-            if (tag === 'BR') { flush(); return; }
-            if (tag === 'LI') { flush(); for (const c of n.childNodes) walk(c); flush('- '); return; }
-            const inline = INLINE.has(tag);
-            if (!inline) flush();
-            for (const c of n.childNodes) walk(c);
-            if (!inline) flush();
-        };
-        walk(document.body);
-        flush();
-        const res = [];
-        for (const l of lines) {
-            const prev = res[res.length - 1];
-            if (l === '' && (prev === '' || prev === undefined)) continue;
-            if (l !== '' && l === prev) continue;
-            res.push(l);
-        }
-        const head = [clean(document.title), location.href, '', '----------------------------------------', ''];
-        const formatted = head.concat(res).join('\n').trim();
-        if (formatted.length < 800) {
-            const fb = (document.body.innerText || '').replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-            return head.concat(['', fb]).join('\n').trim();
-        }
-        return formatted;
-    };
-    try { out.pageText = formatPageText(); } catch (e) { out.pageText = document.body.innerText || ''; }
-
-    out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
-
-    try {
-        const h = Array.from(document.querySelectorAll('h2,h3'))
-            .find(x => /^Facts\s*&\s*[Ff]eatures$/i.test(clean(x.textContent)));
-        if (h && h.parentElement) {
-            const lines = [];
-            h.parentElement.querySelectorAll('*').forEach(el => {
-                if (/^(P|LI|SPAN|DIV|H[1-6])$/i.test(el.tagName)) {
-                    const t = clean(el.textContent);
-                    if (t && t.length < 300 && !lines.includes(t)) lines.push(t);
-                }
-            });
-            out.factsFeaturesText = lines.join('\n');
-        }
-    } catch (e) {}
-
-    // JSON __NEXT_DATA__ (used as fallback source, incl. price history)
-    try {
-        const nextData = JSON.parse(document.querySelector('script#__NEXT_DATA__')?.textContent || 'null');
-        const raw = nextData?.props?.pageProps?.componentProps?.gdpClientCache;
-        if (raw) {
-            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-            for (const key of Object.keys(parsed)) {
-                const prop = parsed[key]?.property;
-                if (!prop) continue;
-                if (!out.price && prop.price) out.price = prop.price;
-                if (!out.soldPrice && prop.lastSoldPrice) out.soldPrice = prop.lastSoldPrice;
-                const sd = prop.dateSold || prop.lastSoldDate || prop.soldDate;
-                if (sd && !out.soldOn) { const d = new Date(sd); if (!isNaN(d)) out.soldOn = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()}`; }
-                const ld = prop.listedDate || prop.dateListed || prop.listingDate;
-                if (ld && !out.listedForSale) { const d = new Date(ld); if (!isNaN(d)) out.listedForSale = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()} ($${prop.price || '?'})`; }
-                const ai = prop.attributionInfo;
-                if (ai) {
-                    if (!out.mls && (ai.mlsId || ai.mlsName)) out.mls = [ai.mlsId, ai.mlsName].filter(Boolean).join(' - ');
-                    if (!out.agentDetails) out.agentDetails = [ai.agentName, ai.brokerName, ai.agentPhoneNumber].filter(Boolean).join(' | ');
-                }
-                if (Array.isArray(prop.priceHistory) && prop.priceHistory.length > 0 && !out.priceHistoryText) {
-                    const fmtDate = (d) => {
-                        if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
-                        const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
-                        return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
-                    };
-                    out.priceHistoryText = prop.priceHistory.map(h => {
-                        const priceTxt = typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || '');
-                        const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? ` (${(h.priceChangeRate*100).toFixed(1)}%)` : '';
-                        const source = h.source ? `Source: ${h.source}` : '';
-                        const ppsf = h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '';
-                        return [fmtDate(h.date), h.event, priceTxt + change, ppsf, source].filter(Boolean).join(' | ');
-                    }).join('\n');
-                    for (const h of prop.priceHistory) {
-                        const ev = String(h.event || '').toLowerCase();
-                        if (ev.includes('listed') && !out.listedForSale) out.listedForSale = `${fmtDate(h.date)} ($${h.price || '?'})`;
-                        if (ev.includes('sold') && !out.soldOn) out.soldOn = fmtDate(h.date);
-                    }
-                }
-                break;
-            }
-        }
-    } catch (e) {}
-
-    if (!out.beds) { const b = metaGet('zillow_fb:beds'); if (b) out.beds = b; }
-    if (!out.baths) { const b = metaGet('zillow_fb:baths'); if (b) out.baths = b; }
-    if ((!out.description || out.description === 'N/A')) {
-        const md = metaGet('og:zillow_fb:description');
-        if (md) out.description = md;
-    }
-    if (!out.street) { const a = metaGet('og:zillow_fb:address'); if (a) out.street = a; }
-
-    return out;
-}
-
-// =========================================================
-// CLICK "Hide" BUTTON FIRST (before anything else on the page)
-// =========================================================
-async function clickHideFirst(page, tag) {
-    try {
-        await page.waitForFunction(() =>
-            Array.from(document.querySelectorAll('span[data-c11n-component="TextButton.Label"]'))
-                .some(sp => (sp.textContent || '').trim().toLowerCase() === 'hide'),
-            { timeout: HIDE_WAIT_MS }
-        );
-    } catch (e) { return 0; }   // button never appeared — carry on
-
-    const n = await page.evaluate(() => {
-        let clicked = 0;
-        const spans = Array.from(document.querySelectorAll('span[data-c11n-component="TextButton.Label"]'))
-            .filter(sp => (sp.textContent || '').trim().toLowerCase() === 'hide');
-        for (const sp of spans) {
-            const el = sp.closest('button, [role="button"], a') || sp;
-            try { el.click(); clicked++; } catch (e) {}
-        }
-        return clicked;
-    }).catch(() => 0);
-
-    if (n > 0) console.log(`   🙈 [${tag}] Clicked "Hide" x${n}`);
-    await delay(HIDE_SETTLE_MS);
-    return n;
-}
-
-// =========================================================
-// SCRAPE ONE URL
-// =========================================================
-async function scrapeOneUrl(browser, url, workerTag) {
-    const tag = `${workerTag}:${String(url).slice(-22)}`;
+async function scrapeOneUrl(browser, url) {
+    const tag = String(url).slice(-22);
     const ctx = await newContext(browser);
     let page;
     try {
         page = await ctx.newPage();
+
+        // ---- Enable everything: JS, service workers, WebGL, etc.
         await page.setJavaScriptEnabled(true);
         try { await page.setBypassCSP(true); } catch (e) {}
         await page.setViewport({
@@ -710,18 +443,21 @@ async function scrapeOneUrl(browser, url, workerTag) {
             isMobile: false,
         });
 
-        try {
+        // ---- Conditional request interception ----
+        if (BLOCK_RESOURCES) {
             await page.setRequestInterception(true);
             page.on('request', (req) => {
                 const type = req.resourceType();
-                if (BLOCK_RESOURCES && (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url())))
-                    req.abort().catch(() => {});
+                if (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url())) req.abort().catch(() => {});
                 else req.continue().catch(() => {});
             });
-        } catch (e) {
-            console.warn(`   ⚠️ [${tag}] Interception unavailable (${e.message})`);
+        } else {
+            // Load EVERYTHING — no blocking at all
+            await page.setRequestInterception(true);
+            page.on('request', (req) => req.continue().catch(() => {}));
         }
 
+        // Small UA fix for headless mode — keep if you use headless
         try {
             await page.evaluateOnNewDocument(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -732,37 +468,220 @@ async function scrapeOneUrl(browser, url, workerTag) {
 
         await delay(jitter(NAV_DELAY_MIN, NAV_DELAY_MAX));
         await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        await page.waitForSelector(
-            '[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"]',
-            { timeout: HYDRATE_TIMEOUT }
-        ).catch(() => {});
+        await page.waitForSelector('[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"]', { timeout: HYDRATE_TIMEOUT }).catch(() => {});
         await delay(HYDRATE_SETTLE);
 
-        // ---- Blocked detection (captcha-safe) ----
         const title = await page.title();
-        const probe = await page.evaluate(() => ({
-            hasNext: !!document.querySelector('script#__NEXT_DATA__'),
-            hasPrice: !!document.querySelector('[data-testid="price"]'),
-            hasH1: !!document.querySelector('h1'),
-            bodyLen: (document.body?.innerText || '').length,
-        }));
-        const blockedTitle = /pardon our interruption|robot check|access denied|access to this page has been denied|press\s*&\s*hold|unusual traffic|captcha/i.test(title);
-        // A real listing page always has __NEXT_DATA__ or a price/h1. Block pages have none.
-        const trulyBlocked = blockedTitle || !probe.hasNext;
+        const hasNext = await page.evaluate(() => !!document.querySelector('script#__NEXT_DATA__'));
+        const blockedTitle = /pardon our interruption|robot check|access denied/i.test(title);
+        if (blockedTitle || !hasNext) return { blocked: true, blockedTitle };
 
-        console.log(`   🔎 [${tag}] probe: next=${probe.hasNext} price=${probe.hasPrice} h1=${probe.hasH1} bodyLen=${probe.bodyLen}`);
-        if (trulyBlocked) return { blocked: true, blockedTitle };
+        const tableFound = await ensureHistoryMounted(page, tag);
 
-        // ---- Mount price history, then extract everything ----
-        await clickHideFirst(page, tag);
-        await ensureHistoryMounted(page, tag);
+        const data = await page.evaluate(() => {
+            const out = {
+                price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
+                agentDetails: "", soldPrice: "", canonicalUrl: "", description: "",
+                pricePerSqft: "", beds: "", baths: "", sqft: "", lotSize: "",
+                listedForSale: "", soldOn: "", mls: "", propertyType: "", yearBuilt: "",
+                hoa: "", priceHistoryText: "", pageText: ""
+            };
+            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const num = (s) => {
+                const str = String(s || '').replace(/,/g, '').trim();
+                if (/^[-—–]+$/.test(str)) return '';
+                const m = str.match(/-?\d+(\.\d+)?/);
+                return m ? Number(m[0]) : '';
+            };
+            const $ = (sel, root = document) => root.querySelector(sel);
+            const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-        const data = await page.evaluate(extractMainDataInPage);
+            out.canonicalUrl = $('meta[property="og:url"]')?.content || $('link[rel="canonical"]')?.href || location.href;
+            out.price = num(clean($('[data-testid="price"]')?.textContent));
+
+            const pill = clean($('[data-testid="gallery-status-pill"]')?.textContent);
+            const soldMatch = pill.match(/Sold\s+for\s+\$([\d,]+)/i);
+            if (soldMatch) out.soldPrice = Number(soldMatch[1].replace(/,/g, ''));
+            else if (/sold/i.test(pill) && out.price) out.soldPrice = out.price;
+
+            const h1 = clean($('h1')?.textContent).replace(/\u00A0/g, ' ');
+            if (h1) {
+                const parts = h1.split(',').map(clean);
+                if (parts.length >= 3) {
+                    out.street = parts[0];
+                    out.city = parts[1];
+                    const stZip = parts[2].match(/^([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+                    if (stZip) { out.state = stZip[1]; out.zipcode = stZip[2]; }
+                }
+            }
+
+            const factMap = {};
+            $$('[data-testid="bed-bath-sqft-fact-container"]').forEach(c => {
+                const sp = c.querySelectorAll('span');
+                if (sp.length >= 2) factMap[clean(sp[1].textContent).toLowerCase()] = clean(sp[0].textContent);
+            });
+            if (factMap.beds)  out.beds  = num(factMap.beds)  || factMap.beds;
+            if (factMap.baths) out.baths = num(factMap.baths) || factMap.baths;
+            if (factMap.sqft)  out.sqft  = num(factMap.sqft)  || factMap.sqft;
+
+            const glance = $('[aria-label="At a glance facts"]');
+            if (glance) {
+                for (const item of glance.querySelectorAll('[role="listitem"]')) {
+                    const t = clean(item.textContent);
+                    if (!t) continue;
+                    const lotM = t.match(/^([\d.,]+)\s*Acres?\s+Lot$/i);
+                    if (lotM && !out.lotSize) out.lotSize = `${lotM[1]} Acres`;
+                    const yearM = t.match(/^Built\s+in\s+(\d{4})$/i);
+                    if (yearM && !out.yearBuilt) out.yearBuilt = yearM[1];
+                    if (!out.propertyType && /^(Single Family|Multi Family|Condo|Townhouse|Manufactured|Mobile|Apartment|Land|Vacant)/i.test(t)) out.propertyType = t;
+                    const ppsfM = t.match(/\$([\d,]+)\s*\/\s*sqft/i);
+                    if (ppsfM && !out.pricePerSqft) out.pricePerSqft = Number(ppsfM[1].replace(/,/g, ''));
+                }
+            }
+
+            const fm = {};
+            $$('[data-testid="fact-category"] li').forEach(li => {
+                const t = clean(li.textContent);
+                const i = t.indexOf(': ');
+                if (i > 0) { const k = t.slice(0, i); if (!(k in fm)) fm[k] = t.slice(i + 2); }
+            });
+            if (!out.propertyType && (fm['Home type'] || fm['Property subtype'])) out.propertyType = fm['Home type'] || fm['Property subtype'];
+            if (!out.yearBuilt && fm['Year built']) out.yearBuilt = fm['Year built'];
+            if (!out.lotSize && fm['Size']) out.lotSize = fm['Size'];
+            if (!out.pricePerSqft && fm['Price per square foot']) out.pricePerSqft = num(fm['Price per square foot']);
+            if (!out.hoa) {
+                if (fm['HOA fee'] || fm['HOA fee frequency']) out.hoa = fm['HOA fee'] || fm['HOA fee frequency'];
+                else out.hoa = 'No / None listed';
+            }
+
+            const descEl = $('[data-testid="description"] article') || $('[data-testid="description"]');
+            if (descEl) out.description = clean(descEl.textContent) || 'N/A';
+
+            const la = $('[data-testid="attribution-LISTING_AGENT"]');
+            if (la) {
+                const parts = Array.from(la.querySelectorAll('span')).map(x => clean(x.textContent).replace(/,$/, '')).filter(Boolean);
+                const broker = clean($('[data-testid="attribution-BROKER"]')?.textContent);
+                out.agentDetails = [parts[0], broker, parts[1]].filter(Boolean).join(' | ');
+            }
+
+            const mlsInfo = clean($('[role="contentinfo"][aria-label="MLS information"]')?.textContent);
+            if (mlsInfo) {
+                let m = mlsInfo.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
+                if (m) out.mls = `${m[2].replace(/Originating.*$/i, '').trim()} - ${clean(m[1])}`;
+                else {
+                    m = mlsInfo.match(/MLS#?:\s*([A-Za-z0-9-]+)\s*(?:Originating\s+MLS:?\s*([A-Za-z .]+))?/i);
+                    if (m) {
+                        const id = m[1].replace(/Originating.*$/i, '').trim();
+                        const src = m[2] ? clean(m[2]) : 'Hive MLS';
+                        out.mls = `${id} - ${src}`;
+                    }
+                }
+            }
+
+            const formatPageText = () => {
+                const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG','VIDEO','AUDIO','CANVAS','OBJECT','EMBED']);
+                const SKIP_IDS = new Set(['pfs-nav-wrapper','page-header-container','sw-container','skip-topnav-target','__PFS_TOPNAV_DATA__','hdp-srp-split-page-frame-nav-styles','with-product-nav-styles','hdp-srp-split-no-search-layout-styles']);
+                const SKIP_TESTIDS = new Set(['topnav','back-link','desktop-action-bar','close-lightbox-button']);
+                const INLINE = new Set(['A','SPAN','B','STRONG','EM','I','U','SMALL','LABEL','SUP','SUB','ABBR','TIME','MARK','CODE','FONT','BR']);
+                const lines = []; let buf = '';
+                const flush = (prefix = '') => { const t = clean(buf); buf = ''; if (t) lines.push(prefix + t); };
+                const isChrome = (n) => {
+                    if (n.id && SKIP_IDS.has(n.id)) return true;
+                    const tid = n.getAttribute && n.getAttribute('data-testid');
+                    if (tid && SKIP_TESTIDS.has(tid)) return true;
+                    const cls = (n.className && String(n.className)) || '';
+                    return /\b(topnav|znav|pfs-nav|hdp-action-bar|layout-action-bar|with-product-nav__product-nav)\b/i.test(cls);
+                };
+                const walk = (n) => {
+                    if (n.nodeType === 3) { buf += ' ' + n.nodeValue; return; }
+                    if (n.nodeType !== 1) return;
+                    const tag = n.tagName.toUpperCase();
+                    if (SKIP.has(tag)) return;
+                    if (n.hidden || n.getAttribute('aria-hidden') === 'true') return;
+                    if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(n.getAttribute('style') || '')) return;
+                    if (isChrome(n)) return;
+                    if (/^H[1-6]$/.test(tag)) { flush(); const t = clean(n.textContent); if (t) { lines.push(''); lines.push('## ' + t); } return; }
+                    if (tag === 'TR') { flush(); const cells = Array.from(n.children).filter(c => /^(TD|TH)$/i.test(c.tagName)).map(c => clean(c.textContent)).filter(Boolean); if (cells.length) lines.push(cells.join(' | ')); return; }
+                    if (tag === 'BR') { flush(); return; }
+                    if (tag === 'LI') { flush(); for (const c of n.childNodes) walk(c); flush('- '); return; }
+                    const inline = INLINE.has(tag);
+                    if (!inline) flush();
+                    for (const c of n.childNodes) walk(c);
+                    if (!inline) flush();
+                };
+                walk(document.body);
+                flush();
+                const res = [];
+                for (const l of lines) {
+                    const prev = res[res.length - 1];
+                    if (l === '' && (prev === '' || prev === undefined)) continue;
+                    if (l !== '' && l === prev) continue;
+                    res.push(l);
+                }
+                const head = [clean(document.title), location.href, '', '----------------------------------------', ''];
+                const formatted = head.concat(res).join('\n').trim();
+                if (formatted.length < 800) {
+                    const fb = (document.body.innerText || '').replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+                    return head.concat(['', fb]).join('\n').trim();
+                }
+                return formatted;
+            };
+            try { out.pageText = formatPageText(); } catch (e) { out.pageText = document.body.innerText || ''; }
+
+            out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
+
+            // JSON fallback
+            try {
+                const nextData = JSON.parse(document.querySelector('script#__NEXT_DATA__')?.textContent || 'null');
+                const raw = nextData?.props?.pageProps?.componentProps?.gdpClientCache;
+                if (raw) {
+                    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                    for (const key of Object.keys(parsed)) {
+                        const prop = parsed[key]?.property;
+                        if (!prop) continue;
+                        if (!out.price && prop.price) out.price = prop.price;
+                        if (!out.soldPrice && prop.lastSoldPrice) out.soldPrice = prop.lastSoldPrice;
+                        const sd = prop.dateSold || prop.lastSoldDate || prop.soldDate;
+                        if (sd && !out.soldOn) { const d = new Date(sd); if (!isNaN(d)) out.soldOn = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()}`; }
+                        const ld = prop.listedDate || prop.dateListed || prop.listingDate;
+                        if (ld && !out.listedForSale) { const d = new Date(ld); if (!isNaN(d)) out.listedForSale = `${d.getUTCMonth()+1}/${d.getUTCDate()}/${d.getUTCFullYear()} ($${prop.price || '?'})`; }
+                        const ai = prop.attributionInfo;
+                        if (ai) {
+                            if (!out.mls && (ai.mlsId || ai.mlsName)) out.mls = [ai.mlsId, ai.mlsName].filter(Boolean).join(' - ');
+                            if (!out.agentDetails) out.agentDetails = [ai.agentName, ai.brokerName, ai.agentPhoneNumber].filter(Boolean).join(' | ');
+                        }
+                        if (Array.isArray(prop.priceHistory) && prop.priceHistory.length > 0 && !out.priceHistoryText) {
+                            const fmtDate = (d) => {
+                                if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
+                                const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+                                return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
+                            };
+                            out.priceHistoryText = prop.priceHistory.map(h => {
+                                const priceTxt = typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || '');
+                                const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? ` (${(h.priceChangeRate*100).toFixed(1)}%)` : '';
+                                const source = h.source ? `Source: ${h.source}` : '';
+                                const ppsf = h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '';
+                                return [fmtDate(h.date), h.event, priceTxt + change, ppsf, source].filter(Boolean).join(' | ');
+                            }).join('\n');
+                            for (const h of prop.priceHistory) {
+                                const ev = String(h.event || '').toLowerCase();
+                                if (ev.includes('listed') && !out.listedForSale) out.listedForSale = `${fmtDate(h.date)} ($${h.price || '?'})`;
+                                if (ev.includes('sold') && !out.soldOn) out.soldOn = fmtDate(h.date);
+                            }
+                        }
+                        break;
+                    }
+                }
+            } catch (e) {}
+
+            return out;
+        });
+
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
         let domRows = [];
         try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
+
         if (!domRows.length) {
             await page.evaluate(() => {
                 const h = Array.from(document.querySelectorAll('h2,h3'))
@@ -773,6 +692,11 @@ async function scrapeOneUrl(browser, url, workerTag) {
             try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
         }
 
+        if (!domRows.length) {
+            try { domRows = await page.evaluate(fallbackHistoryParse); } catch (e) {}
+            if (domRows.length) console.log(`   🔁 [${tag}] Fallback history found: ${domRows.length} rows`);
+        }
+
         if (domRows.length) {
             data.priceHistoryText = domRows.map(r => {
                 const priceTxt = r.price + (r.change ? ` (${r.change})` : '');
@@ -780,18 +704,19 @@ async function scrapeOneUrl(browser, url, workerTag) {
             }).join('\n');
             for (const r of domRows) {
                 const ev = String(r.event || '').toLowerCase();
-                if (ev.includes('listed') && !data.listedForSale) data.listedForSale = `${r.date} (${r.price})`;
+                if (ev.includes('listed for sale') && !data.listedForSale) data.listedForSale = `${r.date} (${r.price})`;
                 if (ev.includes('sold') && !data.soldOn) data.soldOn = r.date;
             }
             if (!data.mls) {
                 for (const r of domRows) {
-                    const m = String(r.source || '').match(/Source:\s*(.+?)\s*#\s*([A-Za-z0-9-]+)/i);
-                    if (m) { data.mls = `${m[2].trim()} - ${m[1].trim()}`; break; }
+                    const m = String(r.source || '').match(/Source:\s*(.+?MLS)\s*#\s*([A-Za-z0-9-]+)/i);
+                    if (m) { data.mls = `${m[2].replace(/Originating.*$/i, '').trim()} - ${m[1].trim()}`; break; }
                 }
             }
-            console.log(`   📊 [${tag}] DOM history: ${domRows.length} row(s)`);
+            console.log(`   📊 [${tag}] History: ${domRows.length} row(s)`);
+            domRows.forEach(r => console.log(`       ${r.date} | ${r.event} | ${r.price}${r.change ? ' (' + r.change + ')' : ''}`));
         } else {
-            console.log(`   ⚠️ [${tag}] DOM history empty${data.priceHistoryText ? ' (__NEXT_DATA__ fallback OK)' : ''}`);
+            console.log(`   ⚠️ [${tag}] History: EMPTY${data.priceHistoryText ? ' (JSON fallback OK)' : ''}`);
         }
 
         if (!data.description || data.description === 'N/A') {
@@ -805,11 +730,29 @@ async function scrapeOneUrl(browser, url, workerTag) {
                     }
                     return "";
                 });
-                data.description = ldDesc || data.description || 'N/A';
+                data.description = ldDesc || 'N/A';
             } catch (e) { data.description = data.description || 'N/A'; }
         }
 
-        return { blocked: false, data, domRowsFound: domRows.length };
+        data.factsFeaturesText = "";
+        try {
+            data.factsFeaturesText = await page.evaluate(() => {
+                const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                const h = Array.from(document.querySelectorAll('h2,h3'))
+                    .find(x => /^Facts\s*&\s*[Ff]eatures$/i.test(clean(x.textContent)));
+                if (!h || !h.parentElement) return "";
+                const lines = [];
+                h.parentElement.querySelectorAll('*').forEach(el => {
+                    if (/^(P|LI|SPAN|DIV|H[1-6])$/i.test(el.tagName)) {
+                        const t = clean(el.textContent);
+                        if (t && t.length < 300 && !lines.includes(t)) lines.push(t);
+                    }
+                });
+                return lines.join('\n');
+            }) || "";
+        } catch (e) {}
+
+        return { blocked: false, data, tableFound, domRowsFound: domRows.length };
     } finally {
         if (page) await page.close().catch(() => {});
         await ctx.close().catch(() => {});
@@ -821,11 +764,11 @@ async function scrapeOneUrl(browser, url, workerTag) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Chrome Stealth Scraper | workers=${CONCURRENCY} | shard=${SHARD_INDEX + 1}/${SHARD_COUNT} | resource-block=${BLOCK_RESOURCES ? 'ON' : 'OFF'}`);
+    console.log(`🚀 Stealth Scraper V23 — full browser (JS/WebGL/ServiceWorkers enabled), resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF'}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
-            try { fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_more=${hasMore}\nblocked=${blocked}\n`); } catch (e) {}
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_more=${hasMore}\nblocked=${blocked}\n`);
         }
     };
 
@@ -839,19 +782,16 @@ async function runScraper() {
     await sheet.loadCells();
     console.log(`📊 Sheet: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
 
-    // Only shard 0 writes headers, to avoid parallel jobs racing on row 1
-    if (SHARD_INDEX === 0) {
-        try {
-            let hd = 0;
-            HEADERS.forEach((title, i) => {
-                const col = HEADER_START_COL + i;
-                if (col >= sheet.columnCount) return;
-                const cell = sheet.getCell(0, col);
-                if (OVERWRITE_HEADERS || !cell.value) { cell.value = title; try { cell.textFormat = { bold: true }; } catch (e) {} hd++; }
-            });
-            if (hd) await saveWithRetry(sheet);
-        } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
-    }
+    try {
+        let hd = 0;
+        HEADERS.forEach((title, i) => {
+            const col = HEADER_START_COL + i;
+            if (col >= sheet.columnCount) return;
+            const cell = sheet.getCell(0, col);
+            if (OVERWRITE_HEADERS || !cell.value) { cell.value = title; try { cell.textFormat = { bold: true }; } catch (e) {} hd++; }
+        });
+        if (hd) await saveWithRetry(sheet);
+    } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
 
     const queue = [];
     const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
@@ -898,11 +838,12 @@ async function runScraper() {
     const flush = () => (flushChain = flushChain.then(doFlush));
 
     let claimed = 0, success = 0, blockStreak = 0, errorStreak = 0;
-    let totalBlocks = 0, totalErrors = 0, totalWithHistory = 0;
+    let totalBlocks = 0, totalErrors = 0;
+    let totalWithHistory = 0, totalWithTableFound = 0;
     let cursor = -1;
     let stop = false, blockedExit = false;
+    const inflight = new Map();
 
-    // Synchronous claim: JS is single-threaded, so two workers can never get the same row
     const claimRow = () => {
         const r = findNextRow(sheet, cursor, claimed === 0 && RETRY_BLOCKED);
         if (r !== -1) cursor = r;
@@ -910,13 +851,9 @@ async function runScraper() {
     };
 
     async function worker(id) {
-        const wtag = `W${id}`;
         let browser = null, used = 0;
         try {
-            // Stagger worker start so N browsers don't hit Zillow in the same instant
-            await delay((id - 1) * jitter(1500, 3000));
-
-            while (!stop && !SHUTDOWN_REQUESTED) {
+            while (!stop) {
                 if (Date.now() - startTime >= MAX_RUNTIME_MS) break;
                 if (claimed >= MAX_URLS_PER_RUN) break;
                 if (errorStreak >= MAX_CONSECUTIVE_ERRORS) { stop = true; break; }
@@ -926,7 +863,7 @@ async function runScraper() {
                 claimed++;
                 const url = String(safeValue(sheet, rowIndex, 0));
                 const actualRow = rowIndex + 1;
-                console.log(`🕵️ [${wtag}] Row ${actualRow} (${claimed}/${MAX_URLS_PER_RUN}): ${url}`);
+                console.log(`🕵️ [W${id}] Row ${actualRow} (${claimed}/${MAX_URLS_PER_RUN}): ${url}`);
 
                 let recycle = false;
                 try {
@@ -937,34 +874,38 @@ async function runScraper() {
                     }
                     used++;
 
-                    const result = await scrapeOneUrl(browser, url, wtag);
+                    const key = urlKey(url);
+                    if (!inflight.has(key)) inflight.set(key, scrapeOneUrl(browser, url));
+                    const result = await inflight.get(key);
 
                     if (result.blocked) {
-                        console.log(`❌ [${wtag}] BLOCKED on Row ${actualRow}`);
+                        console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}`);
                         queue.push({ row: rowIndex, status: result.blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)" });
                         blockStreak++; errorStreak = 0; totalBlocks++;
                         recycle = true;
                         if (blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS) { stop = true; blockedExit = true; }
                     } else {
                         const d = result.data;
+                        if (result.tableFound) totalWithTableFound++;
                         if (d.priceHistoryText) totalWithHistory++;
 
                         if (!(d.price || d.fullAddress || d.description)) {
-                            console.log(`⚠️ [${wtag}] Empty parse Row ${actualRow}`);
+                            console.log(`⚠️ [W${id}] Empty parse on Row ${actualRow}`);
                             queue.push({ row: rowIndex, status: "⚠️ Empty parse (skipped)" });
                             errorStreak++; totalErrors++;
                         } else {
                             queue.push({ row: rowIndex, status: "✅ Done", d });
                             success++; blockStreak = 0; errorStreak = 0;
-                            const histCount = d.priceHistoryText ? d.priceHistoryText.split('\n').length : 0;
-                            console.log(`✔️ [${wtag}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${histCount} | 🏷️ ${d.mls || '—'}`);
+                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${d.priceHistoryText ? d.priceHistoryText.split('\n').length : 'NO'} | 🏷️ ${d.mls || '—'}`);
                         }
                     }
                 } catch (e) {
-                    console.error(`🛑 [${wtag}] Error Row ${actualRow}: ${e.message}`);
+                    console.error(`🛑 [W${id}] Error on Row ${actualRow}: ${e.message}`);
                     queue.push({ row: rowIndex, status: "🛑 Error: " + String(e.message).slice(0, 100) });
                     errorStreak++; totalErrors++;
                     recycle = true;
+                } finally {
+                    inflight.delete(urlKey(url));
                 }
 
                 if (recycle) { await closeBrowser(browser); browser = null; }
@@ -975,23 +916,16 @@ async function runScraper() {
         }
     }
 
-    console.log(`🚦 Starting ${CONCURRENCY} Chrome worker(s)`);
     await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1)));
     await flush();
 
     console.log(`\n📊 ─── RUN TOTALS ───`);
     console.log(`✅ Success: ${success} | 🚫 Blocked: ${totalBlocks} | 🛑 Errors: ${totalErrors}`);
-    console.log(`📊 Rows with price history: ${totalWithHistory}`);
+    console.log(`📊 Rows with history: ${totalWithHistory} | 📊 Table-mounted rows: ${totalWithTableFound}`);
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
-    if (SHUTDOWN_REQUESTED) {
-        console.log(`🛑 Run was cancelled — has_more=false blocked=false so workflow stops.`);
-        setOutput(false, false);
-        return;
-    }
-
     if (blockedExit) {
-        console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — exiting.`);
+        console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — exiting so GitHub starts a new batch.`);
         setOutput(true, true);
         return;
     }
@@ -999,15 +933,7 @@ async function runScraper() {
     const remaining = RETRY_BLOCKED ? findNextRow(sheet, cursor, true) : findNextRow(sheet, -1, false);
     const hasMore = remaining !== -1;
     setOutput(hasMore, false);
-    console.log(hasMore ? `🔄 More rows — resume at row ${remaining + 1}.` : "🎉 Sheet fully processed!");
+    console.log(hasMore ? `🔄 More rows remain — next run resumes at row ${remaining + 1}.` : "🎉 Sheet fully processed!");
 }
 
-runScraper()
-    .then(() => {
-        console.log('👋 Script finished.');
-        process.exit(0);
-    })
-    .catch(err => {
-        console.error("💥 Fatal:", err);
-        process.exit(SHUTDOWN_REQUESTED ? 0 : 1);
-    });
+runScraper().then(() => process.exit(0)).catch(err => { console.error("💥 Fatal:", err); process.exit(1); });

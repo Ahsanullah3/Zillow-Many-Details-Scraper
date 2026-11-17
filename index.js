@@ -1,27 +1,32 @@
 // =========================================================
-// ZILLOW SCRAPER — COMPLETE PRODUCTION SCRIPT
-// Multi-browser (Chrome + Edge + Firefox) | 34-col sheet output
-// Price history: looped "Show more" + hardened parser + GraphQL fallback
-// Graceful cancel on SIGTERM/SIGINT (GitHub Actions Cancel button)
+// ZILLOW SCRAPER — CHROME-ONLY, STEALTH, PARALLEL WORKERS
+// - puppeteer-extra + stealth plugin (restored)
+// - N parallel Chrome workers, each claims a DIFFERENT row
+// - Optional SHARD_INDEX / SHARD_COUNT to split rows across
+//   multiple GitHub Actions jobs running at the same time
+// - Price history: zoom trick + Table view + expanders + looped
+//   "Show more" (no GraphQL fallback — it triggered blocks)
+// - Graceful cancel on SIGTERM/SIGINT/SIGHUP
 // =========================================================
 
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
-const puppeteer = require('puppeteer');
-const puppeteerCore = require('puppeteer-core');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+puppeteer.use(StealthPlugin());
+
 // =========================================================
-// GRACEFUL CANCEL — fires on SIGTERM (Actions cancel) / SIGINT (Ctrl+C)
+// GRACEFUL CANCEL
 // =========================================================
 let SHUTDOWN_REQUESTED = false;
 const shutdown = (signal) => {
     if (SHUTDOWN_REQUESTED) return;
     SHUTDOWN_REQUESTED = true;
     console.log(`\n🛑 Received ${signal} — shutting down cleanly...`);
-    // Hard-exit fallback after 8s in case a browser launch/flush hangs
     setTimeout(() => {
         console.log('💥 Forcing exit after 8s grace period');
         process.exit(0);
@@ -34,14 +39,19 @@ process.on('SIGHUP',  () => shutdown('SIGHUP'));
 // =========================================================
 // CONFIG
 // =========================================================
-const CONCURRENCY = Number(process.env.CONCURRENCY || '3');
+const CONCURRENCY = Number(process.env.CONCURRENCY || '5');          // parallel Chrome workers per job
 const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
-const FLUSH_EVERY = Number(process.env.FLUSH_EVERY || '3');
+const FLUSH_EVERY = Number(process.env.FLUSH_EVERY || '5');
 const REQUIRED_COLS = 34;
 const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '6');
 const MAX_CONSECUTIVE_ERRORS = 6;
 const MAX_RUNTIME_MS = Number(process.env.MAX_RUNTIME_MS || 60 * 60 * 1000);
 const RECYCLE_BROWSER_EVERY = Number(process.env.RECYCLE_BROWSER_EVERY || '10');
+
+// ---- Sharding: run several Actions jobs at once, each on different rows ----
+// Job k of N processes only rows where (rowIndex % N) === k
+const SHARD_COUNT = Math.max(1, Number(process.env.SHARD_COUNT || '1'));
+const SHARD_INDEX = Number(process.env.SHARD_INDEX || '0');
 
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED !== '0';
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse/i.test(String(st || ''));
@@ -50,14 +60,22 @@ const isDoneStatus = (st) => /✅/.test(String(st || ''));
 const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES !== '0';
 console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF'}`);
 
-const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '1');
+const PAGE_ZOOM = Number(process.env.PAGE_ZOOM || '0.05');
 const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
 const VIEWPORT_H = Number(process.env.VIEWPORT_H || '900');
 
 const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '100');
 const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '500');
-const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '12000');
-const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '600');
+const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '10000');
+const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '500');
+const ZOOM_SETTLE_MS = Number(process.env.ZOOM_SETTLE_MS || '1200');
+const HEADING_SETTLE_MS = Number(process.env.HEADING_SETTLE_MS || '1500');
+const TABLE_VIEW_SETTLE_MS = Number(process.env.TABLE_VIEW_SETTLE_MS || '1000');
+const TABLE_WAIT_MS = Number(process.env.TABLE_WAIT_MS || '15000');
+const CLICK_EXPAND_SETTLE_MS = Number(process.env.CLICK_EXPAND_SETTLE_MS || '1000');
+const SCROLL_WRAPPER_SETTLE_MS = Number(process.env.SCROLL_WRAPPER_SETTLE_MS || '1000');
+const RETRY_SCROLL_SETTLE_MS = Number(process.env.RETRY_SCROLL_SETTLE_MS || '2000');
+const RETRY_WAIT_MS = Number(process.env.RETRY_WAIT_MS || '5000');
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -75,107 +93,47 @@ const safeCell = (v) => {
     return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…[truncated]" : s;
 };
 
-const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch|datagrail|consentjs|pubnub/i;
+// (reverted to the original list — datagrail/consentjs/pubnub are no longer blocked)
+const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 const jitter = (min, max) => min + Math.floor(Math.random() * (max - min));
 
 // =========================================================
-// BROWSER LAUNCHERS (Chrome / Edge / Firefox)
+// BROWSER (Chrome only)
 // =========================================================
-function findEdgeExecutable() {
-    const candidates = [
-        process.env.EDGE_PATH,
-        '/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable',
-        '/opt/microsoft/msedge/msedge',
-        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-        'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-        'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    ].filter(Boolean);
-    for (const p of candidates) { try { if (fs.existsSync(p)) return p; } catch (e) {} }
-    return null;
-}
-
-function findFirefoxExecutable() {
-    const candidates = [
-        process.env.FIREFOX_PATH,
-        '/usr/bin/firefox', '/usr/bin/firefox-esr', '/snap/bin/firefox',
-        '/opt/firefox/firefox',
-        '/Applications/Firefox.app/Contents/MacOS/firefox',
-        'C:\\Program Files\\Mozilla Firefox\\firefox.exe',
-    ].filter(Boolean);
-    for (const p of candidates) { try { if (fs.existsSync(p)) return p; } catch (e) {} }
-    return null;
-}
-
-const COMMON_ARGS = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-blink-features=AutomationControlled',
-    `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
-    '--enable-javascript',
-    '--enable-webgl',
-];
-
-async function launchChrome() {
+async function launchBrowser() {
     const userDataDir = path.join(os.tmpdir(), `zl-chrome-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
+        '--enable-javascript',
+        '--enable-webgl',
+        '--enable-webgl2',
+        '--enable-accelerated-2d-canvas',
+        '--ignore-gpu-blocklist',
+        '--enable-gpu-rasterization',
+        '--enable-zero-copy',
+        '--enable-canvas-2d-layers',
+        '--enable-native-gpu-memory-buffers',
+        '--autoplay-policy=no-user-gesture-required',
+        '--enable-webrtc',
+        '--enable-websockets',
+        '--enable-dns-prefetch',
+        '--enable-quic',
+    ];
     const browser = await puppeteer.launch({
         headless: "new",
         userDataDir,
-        args: COMMON_ARGS,
+        args,
         ignoreDefaultArgs: ['--disable-gpu'],
     });
     browser.__userDataDir = userDataDir;
-    browser.__engine = 'chrome';
     return browser;
-}
-
-async function launchEdge() {
-    const edgePath = findEdgeExecutable();
-    if (!edgePath) { console.warn('⚠️ Edge not found — skipping'); return null; }
-    const userDataDir = path.join(os.tmpdir(), `zl-edge-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    try {
-        const browser = await puppeteerCore.launch({
-            executablePath: edgePath,
-            headless: "new",
-            userDataDir,
-            args: COMMON_ARGS,
-            ignoreDefaultArgs: ['--disable-gpu'],
-        });
-        browser.__userDataDir = userDataDir;
-        browser.__engine = 'edge';
-        return browser;
-    } catch (e) { console.warn(`⚠️ Edge failed: ${e.message}`); return null; }
-}
-
-async function launchFirefox() {
-    const firefoxPath = findFirefoxExecutable();
-    if (!firefoxPath) { console.warn('⚠️ Firefox not found — skipping'); return null; }
-    const userDataDir = path.join(os.tmpdir(), `zl-ff-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    try {
-        const browser = await puppeteerCore.launch({
-            browser: 'firefox',
-            executablePath: firefoxPath,
-            headless: "new",
-            userDataDir,
-            args: [`--width=${VIEWPORT_W}`, `--height=${VIEWPORT_H}`],
-            extraPrefsFirefox: {
-                'dom.webdriver.enabled': false,
-                'useAutomationExtension': false,
-            },
-        });
-        browser.__userDataDir = userDataDir;
-        browser.__engine = 'firefox';
-        return browser;
-    } catch (e) { console.warn(`⚠️ Firefox failed: ${e.message}`); return null; }
-}
-
-async function launchBrowserFor(engine) {
-    if (engine === 'chrome')  return launchChrome();
-    if (engine === 'edge')    return launchEdge();
-    if (engine === 'firefox') return launchFirefox();
-    throw new Error(`Unknown engine: ${engine}`);
 }
 
 async function closeBrowser(browser) {
@@ -191,7 +149,7 @@ async function newContext(browser) {
 }
 
 // =========================================================
-// GOOGLE SHEETS RETRY
+// GOOGLE SHEETS HELPERS
 // =========================================================
 async function saveWithRetry(sheet, retries = 4) {
     for (let i = 0; i < retries; i++) {
@@ -212,6 +170,7 @@ function safeValue(sheet, row, col) {
 
 function findNextRow(sheet, afterRow, includeSkipped) {
     for (let r = afterRow + 1; r < sheet.rowCount; r++) {
+        if (SHARD_COUNT > 1 && (r % SHARD_COUNT) !== SHARD_INDEX) continue;
         const url = safeValue(sheet, r, 0);
         if (!url || !url.includes("zillow.com")) continue;
         const status = safeValue(sheet, r, 17);
@@ -222,16 +181,13 @@ function findNextRow(sheet, afterRow, includeSkipped) {
     return -1;
 }
 
-const extractZpid = (u) => { const m = String(u).match(/(\d+)_zpid/); return m ? m[1] : null; };
-
 // =========================================================
-// IN-PAGE: PRICE HISTORY PARSER (label-first, span-merge)
+// IN-PAGE: PRICE HISTORY PARSER
 // =========================================================
 function parseHistoryRowsInPage() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const isHistoryTable = (t) => {
-        const hs = Array.from(t.querySelectorAll('th'))
-            .map(x => clean(x.textContent).toLowerCase());
+        const hs = Array.from(t.querySelectorAll('th')).map(x => clean(x.textContent).toLowerCase());
         return hs.includes('date') && hs.includes('event') && hs.includes('price');
     };
 
@@ -253,7 +209,6 @@ function parseHistoryRowsInPage() {
         const tr = dataRows[i];
         if (!isDataRow(tr)) continue;
 
-        // PRIMARY: label attribute
         const label = tr.getAttribute('label') || '';
         let lblDate = '', lblEvent = '', lblPrice = '';
         const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
@@ -263,7 +218,6 @@ function parseHistoryRowsInPage() {
             lblPrice = clean(lm[3]);
         }
 
-        // SECONDARY: child spans
         const dateEl = tr.querySelector('[data-testid="date-info"]');
         const date = clean(dateEl?.textContent) || lblDate;
 
@@ -289,7 +243,6 @@ function parseHistoryRowsInPage() {
             if (cm) change = cm[1];
         }
 
-        // Source row = next non-data row
         let source = '';
         for (let j = i + 1; j < dataRows.length; j++) {
             const nxt = dataRows[j];
@@ -309,23 +262,128 @@ function parseHistoryRowsInPage() {
 }
 
 // =========================================================
-// MOUNT PRICE HISTORY + LOOP CLICK "SHOW MORE"
+// MOUNT PRICE HISTORY (zoom + Table view + expanders) THEN LOOP "SHOW MORE"
 // =========================================================
-async function ensureHistoryMounted(page, tag) {
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-    await delay(1200);
+const IN_PAGE_HAS_TABLE = () => {
+    const tables = document.querySelectorAll('table');
+    return Array.from(tables).some(t => {
+        const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
+        return hs.includes('date') && hs.includes('event') && hs.includes('price');
+    });
+};
 
+async function waitForHistoryTable(page, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (SHUTDOWN_REQUESTED) return false;
+        const ok = await page.evaluate(IN_PAGE_HAS_TABLE).catch(() => false);
+        if (ok) return true;
+        await delay(500);
+    }
+    return false;
+}
+
+async function ensureHistoryMounted(page, tag) {
+    // Step 0: expand collapsed sections
+    try {
+        const n = await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll(
+                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
+            ));
+            let clicked = 0;
+            for (const btn of buttons) {
+                const txt = (btn.textContent || '').trim().toLowerCase();
+                if (txt.includes('see more') || txt.includes('show more') || txt.includes('view more') || txt === 'more') {
+                    try { btn.click(); clicked++; } catch (e) {}
+                }
+            }
+            return clicked;
+        });
+        if (n > 0) console.log(`   🔽 [${tag}] Expanded ${n} collapsed section(s)`);
+    } catch (e) {}
+    await delay(CLICK_EXPAND_SETTLE_MS);
+
+    // Step 1: zoom out + scroll to bottom so lazy sections mount
+    try {
+        await page.evaluate((z) => {
+            document.documentElement.style.zoom = String(z);
+            if (document.body) document.body.style.zoom = String(z);
+            window.scrollTo(0, document.body.scrollHeight);
+        }, PAGE_ZOOM);
+    } catch (e) {}
+    await delay(ZOOM_SETTLE_MS);
+
+    // Step 2: scroll to Price history heading
     await page.evaluate(() => {
         const h = Array.from(document.querySelectorAll('h2,h3'))
             .find(x => /price\s*history/i.test(x.textContent || ''));
         if (h) h.scrollIntoView({ block: 'center', behavior: 'instant' });
     }).catch(() => {});
-    await delay(1500);
+    await delay(HEADING_SETTLE_MS);
 
+    // Step 3: click "Table view"
+    await page.evaluate(() => {
+        const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
+            .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
+        if (tv) tv.click();
+    }).catch(() => {});
+    await delay(TABLE_VIEW_SETTLE_MS);
+
+    // Step 4: is the table there?
+    let tableFound = await page.evaluate(IN_PAGE_HAS_TABLE).catch(() => false);
+
+    // Step 5: click heading + scroll wrapper
+    if (!tableFound) {
+        await page.evaluate(() => {
+            const h = Array.from(document.querySelectorAll('h2,h3'))
+                .find(x => /price\s*history/i.test(x.textContent || ''));
+            if (h) {
+                h.click();
+                const parent = h.closest('[role="button"], button, details, summary, [data-testid*="card"]');
+                if (parent) try { parent.click(); } catch (e) {}
+            }
+        }).catch(() => {});
+        await delay(CLICK_EXPAND_SETTLE_MS);
+        await page.evaluate(() => {
+            const tbl = document.querySelector('table');
+            if (tbl) { tbl.scrollIntoView({ block: 'center', behavior: 'instant' }); return; }
+            const wrap = document.querySelector('[data-c11n-component="Table.Responsive"]');
+            if (wrap) wrap.scrollIntoView({ block: 'center', behavior: 'instant' });
+        }).catch(() => {});
+        await delay(SCROLL_WRAPPER_SETTLE_MS);
+    }
+
+    // Step 6: wait for table
+    if (!tableFound) tableFound = await waitForHistoryTable(page, TABLE_WAIT_MS);
+
+    // Step 7: second chance
+    if (!tableFound && !SHUTDOWN_REQUESTED) {
+        await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll(
+                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
+            ));
+            for (const btn of buttons) {
+                const txt = (btn.textContent || '').trim().toLowerCase();
+                if (txt.includes('see more') || txt.includes('show more')) { try { btn.click(); } catch (e) {} }
+            }
+            const h = Array.from(document.querySelectorAll('h2,h3'))
+                .find(x => /price\s*history/i.test(x.textContent || ''));
+            if (h) h.scrollIntoView({ block: 'center' });
+        }).catch(() => {});
+        await delay(RETRY_SCROLL_SETTLE_MS);
+        tableFound = await waitForHistoryTable(page, RETRY_WAIT_MS);
+    }
+
+    if (!tableFound) {
+        console.log(`   ❌ [${tag}] History table NOT mounted`);
+        return false;
+    }
+    console.log(`   📊 [${tag}] History table mounted ✅`);
+
+    // Step 8: loop "Show more" inside the history table
     const getRowCount = () => page.evaluate(() => {
         const t = Array.from(document.querySelectorAll('table')).find(t => {
-            const hs = Array.from(t.querySelectorAll('th'))
-                .map(x => (x.textContent || '').trim().toLowerCase());
+            const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
             return hs.includes('date') && hs.includes('event') && hs.includes('price');
         });
         if (!t) return -1;
@@ -335,27 +393,12 @@ async function ensureHistoryMounted(page, tag) {
         ).length;
     }).catch(() => -1);
 
-    let mounted = false;
-    const mountDeadline = Date.now() + 12000;
-    while (Date.now() < mountDeadline) {
-        if (SHUTDOWN_REQUESTED) return 0;
-        const c = await getRowCount();
-        if (c >= 0) { mounted = true; break; }
-        await delay(500);
-    }
-    if (!mounted) { console.log(`   ❌ [${tag}] History table NOT mounted after 12s`); return 0; }
-
     let totalClicked = 0;
     let prevCount = await getRowCount();
-    const maxIter = 15;
-
-    for (let iter = 0; iter < maxIter; iter++) {
+    for (let iter = 0; iter < 15; iter++) {
         if (SHUTDOWN_REQUESTED) break;
-
         const clicked = await page.evaluate(() => {
-            const btns = Array.from(document.querySelectorAll(
-                'tfoot[data-testid="table-see-more"] button'
-            ));
+            const btns = Array.from(document.querySelectorAll('tfoot[data-testid="table-see-more"] button'));
             let n = 0;
             for (const btn of btns) {
                 const txt = (btn.textContent || '').trim().toLowerCase();
@@ -365,7 +408,6 @@ async function ensureHistoryMounted(page, tag) {
             }
             return n;
         }).catch(() => 0);
-
         if (clicked === 0) break;
         totalClicked += clicked;
 
@@ -373,48 +415,19 @@ async function ensureHistoryMounted(page, tag) {
         let grew = false;
         while (Date.now() < waitDeadline) {
             if (SHUTDOWN_REQUESTED) break;
-            await delay(300);
+            await delay(300 + jitter(0, 200));
             const c = await getRowCount();
             if (c > prevCount) { grew = true; prevCount = c; break; }
         }
         if (!grew) break;
+        await delay(jitter(200, 600));
     }
-
     console.log(`   🔽 [${tag}] Show more: ${totalClicked} click(s), ${prevCount} rows total`);
-    return totalClicked;
+    return true;
 }
 
 // =========================================================
-// GRAPHQL FALLBACK
-// =========================================================
-async function fetchPriceHistoryFromGraphQL(page, zpid) {
-    if (!zpid) return null;
-    try {
-        return await page.evaluate(async (zpidNum) => {
-            const query = `query GetPriceHistory($zpid: ID!) {
-                property(zpid: $zpid) {
-                    priceHistory { date event price priceChangeRate pricePerSquareFoot source }
-                }
-            }`;
-            try {
-                const resp = await fetch('https://www.zillow.com/graphql/', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'client-id': 'PricingTable' },
-                    body: JSON.stringify({
-                        operationName: 'GetPriceHistory',
-                        query, variables: { zpid: zpidNum },
-                    }),
-                    credentials: 'include',
-                });
-                if (!resp.ok) return { error: `HTTP ${resp.status}` };
-                return await resp.json();
-            } catch (e) { return { error: e.message }; }
-        }, String(zpid));
-    } catch (e) { return { error: e.message }; }
-}
-
-// =========================================================
-// IN-PAGE: MAIN DATA EXTRACTOR (all 34 fields)
+// IN-PAGE: MAIN DATA EXTRACTOR
 // =========================================================
 function extractMainDataInPage() {
     const out = {
@@ -433,19 +446,16 @@ function extractMainDataInPage() {
     };
     const $ = (sel, root = document) => root.querySelector(sel);
     const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
-
     const metaGet = (p) => document.querySelector(`meta[property="${p}"]`)?.content || '';
 
     out.canonicalUrl = $('meta[property="og:url"]')?.content || $('link[rel="canonical"]')?.href || location.href;
     out.price = num(clean($('[data-testid="price"]')?.textContent));
 
-    // Sold price
     const pill = clean($('[data-testid="gallery-status-pill"]')?.textContent);
     const soldMatch = pill.match(/Sold\s+for\s+\$([\d,]+)/i);
     if (soldMatch) out.soldPrice = Number(soldMatch[1].replace(/,/g, ''));
     else if (/sold/i.test(pill) && out.price) out.soldPrice = out.price;
 
-    // Address from h1
     const h1 = clean($('h1')?.textContent).replace(/\u00A0/g, ' ');
     if (h1) {
         const parts = h1.split(',').map(clean);
@@ -457,7 +467,6 @@ function extractMainDataInPage() {
         }
     }
 
-    // Beds/baths/sqft
     const factMap = {};
     $$('[data-testid="bed-bath-sqft-fact-container"]').forEach(c => {
         const sp = c.querySelectorAll('span');
@@ -467,7 +476,6 @@ function extractMainDataInPage() {
     if (factMap.baths) out.baths = num(factMap.baths) || factMap.baths;
     if (factMap.sqft)  out.sqft  = num(factMap.sqft)  || factMap.sqft;
 
-    // At-a-glance
     const glance = $('[aria-label="At a glance facts"]');
     if (glance) {
         for (const item of glance.querySelectorAll('[role="listitem"]')) {
@@ -483,7 +491,6 @@ function extractMainDataInPage() {
         }
     }
 
-    // Facts & features fact-category
     const fm = {};
     $$('[data-testid="fact-category"] li').forEach(li => {
         const t = clean(li.textContent);
@@ -499,11 +506,9 @@ function extractMainDataInPage() {
         else out.hoa = 'No / None listed';
     }
 
-    // Description
     const descEl = $('[data-testid="description"] article') || $('[data-testid="description"]');
     if (descEl) out.description = clean(descEl.textContent) || 'N/A';
 
-    // Agent
     const la = $('[data-testid="attribution-LISTING_AGENT"]');
     if (la) {
         const parts = Array.from(la.querySelectorAll('span')).map(x => clean(x.textContent).replace(/,$/, '')).filter(Boolean);
@@ -511,7 +516,6 @@ function extractMainDataInPage() {
         out.agentDetails = [parts[0], broker, parts[1]].filter(Boolean).join(' | ');
     }
 
-    // MLS
     const mlsInfo = clean($('[role="contentinfo"][aria-label="MLS information"]')?.textContent);
     if (mlsInfo) {
         let m = mlsInfo.match(/Source:\s*(.+?),\s*MLS#:\s*([A-Za-z0-9-]+)/);
@@ -526,7 +530,6 @@ function extractMainDataInPage() {
         }
     }
 
-    // Page text (formatted)
     const formatPageText = () => {
         const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON','SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG','VIDEO','AUDIO','CANVAS','OBJECT','EMBED']);
         const SKIP_IDS = new Set(['pfs-nav-wrapper','page-header-container','sw-container','skip-topnav-target','__PFS_TOPNAV_DATA__','hdp-srp-split-page-frame-nav-styles','with-product-nav-styles','hdp-srp-split-no-search-layout-styles']);
@@ -579,7 +582,6 @@ function extractMainDataInPage() {
 
     out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
-    // Facts & Features section
     try {
         const h = Array.from(document.querySelectorAll('h2,h3'))
             .find(x => /^Facts\s*&\s*[Ff]eatures$/i.test(clean(x.textContent)));
@@ -595,7 +597,7 @@ function extractMainDataInPage() {
         }
     } catch (e) {}
 
-    // JSON __NEXT_DATA__ (if present — for-sale pages)
+    // JSON __NEXT_DATA__ (used as fallback source, incl. price history)
     try {
         const nextData = JSON.parse(document.querySelector('script#__NEXT_DATA__')?.textContent || 'null');
         const raw = nextData?.props?.pageProps?.componentProps?.gdpClientCache;
@@ -639,7 +641,6 @@ function extractMainDataInPage() {
         }
     } catch (e) {}
 
-    // Meta fallback for sparse pages
     if (!out.beds) { const b = metaGet('zillow_fb:beds'); if (b) out.beds = b; }
     if (!out.baths) { const b = metaGet('zillow_fb:baths'); if (b) out.baths = b; }
     if ((!out.description || out.description === 'N/A')) {
@@ -652,10 +653,10 @@ function extractMainDataInPage() {
 }
 
 // =========================================================
-// SCRAPE ONE URL (3-layer price-history fallback)
+// SCRAPE ONE URL
 // =========================================================
-async function scrapeOneUrl(browser, url) {
-    const tag = `${browser.__engine || '?'}:${String(url).slice(-22)}`;
+async function scrapeOneUrl(browser, url, workerTag) {
+    const tag = `${workerTag}:${String(url).slice(-22)}`;
     const ctx = await newContext(browser);
     let page;
     try {
@@ -687,57 +688,45 @@ async function scrapeOneUrl(browser, url) {
         } catch (e) {}
 
         await delay(jitter(NAV_DELAY_MIN, NAV_DELAY_MAX));
-        await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
 
         await page.waitForSelector(
-            '[data-testid="price"], [data-testid="description"], h1, h2',
+            '[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"]',
             { timeout: HYDRATE_TIMEOUT }
         ).catch(() => {});
         await delay(HYDRATE_SETTLE);
 
-        // ---- Content-aware blocked detection ----
+        // ---- Blocked detection (captcha-safe) ----
         const title = await page.title();
         const probe = await page.evaluate(() => ({
             hasNext: !!document.querySelector('script#__NEXT_DATA__'),
             hasPrice: !!document.querySelector('[data-testid="price"]'),
             hasH1: !!document.querySelector('h1'),
-            hasHistoryHeading: Array.from(document.querySelectorAll('h2,h3'))
-                .some(h => /price\s*history/i.test(h.textContent || '')),
-            hasAnyTable: !!document.querySelector('table'),
             bodyLen: (document.body?.innerText || '').length,
         }));
-        const blockedTitle = /pardon our interruption|robot check|access denied|unusual traffic/i.test(title);
-        const trulyBlocked = blockedTitle ||
-            (!probe.hasNext && !probe.hasPrice && !probe.hasH1 &&
-             !probe.hasHistoryHeading && !probe.hasAnyTable && probe.bodyLen < 500);
+        const blockedTitle = /pardon our interruption|robot check|access denied|access to this page has been denied|press\s*&\s*hold|unusual traffic|captcha/i.test(title);
+        // A real listing page always has __NEXT_DATA__ or a price/h1. Block pages have none.
+        const trulyBlocked = blockedTitle || (!probe.hasNext && !probe.hasPrice) || (!probe.hasH1 && probe.bodyLen < 500);
 
-        console.log(`   🔎 [${tag}] probe: next=${probe.hasNext} price=${probe.hasPrice} h1=${probe.hasH1} hist=${probe.hasHistoryHeading} bodyLen=${probe.bodyLen}`);
-
+        console.log(`   🔎 [${tag}] probe: next=${probe.hasNext} price=${probe.hasPrice} h1=${probe.hasH1} bodyLen=${probe.bodyLen}`);
         if (trulyBlocked) return { blocked: true, blockedTitle };
 
-        // ---- Main data ----
+        // ---- Mount price history, then extract everything ----
+        await ensureHistoryMounted(page, tag);
+
         const data = await page.evaluate(extractMainDataInPage);
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
-        // ===== PRICE HISTORY — 3-layer =====
-        await ensureHistoryMounted(page, tag);
-
         let domRows = [];
-        const histDeadline = Date.now() + 10000;
-        while (Date.now() < histDeadline && !SHUTDOWN_REQUESTED) {
-            try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
-            if (domRows.length > 0) break;
+        try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
+        if (!domRows.length) {
             await page.evaluate(() => {
                 const h = Array.from(document.querySelectorAll('h2,h3'))
                     .find(x => /price\s*history/i.test(x.textContent || ''));
                 if (h) h.scrollIntoView({ block: 'center' });
-                const btn = document.querySelector('tfoot[data-testid="table-see-more"] button');
-                if (btn) {
-                    const txt = (btn.textContent || '').trim().toLowerCase();
-                    if (/show\s*more/.test(txt)) try { btn.click(); } catch (e) {}
-                }
             }).catch(() => {});
-            await delay(1000);
+            await delay(1500);
+            try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
         }
 
         if (domRows.length) {
@@ -757,38 +746,8 @@ async function scrapeOneUrl(browser, url) {
                 }
             }
             console.log(`   📊 [${tag}] DOM history: ${domRows.length} row(s)`);
-        }
-
-        // Layer 3: GraphQL fallback
-        if (!data.priceHistoryText && !SHUTDOWN_REQUESTED) {
-            const zpid = extractZpid(url);
-            if (zpid) {
-                console.log(`   🔄 [${tag}] DOM empty — GraphQL zpid ${zpid}`);
-                const apiResult = await fetchPriceHistoryFromGraphQL(page, zpid);
-                const history = apiResult?.data?.property?.priceHistory;
-                if (Array.isArray(history) && history.length > 0) {
-                    const fmtDate = (d) => {
-                        if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
-                        const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
-                        return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
-                    };
-                    data.priceHistoryText = history.map(h => {
-                        const priceTxt = typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || '');
-                        const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? ` (${(h.priceChangeRate*100).toFixed(1)}%)` : '';
-                        const source = h.source ? `Source: ${h.source}` : '';
-                        const ppsf = h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '';
-                        return [fmtDate(h.date), h.event, priceTxt + change, ppsf, source].filter(Boolean).join(' | ');
-                    }).join('\n');
-                    for (const h of history) {
-                        const ev = String(h.event || '').toLowerCase();
-                        if (ev.includes('listed') && !data.listedForSale) data.listedForSale = `${fmtDate(h.date)} ($${h.price || '?'})`;
-                        if (ev.includes('sold') && !data.soldOn) data.soldOn = fmtDate(h.date);
-                    }
-                    console.log(`   ✅ [${tag}] GraphQL history: ${history.length} row(s)`);
-                } else {
-                    console.log(`   ⚠️ [${tag}] GraphQL also empty: ${JSON.stringify(apiResult).slice(0, 150)}`);
-                }
-            }
+        } else {
+            console.log(`   ⚠️ [${tag}] DOM history empty${data.priceHistoryText ? ' (__NEXT_DATA__ fallback OK)' : ''}`);
         }
 
         if (!data.description || data.description === 'N/A') {
@@ -802,8 +761,7 @@ async function scrapeOneUrl(browser, url) {
                     }
                     return "";
                 });
-                if (ldDesc) data.description = ldDesc;
-                else data.description = data.description || 'N/A';
+                data.description = ldDesc || data.description || 'N/A';
             } catch (e) { data.description = data.description || 'N/A'; }
         }
 
@@ -819,13 +777,11 @@ async function scrapeOneUrl(browser, url) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Multi-browser Scraper (Chrome+Edge+Firefox) | concurrency=${CONCURRENCY} | resource-block=${BLOCK_RESOURCES ? 'ON' : 'OFF'}`);
+    console.log(`🚀 Chrome Stealth Scraper | workers=${CONCURRENCY} | shard=${SHARD_INDEX + 1}/${SHARD_COUNT} | resource-block=${BLOCK_RESOURCES ? 'ON' : 'OFF'}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
-            try {
-                fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_more=${hasMore}\nblocked=${blocked}\n`);
-            } catch (e) {}
+            try { fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_more=${hasMore}\nblocked=${blocked}\n`); } catch (e) {}
         }
     };
 
@@ -839,16 +795,19 @@ async function runScraper() {
     await sheet.loadCells();
     console.log(`📊 Sheet: ${sheet.rowCount} rows × ${sheet.columnCount} cols`);
 
-    try {
-        let hd = 0;
-        HEADERS.forEach((title, i) => {
-            const col = HEADER_START_COL + i;
-            if (col >= sheet.columnCount) return;
-            const cell = sheet.getCell(0, col);
-            if (OVERWRITE_HEADERS || !cell.value) { cell.value = title; try { cell.textFormat = { bold: true }; } catch (e) {} hd++; }
-        });
-        if (hd) await saveWithRetry(sheet);
-    } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
+    // Only shard 0 writes headers, to avoid parallel jobs racing on row 1
+    if (SHARD_INDEX === 0) {
+        try {
+            let hd = 0;
+            HEADERS.forEach((title, i) => {
+                const col = HEADER_START_COL + i;
+                if (col >= sheet.columnCount) return;
+                const cell = sheet.getCell(0, col);
+                if (OVERWRITE_HEADERS || !cell.value) { cell.value = title; try { cell.textFormat = { bold: true }; } catch (e) {} hd++; }
+            });
+            if (hd) await saveWithRetry(sheet);
+        } catch (e) { console.warn(`⚠️ Headings: ${e.message}`); }
+    }
 
     const queue = [];
     const setCell = (r, c, v) => { if (c < sheet.columnCount) sheet.getCell(r, c).value = safeCell(v); };
@@ -895,20 +854,24 @@ async function runScraper() {
     const flush = () => (flushChain = flushChain.then(doFlush));
 
     let claimed = 0, success = 0, blockStreak = 0, errorStreak = 0;
-    let totalBlocks = 0, totalErrors = 0;
-    let totalWithHistory = 0;
+    let totalBlocks = 0, totalErrors = 0, totalWithHistory = 0;
     let cursor = -1;
     let stop = false, blockedExit = false;
 
+    // Synchronous claim: JS is single-threaded, so two workers can never get the same row
     const claimRow = () => {
         const r = findNextRow(sheet, cursor, claimed === 0 && RETRY_BLOCKED);
         if (r !== -1) cursor = r;
         return r;
     };
 
-    async function laneWorker(engine, id) {
+    async function worker(id) {
+        const wtag = `W${id}`;
         let browser = null, used = 0;
         try {
+            // Stagger worker start so N browsers don't hit Zillow in the same instant
+            await delay((id - 1) * jitter(1500, 3000));
+
             while (!stop && !SHUTDOWN_REQUESTED) {
                 if (Date.now() - startTime >= MAX_RUNTIME_MS) break;
                 if (claimed >= MAX_URLS_PER_RUN) break;
@@ -919,25 +882,21 @@ async function runScraper() {
                 claimed++;
                 const url = String(safeValue(sheet, rowIndex, 0));
                 const actualRow = rowIndex + 1;
-                console.log(`🕵️ [${engine}${id}] Row ${actualRow} (${claimed}/${MAX_URLS_PER_RUN}): ${url}`);
+                console.log(`🕵️ [${wtag}] Row ${actualRow} (${claimed}/${MAX_URLS_PER_RUN}): ${url}`);
 
                 let recycle = false;
                 try {
                     if (!browser || used >= RECYCLE_BROWSER_EVERY) {
                         await closeBrowser(browser);
-                        browser = await launchBrowserFor(engine);
+                        browser = await launchBrowser();
                         used = 0;
-                        if (!browser) {
-                            console.warn(`⚠️ [${engine}${id}] Browser unavailable — stopping lane`);
-                            return;
-                        }
                     }
                     used++;
 
-                    const result = await scrapeOneUrl(browser, url);
+                    const result = await scrapeOneUrl(browser, url, wtag);
 
                     if (result.blocked) {
-                        console.log(`❌ [${engine}${id}] BLOCKED on Row ${actualRow}`);
+                        console.log(`❌ [${wtag}] BLOCKED on Row ${actualRow}`);
                         queue.push({ row: rowIndex, status: result.blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)" });
                         blockStreak++; errorStreak = 0; totalBlocks++;
                         recycle = true;
@@ -947,18 +906,18 @@ async function runScraper() {
                         if (d.priceHistoryText) totalWithHistory++;
 
                         if (!(d.price || d.fullAddress || d.description)) {
-                            console.log(`⚠️ [${engine}${id}] Empty parse Row ${actualRow}`);
+                            console.log(`⚠️ [${wtag}] Empty parse Row ${actualRow}`);
                             queue.push({ row: rowIndex, status: "⚠️ Empty parse (skipped)" });
                             errorStreak++; totalErrors++;
                         } else {
                             queue.push({ row: rowIndex, status: "✅ Done", d });
                             success++; blockStreak = 0; errorStreak = 0;
                             const histCount = d.priceHistoryText ? d.priceHistoryText.split('\n').length : 0;
-                            console.log(`✔️ [${engine}${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${histCount} | 🏷️ ${d.mls || '—'}`);
+                            console.log(`✔️ [${wtag}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${histCount} | 🏷️ ${d.mls || '—'}`);
                         }
                     }
                 } catch (e) {
-                    console.error(`🛑 [${engine}${id}] Error Row ${actualRow}: ${e.message}`);
+                    console.error(`🛑 [${wtag}] Error Row ${actualRow}: ${e.message}`);
                     queue.push({ row: rowIndex, status: "🛑 Error: " + String(e.message).slice(0, 100) });
                     errorStreak++; totalErrors++;
                     recycle = true;
@@ -972,15 +931,8 @@ async function runScraper() {
         }
     }
 
-    // 3 lanes: Chrome, Edge, Firefox
-    const lanes = [
-        { engine: 'chrome',  id: 1 },
-        { engine: 'edge',    id: 1 },
-        { engine: 'firefox', id: 1 },
-    ];
-
-    console.log(`🚦 Starting ${lanes.length} lanes: ${lanes.map(l => l.engine).join(', ')}`);
-    await Promise.all(lanes.map(l => laneWorker(l.engine, l.id)));
+    console.log(`🚦 Starting ${CONCURRENCY} Chrome worker(s)`);
+    await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1)));
     await flush();
 
     console.log(`\n📊 ─── RUN TOTALS ───`);
@@ -988,9 +940,8 @@ async function runScraper() {
     console.log(`📊 Rows with price history: ${totalWithHistory}`);
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
-    // ---- CANCELLED: do NOT set has_more, do NOT trigger next batch ----
     if (SHUTDOWN_REQUESTED) {
-        console.log(`🛑 Run was cancelled — writing has_more=false blocked=false so workflow stops.`);
+        console.log(`🛑 Run was cancelled — has_more=false blocked=false so workflow stops.`);
         setOutput(false, false);
         return;
     }
@@ -1009,7 +960,6 @@ async function runScraper() {
 
 runScraper()
     .then(() => {
-        // Always exit 0 so Actions marks the job success (even on cancel)
         console.log('👋 Script finished.');
         process.exit(0);
     })

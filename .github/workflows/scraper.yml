@@ -28,7 +28,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MAX_BATCHES: '60'   # safety cap so a permanently blocked run can't loop forever
+  MAX_BATCHES: '60'       # safety cap so a permanently blocked run can't loop forever
+  MAX_SKIP_STREAK: '15'   # stop self-reboot if too many mandatory-section skips in a row
 
 jobs:
   scrape:
@@ -75,11 +76,14 @@ jobs:
           HEADFUL: '1'
           CHROME_PATH: /usr/bin/google-chrome
           CONCURRENCY: '1'
-          MAX_URLS_PER_RUN: '3000'
-          BLOCK_RESOURCES: '1'
-          INCLUDE_PAGE_TEXT: '0'
+          MAX_URLS_PER_RUN: '100'
+          BLOCK_RESOURCES: '0'          # CHANGED: resources load (images/fonts/CSS)
+          INCLUDE_PAGE_TEXT: '1'        # CHANGED: page text ON (matches script)
           RETRY_BLOCKED: '1'
           MAX_BLOCK_STREAK: '6'
+          MAX_SKIP_STREAK: '15'         # NEW: stop reboot on skip-heavy runs
+          FINANCIAL_WAIT_MS: '12000'    # NEW: mandatory-section wait
+          FINANCIAL_RELOAD_WAIT_MS: '15000'  # NEW: post-reload wait
           DEBUG_DUMP: ${{ inputs.debug_dump || '0' }}
 
       - name: Upload debug files

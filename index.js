@@ -11,14 +11,14 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const CONCURRENCY = Number(process.env.CONCURRENCY || '3');
+const CONCURRENCY = Number(process.env.CONCURRENCY || '2'); // ✅ lowered default for captcha safety
 const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
 const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
-const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '6');
+const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '4'); // ✅ lowered
 const MAX_CONSECUTIVE_ERRORS = 6;
 const MAX_RUNTIME_MS = 60 * 60 * 1000;
-const RECYCLE_BROWSER_EVERY = 10;
+const RECYCLE_BROWSER_EVERY = 8;
 
 const RETRY_BLOCKED = process.env.RETRY_BLOCKED !== '0';
 
@@ -26,23 +26,28 @@ const HEADFUL = process.env.HEADFUL === '1';
 const CHROME_PATH = process.env.CHROME_PATH || '';
 const CHROME_CHANNEL = process.env.CHROME_CHANNEL || '';
 
-// ✅ Resource blocking OFF by default — images/fonts/CSS must load so React hydrates fully
+// ✅ Resource blocking OFF — images/fonts/CSS must load for full hydration
 const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES === '1';
-// ✅ Page text ALWAYS captured (last column)
+// ✅ Page text ALWAYS captured
 const INCLUDE_PAGE_TEXT = true;
 const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';
 
 const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
 const VIEWPORT_H = Number(process.env.VIEWPORT_H || '900');
-const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '500');
-const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '2000');
-const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '12000');
-const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '800');
-const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20000');
-const HISTORY_FALLBACK_MS = Number(process.env.HISTORY_FALLBACK_MS || '8000');
+const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '800');
+const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '2500');
+const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '15000');
+const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '1000');
+const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '25000');
+const HISTORY_FALLBACK_MS = Number(process.env.HISTORY_FALLBACK_MS || '10000');
 const SHOW_MORE_SETTLE_MS = Number(process.env.SHOW_MORE_SETTLE_MS || '900');
-const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY || '350');
-const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || '400');
+const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY || '400');
+const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || '350');
+
+// ✅ Captcha solver config
+const CAPTCHA_HOLD_MS = Number(process.env.CAPTCHA_HOLD_MS || '12000');
+const WARMUP_URL = process.env.WARMUP_URL || 'https://www.zillow.com/';
+const WARMUP_SETTLE = Number(process.env.WARMUP_SETTLE || '4000');
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -53,9 +58,9 @@ const HEADERS = [
 ];
 const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
-console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF (all resources load)'} | headful: ${HEADFUL} | pageText: ${INCLUDE_PAGE_TEXT ? 'ON' : 'OFF'}`);
+console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF'} | headful: ${HEADFUL} | pageText: ON | warmup: ${WARMUP_URL}`);
 
-const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history/i.test(String(st || ''));
+const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history|captcha/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
@@ -72,6 +77,144 @@ const safeCell = (v, limit = MAX_CELL_LEN) => {
 const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
 
 // =========================================================
+// ✅ CAPTCHA DETECTION & SOLVER
+// =========================================================
+async function detectCaptcha(page) {
+    return page.evaluate(() => {
+        // Primary: px-captcha container
+        if (document.querySelector('.px-captcha-container')) return 'press-hold';
+        // Secondary: iframe with human verification title
+        const iframe = document.querySelector('iframe[title*="Human verification" i], iframe[title*="captcha" i]');
+        if (iframe) return 'iframe';
+        // Tertiary: text content
+        const bodyText = document.body ? document.body.textContent : '';
+        if (/Press\s*&\s*Hold|confirm you are a human|not a bot/i.test(bodyText)) return 'text';
+        // Fourth: reference ID pattern
+        if (document.querySelector('.px-captcha-refid')) return 'refid';
+        return null;
+    }).catch(() => null);
+}
+
+async function solvePressAndHold(page, tag) {
+    const captchaType = await detectCaptcha(page);
+    if (!captchaType) return true; // no captcha
+
+    console.log(`   🧩 [${tag}] Captcha detected (${captchaType}) — attempting Press & Hold solve`);
+
+    try {
+        // Strategy 1: Find the iframe and click-hold inside it
+        const iframeHandle = await page.$('iframe[title*="Human verification" i], iframe[title*="captcha" i], #px-captcha iframe').catch(() => null);
+
+        if (iframeHandle) {
+            const frame = await iframeHandle.contentFrame().catch(() => null);
+            if (frame) {
+                // Find clickable element inside iframe
+                const btn = await frame.$('button, [role="button"], div[style*="cursor"]').catch(() => null);
+                if (btn) {
+                    const box = await btn.boundingBox().catch(() => null);
+                    if (box) {
+                        const cx = box.x + box.width / 2;
+                        const cy = box.y + box.height / 2;
+                        // Move to element then press and hold
+                        await page.mouse.move(cx, cy);
+                        await delay(300);
+                        await page.mouse.down();
+                        await delay(CAPTCHA_HOLD_MS);
+                        await page.mouse.up();
+                        console.log(`   🖱️ [${tag}] Held mouse for ${CAPTCHA_HOLD_MS}ms`);
+                    }
+                }
+            }
+        }
+
+        // Strategy 2: Keyboard fallback — Tab to focus, hold Space
+        if (await detectCaptcha(page)) {
+            console.log(`   ⌨️ [${tag}] Mouse solve failed, trying keyboard`);
+            await page.keyboard.press('Tab').catch(() => {});
+            await delay(500);
+            await page.keyboard.down('Space');
+            await delay(CAPTCHA_HOLD_MS);
+            await page.keyboard.up('Space');
+        }
+
+        // Strategy 3: Direct DOM manipulation on the container (last resort)
+        if (await detectCaptcha(page)) {
+            console.log(`   🔧 [${tag}] Trying direct DOM removal of captcha overlay`);
+            await page.evaluate(() => {
+                // Remove the captcha container
+                document.querySelectorAll('.px-captcha-container, #px-captcha, .px-captcha-refid').forEach(el => el.remove());
+                // Clear scroll locks
+                document.documentElement.style.overflow = '';
+                document.documentElement.removeAttribute('data-hdp-scroll-locked');
+                document.body.style.overflow = '';
+                document.body.style.position = '';
+                // Remove backdrop overlays
+                document.querySelectorAll('[class*="backdrop" i], [class*="overlay" i]').forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > window.innerWidth * 0.8 && r.height > window.innerHeight * 0.8) {
+                        el.remove();
+                    }
+                });
+            }).catch(() => {});
+            await delay(1000);
+        }
+
+        // Wait for resolution (cookie set or page reload)
+        await delay(3000);
+
+        // Reload to check if we passed
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        await delay(2000);
+
+        const stillBlocked = await detectCaptcha(page);
+        if (!stillBlocked) {
+            console.log(`   ✅ [${tag}] Captcha solved — page is clean`);
+            return true;
+        }
+
+        console.log(`   ❌ [${tag}] Captcha still present after solve attempt`);
+        return false;
+    } catch (e) {
+        console.log(`   ⚠️ [${tag}] Captcha solve error: ${e.message}`);
+        return false;
+    }
+}
+
+// =========================================================
+// ✅ SESSION WARM-UP — acquire valid cookies before deep pages
+// =========================================================
+async function warmUpSession(page, tag) {
+    try {
+        console.log(`   🔥 [${tag}] Warming up session at ${WARMUP_URL}`);
+        await page.goto(WARMUP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await delay(WARMUP_SETTLE);
+
+        // Check if warmup page itself is blocked
+        const warmupCaptcha = await detectCaptcha(page);
+        if (warmupCaptcha) {
+            console.log(`   🧩 [${tag}] Captcha on warmup page — attempting solve`);
+            await solvePressAndHold(page, tag);
+        }
+
+        // Simulate light human interaction: small scroll
+        await page.evaluate(() => {
+            window.scrollBy(0, 200);
+        }).catch(() => {});
+        await delay(1000);
+        await page.evaluate(() => {
+            window.scrollTo(0, 0);
+        }).catch(() => {});
+        await delay(500);
+
+        console.log(`   ✅ [${tag}] Session warmed up`);
+        return true;
+    } catch (e) {
+        console.log(`   ⚠️ [${tag}] Warmup error: ${e.message}`);
+        return false;
+    }
+}
+
+// =========================================================
 // BROWSER
 // =========================================================
 async function launchBrowser() {
@@ -84,6 +227,7 @@ async function launchBrowser() {
         `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
         '--autoplay-policy=no-user-gesture-required',
         '--lang=en-US,en',
+        '--disable-features=IsolateOrigins,site-per-process',
     ];
     const opts = {
         headless: HEADFUL ? false : true,
@@ -149,7 +293,7 @@ function findNextRow(sheet, afterRow, mode) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// ✅ SLOW SCROLL — loads lazy modules incl. price history
+// SLOW SCROLL
 // =========================================================
 async function slowScrollToBottom(page, tag) {
     try {
@@ -189,13 +333,11 @@ async function slowScrollToBottom(page, tag) {
 }
 
 // =========================================================
-// ✅ PRICE HISTORY — heading + date-info fallback, safe expand, parse
+// PRICE HISTORY — heading + date-info fallback
 // =========================================================
 async function getPriceHistory(page, tag) {
-    // 1. Slow scroll so lazy modules mount
     await slowScrollToBottom(page, tag);
 
-    // 2. Try heading-based wait (preferred)
     let found = await page.waitForFunction(() => {
         const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
         const h = Array.from(document.querySelectorAll('h2,h3,h4'))
@@ -210,20 +352,18 @@ async function getPriceHistory(page, tag) {
         return false;
     }, { timeout: HISTORY_WAIT_MS, polling: 500 }).then(() => true).catch(() => false);
 
-    // 3. Fallback: look for date-info cells anywhere on the page
     if (!found) {
         found = await page.waitForFunction(() => {
             return document.querySelectorAll('[data-testid="date-info"]').length > 0;
         }, { timeout: HISTORY_FALLBACK_MS, polling: 500 }).then(() => true).catch(() => false);
-        if (found) console.log(`   📊 [${tag}] Heading missing but date-info cells found — using fallback locator`);
+        if (found) console.log(`   📊 [${tag}] Heading missing but date-info cells found`);
     }
 
     if (!found) {
-        console.log(`   📊 [${tag}] Price history DOM NOT found — will rely on JSON fallback`);
+        console.log(`   📊 [${tag}] Price history DOM NOT found`);
         return { rows: [], found: false };
     }
 
-    // 4. Safe "Show more" expansion
     let prevCount = -1, clicks = 0;
     for (let i = 0; i < 25; i++) {
         const state = await page.evaluate(() => {
@@ -261,14 +401,12 @@ async function getPriceHistory(page, tag) {
     }
     if (clicks) console.log(`   🔽 [${tag}] Expanded price history (${clicks} click(s))`);
 
-    // Nudge scroll into view
     await page.evaluate(() => {
         const cell = document.querySelector('[data-testid="date-info"]');
         if (cell) cell.scrollIntoView({ block: 'start' });
     }).catch(() => {});
     await delay(600);
 
-    // 5. Parse rows — via heading OR via any table containing date-info
     const rows = await page.evaluate(() => {
         const clean = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
         const norm = (s) => clean(s).toLowerCase();
@@ -347,14 +485,30 @@ async function scrapeOneUrl(browser, url) {
             });
         }
 
+        // ✅ STEP 1: Warm up session first
+        await warmUpSession(page, tag);
+
+        // ✅ STEP 2: Navigate to target
         await delay(jitter(NAV_DELAY_MIN, NAV_DELAY_MAX));
         await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForSelector('[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"], h1', { timeout: HYDRATE_TIMEOUT }).catch(() => {});
-        // Give heavier (unblocked) page time to settle
         if (typeof page.waitForNetworkIdle === 'function') {
-            await page.waitForNetworkIdle({ idleTime: 1200, timeout: 15000 }).catch(() => {});
+            await page.waitForNetworkIdle({ idleTime: 1500, timeout: 30000 }).catch(() => {});
         }
         await delay(HYDRATE_SETTLE);
+
+        // ✅ STEP 3: Check for captcha on the actual page
+        const captchaType = await detectCaptcha(page);
+        if (captchaType) {
+            const solved = await solvePressAndHold(page, tag);
+            if (!solved) {
+                if (DEBUG_DUMP) await dumpDebug(page, 'captcha');
+                return { blocked: true, blockedTitle: 'captcha-unsolved' };
+            }
+            // After solving, wait for content
+            await page.waitForSelector('[data-testid="price"], h1', { timeout: HYDRATE_TIMEOUT }).catch(() => {});
+            await delay(1000);
+        }
 
         const title = await page.title();
         const hasContent = await page.evaluate(() => !!document.querySelector('h1, [data-testid="price"]'));
@@ -367,7 +521,7 @@ async function scrapeOneUrl(browser, url) {
         // ---- Price history
         const { rows: domRows, found: tableFound } = await getPriceHistory(page, tag);
 
-        // ---- Main page data (always captures pageText)
+        // ---- Main page data
         const data = await page.evaluate((INCLUDE_PAGE_TEXT) => {
             const out = {
                 price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -480,14 +634,14 @@ async function scrapeOneUrl(browser, url) {
                 if (id) out.mls = `${id[1]} - ${src ? clean(src[1]) : ''}`.replace(/ - $/, '');
             }
 
-            // ✅ Page text — always captured, structured
+            // Page text — always captured
             if (INCLUDE_PAGE_TEXT) {
                 const SKIP = new Set([
                     'SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON',
                     'SELECT','INPUT','TEXTAREA','HEAD','LINK','META','PATH','IMG',
                     'VIDEO','AUDIO','CANVAS','OBJECT','EMBED'
                 ]);
-                const SKIP_TESTID = /topnav|desktop-action-bar|action-bar|footer|mobile-footer|neighborhood-ad|MstServicesAvailability|zhl-upsell|third-party|ad-frame|lightbox/i;
+                const SKIP_TESTID = /topnav|desktop-action-bar|action-bar|footer|mobile-footer|neighborhood-ad|MstServicesAvailability|zhl-upsell|third-party|ad-frame|lightbox|px-captcha/i;
 
                 const lines = [];
                 const seen = new Set();
@@ -563,7 +717,7 @@ async function scrapeOneUrl(browser, url) {
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
-            // JSON fallback #1: Next.js gdpClientCache
+            // JSON fallback #1
             try {
                 const nd = $('script#__NEXT_DATA__');
                 const nextData = nd ? JSON.parse(nd.textContent || 'null') : null;
@@ -598,7 +752,7 @@ async function scrapeOneUrl(browser, url) {
                 }
             } catch (e) {}
 
-            // ✅ JSON fallback #2: scan any JSON script for priceHistory array
+            // JSON fallback #2: scan any JSON script
             try {
                 if (!out.priceHistoryText) {
                     const scripts = document.querySelectorAll('script[type="application/json"], script[type="application/ld+json"]');
@@ -639,7 +793,7 @@ async function scrapeOneUrl(browser, url) {
 
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
-        // ---- Merge DOM price history (preferred over JSON fallback)
+        // Merge DOM price history (preferred over JSON fallback)
         if (domRows.length) {
             data.priceHistoryText = domRows.map(r => {
                 const priceTxt = (r.price || '') + (r.change ? ` (${r.change})` : '');
@@ -659,7 +813,6 @@ async function scrapeOneUrl(browser, url) {
             console.log(`   📊 [${tag}] History: ${domRows.length} row(s)`);
             domRows.forEach(r => console.log(`       ${r.date} | ${r.event} | ${r.price}${r.change ? ' (' + r.change + ')' : ''}`));
         } else {
-            // ✅ Diagnostics when history missing
             const diag = await page.evaluate(() => {
                 const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
                 const heads = Array.from(document.querySelectorAll('h1,h2,h3,h4'))
@@ -677,7 +830,7 @@ async function scrapeOneUrl(browser, url) {
             if (DEBUG_DUMP) await dumpDebug(page, 'nohistory');
         }
 
-        // ---- Description fallback from JSON-LD
+        // Description fallback from JSON-LD
         if (!data.description || data.description === 'N/A') {
             try {
                 const ldDesc = await page.evaluate(() => {
@@ -702,12 +855,25 @@ async function scrapeOneUrl(browser, url) {
 
 async function dumpDebug(page, label) {
     try {
+        await page.waitForFunction(() => document.body && document.body.children.length > 0, { timeout: 5000 }).catch(() => {});
         const stamp = `${label}-${Date.now()}`;
         const dir = path.join(process.cwd(), 'debug');
         fs.mkdirSync(dir, { recursive: true });
         await page.screenshot({ path: path.join(dir, `${stamp}.png`), fullPage: true }).catch(() => {});
         fs.writeFileSync(path.join(dir, `${stamp}.html`), await page.content());
-        console.log(`   🧾 Debug saved: debug/${stamp}.{png,html}`);
+        const diag = await page.evaluate(() => ({
+            bodyChildren: document.body ? document.body.children.length : 0,
+            htmlOverflow: document.documentElement.style.overflow,
+            scrollLocked: document.documentElement.hasAttribute('data-hdp-scroll-locked'),
+            hasConsent: !!document.querySelector('[class*="consent"], [id*="consent"], [class*="cookie"]'),
+            hasCaptcha: !!document.querySelector('.px-captcha-container, #px-captcha'),
+            h1Count: document.querySelectorAll('h1').length,
+            h2Count: document.querySelectorAll('h2').length,
+            tableCount: document.querySelectorAll('table').length,
+            dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
+        })).catch(() => ({}));
+        fs.writeFileSync(path.join(dir, `${stamp}.diag.json`), JSON.stringify(diag, null, 2));
+        console.log(`   🧾 Debug saved: debug/${stamp}.{png,html,diag.json}`, diag);
     } catch (e) {}
 }
 
@@ -716,7 +882,7 @@ async function dumpDebug(page, label) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Zillow Scraper V26 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
+    console.log(`🚀 Zillow Scraper V27 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -773,7 +939,7 @@ async function runScraper() {
         setCell(row, 30, d.hoa);
         setCell(row, 31, d.priceHistoryText);
         setCell(row, 32, d.factsFeaturesText);
-        setCell(row, 33, d.pageText, MAX_PAGETEXT_LEN); // ✅ last column
+        setCell(row, 33, d.pageText, MAX_PAGETEXT_LEN);
     };
     let flushChain = Promise.resolve();
     const doFlush = async () => {
@@ -838,8 +1004,8 @@ async function runScraper() {
                     const result = await inflight.get(key);
 
                     if (result.blocked) {
-                        console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}`);
-                        queue.push({ row: rowIndex, status: result.blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)" });
+                        console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}${result.blockedTitle ? ` (${result.blockedTitle})` : ''}`);
+                        queue.push({ row: rowIndex, status: result.blockedTitle === 'captcha-unsolved' ? "🧩 CAPTCHA blocked (skipped)" : "❌ BLOCKED (skipped)" });
                         blockStreak++; errorStreak = 0; totalBlocks++;
                         recycle = true;
                         if (blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS) { stop = true; blockedExit = true; }

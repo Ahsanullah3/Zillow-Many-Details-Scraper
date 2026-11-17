@@ -1,3 +1,4 @@
+
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const puppeteer = require('puppeteer-extra');
@@ -269,18 +270,21 @@ function fallbackHistoryParse() {
 }
 
 // =========================================================
-// HARDENED MOUNT (with See More click)
+// HARDENED MOUNT (with Show More click)
 // =========================================================
 async function ensureHistoryMounted(page, tag) {
     // Step 0: Click ALL "See more" / collapsed buttons
     try {
         const clickedCount = await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll(
-                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
+            // Zillow's visible "Show more" label may be a span inside the actual button.
+            // Include that label selector, then normalize each match to its parent button.
+            const candidates = Array.from(document.querySelectorAll(
+                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"], span[data-c11n-component="TextButton.Label"]'
             ));
+            const buttons = [...new Set(candidates.map(el => el.closest('button') || el))];
             let clicked = 0;
             for (const btn of buttons) {
-                const txt = (btn.textContent || '').trim().toLowerCase();
+                const txt = (btn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 if (txt.includes('see more') || txt.includes('show more') || txt.includes('view more') || txt === 'more') {
                     try { btn.click(); clicked++; } catch (e) {}
                 }
@@ -369,11 +373,12 @@ async function ensureHistoryMounted(page, tag) {
     // Step 7: Second chance
     if (!tableFound) {
         await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll(
-                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
+            const candidates = Array.from(document.querySelectorAll(
+                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"], span[data-c11n-component="TextButton.Label"]'
             ));
+            const buttons = [...new Set(candidates.map(el => el.closest('button') || el))];
             for (const btn of buttons) {
-                const txt = (btn.textContent || '').trim().toLowerCase();
+                const txt = (btn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 if (txt.includes('see more') || txt.includes('show more')) {
                     try { btn.click(); } catch (e) {}
                 }

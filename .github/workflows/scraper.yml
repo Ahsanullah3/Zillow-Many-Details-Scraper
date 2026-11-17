@@ -12,6 +12,11 @@ on:
         required: false
         default: "1"
         type: string
+      debug_dump:
+        description: "Save screenshot + HTML when history is missing/blocked (1 = yes)"
+        required: false
+        default: "0"
+        type: string
 
 permissions:
   actions: write
@@ -56,26 +61,41 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
-      - name: Run Scraper Engine
+      - name: Check system Chrome
+        run: google-chrome --version
+
+      - name: Run Scraper Engine (real Chrome, headful under xvfb)
         id: scraper_task
         # Run node directly (not via npm) so cancel signals reach the script,
         # which flushes pending rows before exiting.
-        run: node index.js
+        run: xvfb-run -a --server-args="-screen 0 1400x900x24" node index.js
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          HEADFUL: '1'
+          CHROME_PATH: /usr/bin/google-chrome
           CONCURRENCY: '3'
           MAX_URLS_PER_RUN: '150'
-          PAGE_ZOOM: '1'
           BLOCK_RESOURCES: '1'
+          INCLUDE_PAGE_TEXT: '0'
           RETRY_BLOCKED: '1'
           MAX_BLOCK_STREAK: '6'
+          DEBUG_DUMP: ${{ inputs.debug_dump || '0' }}
 
-      # ---- SELF-REBOOT: only if NOT cancelled AND has_more=true ----
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-batch-${{ inputs.batch || '1' }}
+          path: debug/
+          if-no-files-found: ignore
+
+      # ---- SELF-REBOOT: only if NOT cancelled, has_more=true AND not blocked ----
       - name: Evaluate Self-Reboot Sequence
         if: |
           !cancelled() &&
-          steps.scraper_task.outputs.has_more == 'true'
+          steps.scraper_task.outputs.has_more == 'true' &&
+          steps.scraper_task.outputs.blocked != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

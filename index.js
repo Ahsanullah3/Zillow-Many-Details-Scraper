@@ -12,7 +12,7 @@ puppeteer.use(StealthPlugin());
 // CONFIG
 // =========================================================
 const CONCURRENCY = Number(process.env.CONCURRENCY || '4');
-const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
+const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '30');
 const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
 const MAX_CONSECUTIVE_BLOCK_STREAKS = Number(process.env.MAX_BLOCK_STREAK || '6');

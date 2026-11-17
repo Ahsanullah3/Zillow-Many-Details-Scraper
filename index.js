@@ -1,7 +1,8 @@
 // =========================================================
 // ZILLOW SCRAPER — COMPLETE PRODUCTION SCRIPT
-// Multi-browser (Chrome + Edge + Firefox) | 34-column sheet output
+// Multi-browser (Chrome + Edge + Firefox) | 34-col sheet output
 // Price history: looped "Show more" + hardened parser + GraphQL fallback
+// Graceful cancel on SIGTERM/SIGINT (GitHub Actions Cancel button)
 // =========================================================
 
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -11,6 +12,24 @@ const puppeteerCore = require('puppeteer-core');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+
+// =========================================================
+// GRACEFUL CANCEL — fires on SIGTERM (Actions cancel) / SIGINT (Ctrl+C)
+// =========================================================
+let SHUTDOWN_REQUESTED = false;
+const shutdown = (signal) => {
+    if (SHUTDOWN_REQUESTED) return;
+    SHUTDOWN_REQUESTED = true;
+    console.log(`\n🛑 Received ${signal} — shutting down cleanly...`);
+    // Hard-exit fallback after 8s in case a browser launch/flush hangs
+    setTimeout(() => {
+        console.log('💥 Forcing exit after 8s grace period');
+        process.exit(0);
+    }, 8000).unref();
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGHUP',  () => shutdown('SIGHUP'));
 
 // =========================================================
 // CONFIG
@@ -81,6 +100,7 @@ function findFirefoxExecutable() {
     const candidates = [
         process.env.FIREFOX_PATH,
         '/usr/bin/firefox', '/usr/bin/firefox-esr', '/snap/bin/firefox',
+        '/opt/firefox/firefox',
         '/Applications/Firefox.app/Contents/MacOS/firefox',
         'C:\\Program Files\\Mozilla Firefox\\firefox.exe',
     ].filter(Boolean);
@@ -202,7 +222,6 @@ function findNextRow(sheet, afterRow, includeSkipped) {
     return -1;
 }
 
-const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 const extractZpid = (u) => { const m = String(u).match(/(\d+)_zpid/); return m ? m[1] : null; };
 
 // =========================================================
@@ -293,11 +312,9 @@ function parseHistoryRowsInPage() {
 // MOUNT PRICE HISTORY + LOOP CLICK "SHOW MORE"
 // =========================================================
 async function ensureHistoryMounted(page, tag) {
-    // Scroll bottom → lazy mount
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
     await delay(1200);
 
-    // Scroll to heading
     await page.evaluate(() => {
         const h = Array.from(document.querySelectorAll('h2,h3'))
             .find(x => /price\s*history/i.test(x.textContent || ''));
@@ -305,7 +322,6 @@ async function ensureHistoryMounted(page, tag) {
     }).catch(() => {});
     await delay(1500);
 
-    // Wait for table mount (up to 12s)
     const getRowCount = () => page.evaluate(() => {
         const t = Array.from(document.querySelectorAll('table')).find(t => {
             const hs = Array.from(t.querySelectorAll('th'))
@@ -322,18 +338,20 @@ async function ensureHistoryMounted(page, tag) {
     let mounted = false;
     const mountDeadline = Date.now() + 12000;
     while (Date.now() < mountDeadline) {
+        if (SHUTDOWN_REQUESTED) return 0;
         const c = await getRowCount();
         if (c >= 0) { mounted = true; break; }
         await delay(500);
     }
     if (!mounted) { console.log(`   ❌ [${tag}] History table NOT mounted after 12s`); return 0; }
 
-    // Loop-click "Show more"
     let totalClicked = 0;
     let prevCount = await getRowCount();
     const maxIter = 15;
 
     for (let iter = 0; iter < maxIter; iter++) {
+        if (SHUTDOWN_REQUESTED) break;
+
         const clicked = await page.evaluate(() => {
             const btns = Array.from(document.querySelectorAll(
                 'tfoot[data-testid="table-see-more"] button'
@@ -348,13 +366,13 @@ async function ensureHistoryMounted(page, tag) {
             return n;
         }).catch(() => 0);
 
-        if (clicked === 0) break; // no more "Show more" button
+        if (clicked === 0) break;
         totalClicked += clicked;
 
-        // Wait for growth
         const waitDeadline = Date.now() + 4000;
         let grew = false;
         while (Date.now() < waitDeadline) {
+            if (SHUTDOWN_REQUESTED) break;
             await delay(300);
             const c = await getRowCount();
             if (c > prevCount) { grew = true; prevCount = c; break; }
@@ -416,7 +434,6 @@ function extractMainDataInPage() {
     const $ = (sel, root = document) => root.querySelector(sel);
     const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-    // ---- Meta fallback ----
     const metaGet = (p) => document.querySelector(`meta[property="${p}"]`)?.content || '';
 
     out.canonicalUrl = $('meta[property="og:url"]')?.content || $('link[rel="canonical"]')?.href || location.href;
@@ -622,7 +639,7 @@ function extractMainDataInPage() {
         }
     } catch (e) {}
 
-    // ---- Meta fallback for sparse pages ----
+    // Meta fallback for sparse pages
     if (!out.beds) { const b = metaGet('zillow_fb:beds'); if (b) out.beds = b; }
     if (!out.baths) { const b = metaGet('zillow_fb:baths'); if (b) out.baths = b; }
     if ((!out.description || out.description === 'N/A')) {
@@ -648,13 +665,17 @@ async function scrapeOneUrl(browser, url) {
         await page.setViewport({ width: VIEWPORT_W, height: VIEWPORT_H, deviceScaleFactor: 1 });
 
         if (BLOCK_RESOURCES) {
-            await page.setRequestInterception(true);
-            page.on('request', (req) => {
-                const type = req.resourceType();
-                if (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url()))
-                    req.abort().catch(() => {});
-                else req.continue().catch(() => {});
-            });
+            try {
+                await page.setRequestInterception(true);
+                page.on('request', (req) => {
+                    const type = req.resourceType();
+                    if (['image', 'stylesheet', 'font', 'media'].includes(type) || AD_HOSTS.test(req.url()))
+                        req.abort().catch(() => {});
+                    else req.continue().catch(() => {});
+                });
+            } catch (e) {
+                console.warn(`   ⚠️ [${tag}] Interception unavailable (${e.message})`);
+            }
         }
 
         try {
@@ -699,13 +720,11 @@ async function scrapeOneUrl(browser, url) {
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
         // ===== PRICE HISTORY — 3-layer =====
-        // Layer 1: mount + loop-click "Show more"
         await ensureHistoryMounted(page, tag);
 
-        // Layer 2: parse DOM (poll)
         let domRows = [];
         const histDeadline = Date.now() + 10000;
-        while (Date.now() < histDeadline) {
+        while (Date.now() < histDeadline && !SHUTDOWN_REQUESTED) {
             try { domRows = await page.evaluate(parseHistoryRowsInPage); } catch (e) {}
             if (domRows.length > 0) break;
             await page.evaluate(() => {
@@ -741,7 +760,7 @@ async function scrapeOneUrl(browser, url) {
         }
 
         // Layer 3: GraphQL fallback
-        if (!data.priceHistoryText) {
+        if (!data.priceHistoryText && !SHUTDOWN_REQUESTED) {
             const zpid = extractZpid(url);
             if (zpid) {
                 console.log(`   🔄 [${tag}] DOM empty — GraphQL zpid ${zpid}`);
@@ -804,7 +823,9 @@ async function runScraper() {
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
-            fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_more=${hasMore}\nblocked=${blocked}\n`);
+            try {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_more=${hasMore}\nblocked=${blocked}\n`);
+            } catch (e) {}
         }
     };
 
@@ -888,7 +909,7 @@ async function runScraper() {
     async function laneWorker(engine, id) {
         let browser = null, used = 0;
         try {
-            while (!stop) {
+            while (!stop && !SHUTDOWN_REQUESTED) {
                 if (Date.now() - startTime >= MAX_RUNTIME_MS) break;
                 if (claimed >= MAX_URLS_PER_RUN) break;
                 if (errorStreak >= MAX_CONSECUTIVE_ERRORS) { stop = true; break; }
@@ -967,6 +988,13 @@ async function runScraper() {
     console.log(`📊 Rows with price history: ${totalWithHistory}`);
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
+    // ---- CANCELLED: do NOT set has_more, do NOT trigger next batch ----
+    if (SHUTDOWN_REQUESTED) {
+        console.log(`🛑 Run was cancelled — writing has_more=false blocked=false so workflow stops.`);
+        setOutput(false, false);
+        return;
+    }
+
     if (blockedExit) {
         console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — exiting.`);
         setOutput(true, true);
@@ -979,4 +1007,13 @@ async function runScraper() {
     console.log(hasMore ? `🔄 More rows — resume at row ${remaining + 1}.` : "🎉 Sheet fully processed!");
 }
 
-runScraper().then(() => process.exit(0)).catch(err => { console.error("💥 Fatal:", err); process.exit(1); });
+runScraper()
+    .then(() => {
+        // Always exit 0 so Actions marks the job success (even on cancel)
+        console.log('👋 Script finished.');
+        process.exit(0);
+    })
+    .catch(err => {
+        console.error("💥 Fatal:", err);
+        process.exit(SHUTDOWN_REQUESTED ? 0 : 1);
+    });

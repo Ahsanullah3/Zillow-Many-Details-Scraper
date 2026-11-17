@@ -1,7 +1,7 @@
 {
   "name": "zillow-scraper",
   "version": "1.0.0",
-  "description": "Zillow detail-page scraper with CDP remote debugging for manual CAPTCHA solving",
+  "description": "Zillow detail-page scraper with SSH debug for manual CAPTCHA solving",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

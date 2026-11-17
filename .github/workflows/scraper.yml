@@ -66,12 +66,10 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           CONCURRENCY: '3'
           MAX_URLS_PER_RUN: '150'
-          PAGE_ZOOM: '0.05'
+          PAGE_ZOOM: '1'
           BLOCK_RESOURCES: '1'
           RETRY_BLOCKED: '1'
           MAX_BLOCK_STREAK: '6'
-          NAV_DELAY_MIN: '500'
-          NAV_DELAY_MAX: '2000'
 
       # ---- SELF-REBOOT: only if NOT cancelled AND has_more=true ----
       - name: Evaluate Self-Reboot Sequence

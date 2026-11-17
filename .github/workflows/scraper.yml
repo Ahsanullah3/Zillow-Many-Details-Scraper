@@ -75,7 +75,7 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           HEADFUL: '1'
           CHROME_PATH: /usr/bin/google-chrome
-          CONCURRENCY: '1'
+          CONCURRENCY: '5'
           MAX_URLS_PER_RUN: '100'
           BLOCK_RESOURCES: '0'          # CHANGED: resources load (images/fonts/CSS)
           INCLUDE_PAGE_TEXT: '1'        # CHANGED: page text ON (matches script)

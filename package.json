@@ -4,13 +4,16 @@
   "private": true,
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "node -e \"console.log('Installed. Ensure Edge + Firefox are on PATH or set EDGE_PATH / FIREFOX_PATH env vars.')\""
   },
   "dependencies": {
     "google-spreadsheet": "^4.1.2",
     "google-auth-library": "^9.14.1",
     "puppeteer": "^23.9.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer-core": "^23.9.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

@@ -45,8 +45,13 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install ngrok
+      - name: Install ngrok and jq
         run: |
+          # Install jq (for parsing ngrok API JSON)
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+
+          # Install ngrok
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt-get update -qq && sudo apt-get install -y -qq ngrok
@@ -59,7 +64,11 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
 
       - name: Check system Chrome
         run: google-chrome --version
@@ -75,8 +84,23 @@ jobs:
         run: |
           ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
           ngrok tcp 9222 --log=stdout > /tmp/ngrok.log 2>&1 &
-          sleep 6
-          NGROK_ADDR=$(grep -o 'tcp://[^ ]*' /tmp/ngrok.log | head -1 | sed 's|tcp://||')
+
+          # Wait up to 30 seconds for the tunnel to appear in the local ngrok API
+          NGROK_ADDR=""
+          for i in {1..30}; do
+            sleep 1
+            NGROK_ADDR=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url' 2>/dev/null | sed 's|tcp://||')
+            if [ -n "$NGROK_ADDR" ] && [ "$NGROK_ADDR" != "null" ]; then
+              break
+            fi
+          done
+
+          if [ -z "$NGROK_ADDR" ] || [ "$NGROK_ADDR" = "null" ]; then
+            echo "❌ Failed to get ngrok URL after 30 seconds. Dumping log:"
+            cat /tmp/ngrok.log
+            exit 1
+          fi
+
           echo "CDP_ADDRESS=$NGROK_ADDR" >> $GITHUB_OUTPUT
           echo ""
           echo "=========================================="
@@ -129,13 +153,14 @@ jobs:
           CURRENT_BATCH="${{ inputs.batch || '1' }}"
           NEXT_BATCH=$((CURRENT_BATCH + 1))
           if [ "$NEXT_BATCH" -gt "$MAX_BATCHES" ]; then
-            echo "Reached MAX_BATCHES — stopping."
+            echo "Reached MAX_BATCHES ($MAX_BATCHES) — stopping."
             exit 0
           fi
-          echo "Triggering Batch $NEXT_BATCH..."
+          echo "Batch $CURRENT_BATCH hit threshold. Triggering Batch $NEXT_BATCH..."
           gh workflow run scraper.yml --ref main -f batch="$NEXT_BATCH"
           sleep 5
 
       - name: Cleanup on Cancel
         if: cancelled()
-        run: echo "🛑 Workflow cancelled — reboot skipped."
+        run: |
+          echo "🛑 Workflow was cancelled — self-reboot skipped."

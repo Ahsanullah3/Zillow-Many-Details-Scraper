@@ -78,7 +78,6 @@ async function launchBrowser() {
         '--disable-blink-features=AutomationControlled',
         '--disable-features=IsolateOrigins,site-per-process',
         `--window-size=${VIEWPORT_W},${VIEWPORT_H}`,
-        // ---- ENABLE EVERYTHING ----
         '--enable-javascript',
         '--enable-webgl',
         '--enable-webgl2',
@@ -91,28 +90,21 @@ async function launchBrowser() {
         '--enable-canvas-2d-layers',
         '--enable-native-gpu-memory-buffers',
         '--enable-features=CanvasOopRasterization',
-        // Media / DRM
         '--autoplay-policy=no-user-gesture-required',
         '--enable-features=MediaSessionService',
-        // WebRTC / WebSockets
         '--enable-webrtc',
         '--enable-websockets',
-        // DNS / networking
         '--enable-dns-prefetch',
         '--enable-quic',
-        // Modern JS features
         '--js-flags=--harmony',
-        // Form/Storage
         '--enable-features=StorageBuckets',
         '--enable-features=FileSystemAccessAPI',
     ];
-    // NOTE: removed --disable-gpu (was blocking WebGL) so hardware rendering
-    //       flags above take effect and canvas fingerprint looks real.
     const browser = await puppeteer.launch({
         headless: "new",
         userDataDir,
         args,
-        ignoreDefaultArgs: ['--disable-gpu'],  // ensure GPU isn't disabled
+        ignoreDefaultArgs: ['--disable-gpu'],
     });
     browser.__userDataDir = userDataDir;
     return browser;
@@ -173,44 +165,71 @@ function findNextRow(sheet, afterRow, includeSkipped) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// PRICE HISTORY PARSER
+// PRICE HISTORY PARSER (Updated for Zillow Table.Row structure)
 // =========================================================
 function parseHistoryRowsInPage() {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const isHistoryTable = (t) => {
-        const hs = Array.from(t.querySelectorAll('th')).map(x => clean(x.textContent).toLowerCase());
-        return hs.includes('date') && hs.includes('event') && hs.includes('price');
-    };
-    const table = Array.from(document.querySelectorAll(
-        'table[data-c11n-component="Table.Root"], table.c11n_table__root, table'
-    )).find(isHistoryTable);
-    if (!table) return [];
-
     const rows = [];
-    for (const tr of table.querySelectorAll('tr')) {
-        const dateEl = tr.querySelector('[data-testid="date-info"]');
-        const label = tr.getAttribute('label') || '';
-        if (!dateEl && !label) continue;
-        const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
-        const cells = tr.querySelectorAll('td[data-c11n-component="Table.Cell"], td');
-        const date = clean(dateEl?.textContent) || (lm ? clean(lm[1]) : '');
-        const event = clean(cells[1]?.textContent) || (lm ? clean(lm[2]) : '');
-        let price = '', change = '', ppsf = '';
-        const priceCell = tr.querySelector('[data-testid="price-money-cell"]');
-        if (priceCell) {
-            price = clean(priceCell.querySelector('span > span')?.textContent);
-            change = clean(priceCell.querySelector('[data-testid="percent-display"]')?.textContent);
-            const lastTxt = clean(priceCell.lastElementChild?.textContent);
-            if (/sqft/i.test(lastTxt)) ppsf = lastTxt;
+
+    const trElements = document.querySelectorAll('table tbody tr[data-c11n-component="Table.Row"]');
+    if (trElements.length > 0) {
+        for (const tr of trElements) {
+            const dateEl = tr.querySelector('[data-testid="date-info"]');
+            const label = tr.getAttribute('label') || '';
+            if (!dateEl && !label) continue;
+
+            const cells = tr.querySelectorAll('td');
+            const date = clean(dateEl?.textContent) || '';
+            const event = clean(cells[1]?.textContent) || '';
+            
+            let price = '', change = '', ppsf = '';
+            const priceCell = tr.querySelector('[data-testid="price-money-cell"]');
+            if (priceCell) {
+                const moneySpan = priceCell.querySelector('span > span > span');
+                if (moneySpan) price = clean(moneySpan.textContent);
+                
+                const percentEl = priceCell.querySelector('[data-testid="percent-display"]');
+                if (percentEl) change = clean(percentEl.textContent);
+                
+                const spans = priceCell.querySelectorAll('span');
+                spans.forEach(sp => {
+                    const txt = clean(sp.textContent);
+                    if (/^\$\d+[,\d]*\/sqft$/i.test(txt)) ppsf = txt;
+                });
+            }
+
+            let source = '';
+            const nextTr = tr.nextElementSibling;
+            if (nextTr) {
+                const sourceText = clean(nextTr.textContent);
+                if (/source:/i.test(sourceText)) {
+                    source = sourceText.replace(/\s*Report\s+a\s+problem\s*$/i, '');
+                }
+            }
+
+            if (date || event || price) {
+                rows.push({ date, event, price, change, ppsf, source });
+            }
         }
-        if (!price && lm) price = clean(lm[3]).replace(/\s*\(.*\)\s*$/, '');
-        let source = '';
-        const next = tr.nextElementSibling;
-        if (next && !next.querySelector('[data-testid="date-info"]') && !next.hasAttribute('label')) {
-            source = clean(next.textContent).replace(/\s*Report\s+a\s+problem\s*$/i, '');
-        }
-        rows.push({ date, event, price, change, ppsf, source });
     }
+
+    if (!rows.length) {
+        document.querySelectorAll('tr[label]').forEach(tr => {
+            const label = tr.getAttribute('label') || '';
+            const lm = label.match(/Date:\s*([^,]+),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
+            if (lm) {
+                rows.push({
+                    date: clean(lm[1]),
+                    event: clean(lm[2]),
+                    price: clean(lm[3]).replace(/\s*\(.*\)\s*$/, ''),
+                    change: (lm[3].match(/\(([^)]+)\)/) || [])[1] || '',
+                    ppsf: '',
+                    source: ''
+                });
+            }
+        });
+    }
+
     return rows;
 }
 
@@ -246,25 +265,6 @@ function fallbackHistoryParse() {
         });
     });
 
-    if (!rows.length) {
-        document.querySelectorAll('table').forEach((tbl) => {
-            const headers = Array.from(tbl.querySelectorAll('th')).map((x) => clean(x.textContent).toLowerCase());
-            if (!(headers.includes('date') && headers.includes('event') && headers.includes('price'))) return;
-            tbl.querySelectorAll('tbody tr').forEach((tr) => {
-                const cells = Array.from(tr.querySelectorAll('td')).map((c) => clean(c.textContent));
-                if (cells.length < 3) return;
-                rows.push({
-                    date: cells[0],
-                    event: cells[1],
-                    price: cells[2].replace(/\s*\(.*\)\s*$/, ''),
-                    change: (cells[2].match(/\(([^)]+)\)/) || [])[1] || '',
-                    ppsf: '',
-                    source: '',
-                });
-            });
-        });
-    }
-
     return rows;
 }
 
@@ -272,7 +272,6 @@ function fallbackHistoryParse() {
 // HARDENED MOUNT (with See More click)
 // =========================================================
 async function ensureHistoryMounted(page, tag) {
-    // Step 0: Click ALL "See more" / collapsed buttons
     try {
         const clickedCount = await page.evaluate(() => {
             const buttons = Array.from(document.querySelectorAll(
@@ -291,7 +290,6 @@ async function ensureHistoryMounted(page, tag) {
     } catch (e) {}
     await delay(CLICK_EXPAND_SETTLE_MS);
 
-    // Step 1: Zoom + scroll bottom
     try {
         await page.evaluate((z) => {
             document.documentElement.style.zoom = String(z);
@@ -301,7 +299,6 @@ async function ensureHistoryMounted(page, tag) {
     } catch (e) {}
     await delay(ZOOM_SETTLE_MS);
 
-    // Step 2: Scroll heading
     await page.evaluate(() => {
         const h = Array.from(document.querySelectorAll('h2,h3'))
             .find(x => /price\s*history/i.test(x.textContent || ''));
@@ -309,7 +306,6 @@ async function ensureHistoryMounted(page, tag) {
     }).catch(() => {});
     await delay(HEADING_SETTLE_MS);
 
-    // Step 3: Click "Table view"
     await page.evaluate(() => {
         const tv = Array.from(document.querySelectorAll('button, [role="button"], a'))
             .find(b => /^\s*table\s+view\s*$/i.test((b.textContent || '').trim()));
@@ -317,7 +313,6 @@ async function ensureHistoryMounted(page, tag) {
     }).catch(() => {});
     await delay(TABLE_VIEW_SETTLE_MS);
 
-    // Step 4: Check table exists
     let tableFound = await page.evaluate(() => {
         const tables = document.querySelectorAll('table');
         return Array.from(tables).some(t => {
@@ -326,7 +321,6 @@ async function ensureHistoryMounted(page, tag) {
         });
     }).catch(() => false);
 
-    // Step 5: Click the "Hide" button + scroll wrapper  (price-history heading click REMOVED)
     if (!tableFound) {
         console.log(`   🔧 [${tag}] Clicking "Hide" button + scrolling table wrapper...`);
         const hideClicked = await page.evaluate(() => {
@@ -349,7 +343,6 @@ async function ensureHistoryMounted(page, tag) {
         await delay(SCROLL_WRAPPER_SETTLE_MS);
     }
 
-    // Step 6: Wait for table
     try {
         await page.waitForFunction(
             () => {
@@ -367,59 +360,6 @@ async function ensureHistoryMounted(page, tag) {
         console.log(`   📊 [${tag}] Table NOT mounted after ${TABLE_WAIT_MS}ms ❌`);
     }
 
-    // Step 7: Second chance
-    if (!tableFound) {
-        await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll(
-                'button[data-c11n-component="ShowHide.Button"], button[aria-expanded="false"]'
-            ));
-            for (const btn of buttons) {
-                const txt = (btn.textContent || '').trim().toLowerCase();
-                if (txt.includes('see more') || txt.includes('show more')) {
-                    try { btn.click(); } catch (e) {}
-                }
-            }
-            const h = Array.from(document.querySelectorAll('h2,h3'))
-                .find(x => /price\s*history/i.test(x.textContent || ''));
-            if (h) h.scrollIntoView({ block: 'center' });
-        }).catch(() => {});
-        await delay(RETRY_SCROLL_SETTLE_MS);
-        try {
-            await page.waitForFunction(
-                () => {
-                    const tables = document.querySelectorAll('table');
-                    return Array.from(tables).some(t => {
-                        const hs = Array.from(t.querySelectorAll('th')).map(x => (x.textContent || '').trim().toLowerCase());
-                        return hs.includes('date') && hs.includes('event') && hs.includes('price');
-                    });
-                },
-                { timeout: RETRY_WAIT_MS }
-            );
-            tableFound = true;
-            console.log(`   📊 [${tag}] Table mounted (retry) ✅`);
-        } catch (e) {
-            console.log(`   📊 [${tag}] Table NOT mounted (retry) ❌`);
-        }
-    }
-
-    // Step 8: Debug
-    if (!tableFound) {
-        try {
-            const debug = await page.evaluate(() => ({
-                hasHeading: Array.from(document.querySelectorAll('h2,h3'))
-                    .some(h => /price history/i.test(h.textContent || '')),
-                dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
-                tableCount: document.querySelectorAll('table').length,
-                showMoreButtons: document.querySelectorAll('button[data-c11n-component="ShowHide.Button"]').length,
-                collapsedButtons: document.querySelectorAll('button[aria-expanded="false"]').length,
-                bodyHeight: document.body.scrollHeight,
-                viewportHeight: window.innerHeight,
-                zoom: document.documentElement.style.zoom,
-            }));
-            console.log(`   🔍 [${tag}] Debug: ${JSON.stringify(debug)}`);
-        } catch (e) {}
-    }
-
     return tableFound;
 }
 
@@ -433,7 +373,6 @@ async function scrapeOneUrl(browser, url) {
     try {
         page = await ctx.newPage();
 
-        // ---- Enable everything: JS, service workers, WebGL, etc.
         await page.setJavaScriptEnabled(true);
         try { await page.setBypassCSP(true); } catch (e) {}
         await page.setViewport({
@@ -444,7 +383,6 @@ async function scrapeOneUrl(browser, url) {
             isMobile: false,
         });
 
-        // ---- Conditional request interception ----
         if (BLOCK_RESOURCES) {
             await page.setRequestInterception(true);
             page.on('request', (req) => {
@@ -453,12 +391,10 @@ async function scrapeOneUrl(browser, url) {
                 else req.continue().catch(() => {});
             });
         } else {
-            // Load EVERYTHING — no blocking at all
             await page.setRequestInterception(true);
             page.on('request', (req) => req.continue().catch(() => {}));
         }
 
-        // Small UA fix for headless mode — keep if you use headless
         try {
             await page.evaluateOnNewDocument(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -631,7 +567,6 @@ async function scrapeOneUrl(browser, url) {
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
-            // JSON fallback
             try {
                 const nextData = JSON.parse(document.querySelector('script#__NEXT_DATA__')?.textContent || 'null');
                 const raw = nextData?.props?.pageProps?.componentProps?.gdpClientCache;

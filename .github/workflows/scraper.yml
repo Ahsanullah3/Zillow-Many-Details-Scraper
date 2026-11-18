@@ -22,13 +22,15 @@ permissions:
   actions: write
   contents: read
 
-# Only one run at a time; a newly queued run waits for the current one.
+# Cancel-in-progress: true so a cancelled run also kills any queued
+# self-reboot. Without this, cancelling Batch N leaves Batch N+1 queued,
+# which then starts and keeps the loop alive.
 concurrency:
   group: zillow-scraper
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
-  MAX_BATCHES: '60'   # safety cap so a permanently blocked run can't loop forever
+  MAX_BATCHES: '60'
 
 jobs:
   scrape:
@@ -64,17 +66,22 @@ jobs:
       - name: Check system Chrome
         run: google-chrome --version
 
+      # Forward SIGINT/SIGTERM into node so cancellation actually stops
+      # the scraper (xvfb-run otherwise swallows the signal).
       - name: Run Scraper Engine (real Chrome, headful under xvfb)
         id: scraper_task
-        # Run node directly (not via npm) so cancel signals reach the script,
-        # which flushes pending rows before exiting.
-        run: xvfb-run -a --server-args="-screen 0 1400x900x24" node index.js
+        run: |
+          set -e
+          xvfb-run -a --server-args="-screen 0 1400x900x24" node index.js &
+          CHILD=$!
+          trap 'echo "🛑 cancel — forwarding TERM to node"; kill -TERM $CHILD 2>/dev/null; wait $CHILD; exit 143' INT TERM
+          wait $CHILD
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           HEADFUL: '1'
           CHROME_PATH: /usr/bin/google-chrome
-          CONCURRENCY: '5'
+          CONCURRENCY: '3'
           MAX_URLS_PER_RUN: '150'
           BLOCK_RESOURCES: '1'
           INCLUDE_PAGE_TEXT: '0'
@@ -90,15 +97,25 @@ jobs:
           path: debug/
           if-no-files-found: ignore
 
-      # ---- SELF-REBOOT: only if NOT cancelled, has_more=true AND not blocked ----
+      # Reboot whenever rows remain — INCLUDING when 6-block streak was hit.
+      # Guarded by `gh run list` so we don't stack runs if one is already
+      # queued (e.g. user cancelled mid-chain).
       - name: Evaluate Self-Reboot Sequence
         if: |
           !cancelled() &&
-          steps.scraper_task.outputs.has_more == 'true' &&
-          steps.scraper_task.outputs.blocked != 'true'
+          steps.scraper_task.outputs.has_more == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          ACTIVE=$(gh run list \
+            --workflow=scraper.yml \
+            --status=queued --status=in_progress \
+            --json databaseId --jq 'length')
+          if [ "$ACTIVE" -gt 1 ]; then
+            echo "Another run already queued/in-progress ($ACTIVE total) — skipping reboot."
+            exit 0
+          fi
+
           CURRENT_BATCH="${{ inputs.batch || '1' }}"
           NEXT_BATCH=$((CURRENT_BATCH + 1))
 
@@ -107,11 +124,10 @@ jobs:
             exit 0
           fi
 
-          echo "Batch $CURRENT_BATCH hit threshold. Triggering Batch $NEXT_BATCH..."
+          echo "Batch $CURRENT_BATCH -> triggering Batch $NEXT_BATCH..."
           gh workflow run scraper.yml --ref main -f batch="$NEXT_BATCH"
           sleep 5
 
-      # ---- CLEAN EXIT: runs even on cancel, logs the stop ----
       - name: Cleanup on Cancel
         if: cancelled()
         run: |

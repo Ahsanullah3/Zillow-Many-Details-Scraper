@@ -26,23 +26,15 @@ const HEADFUL = process.env.HEADFUL === '1';
 const CHROME_PATH = process.env.CHROME_PATH || '';
 const CHROME_CHANNEL = process.env.CHROME_CHANNEL || '';
 
-// ✅ Resource blocking OFF by default — images/fonts/CSS must load so React hydrates fully
 const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES === '0';
-// ✅ Page text ALWAYS captured (last column)
 const INCLUDE_PAGE_TEXT = true;
 const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';
 
 const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
 const VIEWPORT_H = Number(process.env.VIEWPORT_H || '900');
-const NAV_DELAY_MIN = Number(process.env.NAV_DELAY_MIN || '500');
-const NAV_DELAY_MAX = Number(process.env.NAV_DELAY_MAX || '2000');
 const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '12000');
-const HYDRATE_SETTLE = Number(process.env.HYDRATE_SETTLE || '800');
 const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20000');
-const HISTORY_FALLBACK_MS = Number(process.env.HISTORY_FALLBACK_MS || '8000');
-const SHOW_MORE_SETTLE_MS = Number(process.env.SHOW_MORE_SETTLE_MS || '900');
-const SCROLL_STEP_DELAY = Number(process.env.SCROLL_STEP_DELAY || '350');
-const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || '400');
+const ZOOM_PERCENT = Number(process.env.ZOOM_PERCENT || '20');   // ✅ page zoom level
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -53,13 +45,12 @@ const HEADERS = [
 ];
 const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
-console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF (all resources load)'} | headful: ${HEADFUL} | pageText: ${INCLUDE_PAGE_TEXT ? 'ON' : 'OFF'}`);
+console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF (all resources load)'} | headful: ${HEADFUL} | zoom: ${ZOOM_PERCENT}% | pageText: ON`);
 
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
-const jitter = (min, max) => min + Math.floor(Math.random() * Math.max(1, max - min));
 
 const MAX_CELL_LEN = 49000;
 const MAX_PAGETEXT_LEN = 49900;
@@ -85,11 +76,7 @@ async function launchBrowser() {
         '--autoplay-policy=no-user-gesture-required',
         '--lang=en-US,en',
     ];
-    const opts = {
-        headless: HEADFUL ? false : true,
-        userDataDir,
-        args,
-    };
+    const opts = { headless: HEADFUL ? false : true, userDataDir, args };
     if (CHROME_PATH) opts.executablePath = CHROME_PATH;
     else if (CHROME_CHANNEL) opts.channel = CHROME_CHANNEL;
 
@@ -118,7 +105,7 @@ async function saveWithRetry(sheet, retries = 4) {
         try { await sheet.saveUpdatedCells(); return; }
         catch (error) {
             if (i === retries - 1) throw error;
-            await delay((2 ** i) * 1000);
+            await delay((2 ** i) * 1000); // API backoff only
         }
     }
 }
@@ -149,140 +136,109 @@ function findNextRow(sheet, afterRow, mode) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// ✅ SLOW SCROLL — loads lazy modules incl. price history
+// ✅ ZOOM + PAGE SCROLL (no timed delays — frame-based, stops when history mounts)
 // =========================================================
-async function slowScrollToBottom(page, tag) {
+async function zoomAndScroll(page, tag) {
     try {
-        await page.evaluate(() => window.scrollTo(0, 0));
-        await delay(400);
+        await page.evaluate(async (zoomPct) => {
+            const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+            const hasHistory = () => Array.from(document.querySelectorAll('h2,h3,h4'))
+                .some(x => (x.textContent || '').replace(/\u00A0/g, ' ').trim().toLowerCase() === 'price history');
 
-        let lastHeight = 0;
-        let stableRounds = 0;
-        const maxRounds = 90;
-        for (let round = 0; round < maxRounds; round++) {
-            const info = await page.evaluate((stepPx) => {
-                window.scrollBy(0, stepPx);
-                return { y: window.scrollY, h: document.body.scrollHeight, inner: window.innerHeight };
-            }, SCROLL_STEP_PX).catch(() => null);
-            if (!info) break;
+            // Zoom out so far more of the page is in the viewport at once
+            document.documentElement.style.zoom = String(zoomPct / 100);
+            await frame();
 
-            await delay(SCROLL_STEP_DELAY);
+            const step = Math.max(200, window.innerHeight);
+            let lastHeight = -1, stable = 0;
 
-            if (info.h !== lastHeight) {
-                lastHeight = info.h;
-                stableRounds = 0;
-            } else {
-                stableRounds++;
+            // Walk down the page in viewport steps so lazy modules mount
+            for (let round = 0; round < 60; round++) {
+                window.scrollBy(0, step);
+                await frame();
+                const h = document.documentElement.scrollHeight;
+                const atBottom = (window.scrollY + window.innerHeight) >= (h - 5);
+                if (hasHistory() && atBottom) break;
+                if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
+                if (atBottom && stable >= 2) break;
             }
 
-            const atBottom = (info.y + info.inner) >= (info.h - 5);
-            if (atBottom && stableRounds >= 2) break;
-        }
-
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await delay(800);
-        await page.evaluate(() => window.scrollTo(0, Math.max(0, document.body.scrollHeight - window.innerHeight * 2)));
-        await delay(500);
+            // Jump to the bottom
+            window.scrollTo(0, document.documentElement.scrollHeight);
+            await frame();
+        }, ZOOM_PERCENT);
     } catch (e) {
-        console.log(`   ⚠️ [${tag}] slowScroll error: ${e.message}`);
+        console.log(`   ⚠️ [${tag}] zoomAndScroll error: ${e.message}`);
     }
 }
 
 // =========================================================
-// ✅ PRICE HISTORY — heading + date-info fallback, safe expand, parse
+// ✅ PRICE HISTORY — visible DOM table ONLY (no JSON / no fallback locators)
 // =========================================================
-async function getPriceHistory(page, tag) {
-    // 1. Slow scroll so lazy modules mount
-    await slowScrollToBottom(page, tag);
-
-    // 2. Try heading-based wait (preferred)
-    let found = await page.waitForFunction(() => {
-        const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-        const h = Array.from(document.querySelectorAll('h2,h3,h4'))
-            .find(x => norm(x.textContent) === 'price history');
-        if (!h) return false;
+const FIND_TABLE_FN = `
+    const norm = (s) => (s || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+    const findTable = () => {
+        const h = Array.from(document.querySelectorAll('h2,h3,h4')).find(x => norm(x.textContent) === 'price history');
+        if (!h) return null;
         let root = h.parentElement;
         for (let i = 0; i < 5 && root; i++) {
             const t = root.querySelector('table');
-            if (t && t.querySelectorAll('tbody tr').length > 0) return true;
+            if (t) return t;
             root = root.parentElement;
         }
-        return false;
-    }, { timeout: HISTORY_WAIT_MS, polling: 500 }).then(() => true).catch(() => false);
+        return null;
+    };
+`;
 
-    // 3. Fallback: look for date-info cells anywhere on the page
-    if (!found) {
-        found = await page.waitForFunction(() => {
-            return document.querySelectorAll('[data-testid="date-info"]').length > 0;
-        }, { timeout: HISTORY_FALLBACK_MS, polling: 500 }).then(() => true).catch(() => false);
-        if (found) console.log(`   📊 [${tag}] Heading missing but date-info cells found — using fallback locator`);
-    }
+async function getPriceHistory(page, tag) {
+    await zoomAndScroll(page, tag);
+
+    // Wait until the Price history table has rows
+    const found = await page.waitForFunction(new Function(`
+        ${FIND_TABLE_FN}
+        const t = findTable();
+        return !!(t && t.querySelectorAll('tbody tr').length > 0);
+    `), { timeout: HISTORY_WAIT_MS, polling: 'raf' }).then(() => true).catch(() => false);
 
     if (!found) {
-        console.log(`   📊 [${tag}] Price history DOM NOT found — will rely on JSON fallback`);
+        console.log(`   📊 [${tag}] Price history table NOT found on page`);
         return { rows: [], found: false };
     }
 
-    // 4. Safe "Show more" expansion
-    let prevCount = -1, clicks = 0;
+    // Expand "Show more" — wait on row count increasing instead of fixed delays
+    let clicks = 0;
     for (let i = 0; i < 25; i++) {
-        const state = await page.evaluate(() => {
-            const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-            let table = null;
-            const h = Array.from(document.querySelectorAll('h2,h3,h4'))
-                .find(x => norm(x.textContent) === 'price history');
-            if (h) {
-                let root = h.parentElement;
-                for (let j = 0; j < 5 && root; j++) { table = root.querySelector('table'); if (table) break; root = root.parentElement; }
-            }
-            if (!table) {
-                const cell = document.querySelector('[data-testid="date-info"]');
-                if (cell) table = cell.closest('table');
-            }
+        const state = await page.evaluate(new Function(`
+            ${FIND_TABLE_FN}
+            const table = findTable();
             if (!table) return { count: 0, clicked: false };
-
             const count = table.querySelectorAll('tbody tr').length;
             const root2 = table.closest('div') || table.parentElement;
             const btn = (root2 && root2.querySelector('tfoot[data-testid="table-see-more"] button, tfoot button')) ||
                         document.querySelector('tfoot[data-testid="table-see-more"] button, tfoot button');
             if (btn && /show more|see more/i.test(btn.textContent || '')) {
-                btn.scrollIntoView({ block: 'center' });
                 btn.click();
                 return { count, clicked: true };
             }
             return { count, clicked: false };
-        }).catch(() => ({ count: 0, clicked: false }));
+        `)).catch(() => ({ count: 0, clicked: false }));
 
         if (!state.clicked) break;
         clicks++;
-        await delay(SHOW_MORE_SETTLE_MS);
-        if (state.count === prevCount && clicks >= 2) break;
-        prevCount = state.count;
+        const grew = await page.waitForFunction(new Function('prev', `
+            ${FIND_TABLE_FN}
+            const t = findTable();
+            return !!t && t.querySelectorAll('tbody tr').length > prev;
+        `), { timeout: 3000, polling: 'raf' }, state.count).then(() => true).catch(() => false);
+        if (!grew) break;
     }
     if (clicks) console.log(`   🔽 [${tag}] Expanded price history (${clicks} click(s))`);
 
-    // Nudge scroll into view
-    await page.evaluate(() => {
-        const cell = document.querySelector('[data-testid="date-info"]');
-        if (cell) cell.scrollIntoView({ block: 'start' });
-    }).catch(() => {});
-    await delay(600);
-
-    // 5. Parse rows — via heading OR via any table containing date-info
-    const rows = await page.evaluate(() => {
-        const clean = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
-        const norm = (s) => clean(s).toLowerCase();
-        let table = null;
-        const h = Array.from(document.querySelectorAll('h2,h3,h4'))
-            .find(x => norm(x.textContent) === 'price history');
-        if (h) {
-            let root = h.parentElement;
-            for (let i = 0; i < 5 && root; i++) { table = root.querySelector('table'); if (table) break; root = root.parentElement; }
-        }
-        if (!table) {
-            const cell = document.querySelector('[data-testid="date-info"]');
-            if (cell) table = cell.closest('table');
-        }
+    // Parse rows
+    const rows = await page.evaluate(new Function(`
+        ${FIND_TABLE_FN}
+        const clean = (s) => (s || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim();
+        const table = findTable();
         if (!table) return [];
 
         const out = [];
@@ -291,7 +247,7 @@ async function getPriceHistory(page, tag) {
             const label = tr.getAttribute('label') || '';
             if (!dateEl && !label) continue;
 
-            const lm = label.match(/Date:\s*(.+?),\s*Event:\s*(.+?),\s*Price:\s*(.*)$/i);
+            const lm = label.match(/Date:\\s*(.+?),\\s*Event:\\s*(.+?),\\s*Price:\\s*(.*)$/i);
             const cells = tr.querySelectorAll('td');
             const date = clean(dateEl && dateEl.textContent) || (lm ? clean(lm[1]) : '');
             const event = (cells[1] ? clean(cells[1].textContent) : '') || (lm ? clean(lm[2]) : '');
@@ -309,20 +265,20 @@ async function getPriceHistory(page, tag) {
             }
             if (!price && lm) {
                 const raw = clean(lm[3]);
-                if (!change) change = (raw.match(/\(([^)]+)\)/) || [])[1] || '';
-                price = raw.replace(/\s*\(.*\)\s*/, '').replace(/\s*null$/i, '').trim();
+                if (!change) change = (raw.match(/\\(([^)]+)\\)/) || [])[1] || '';
+                price = raw.replace(/\\s*\\(.*\\)\\s*/, '').replace(/\\s*null$/i, '').trim();
             }
             if (/^[-—–]+$/.test(price)) price = '';
 
             let source = '';
             const next = tr.nextElementSibling;
             if (next && !next.hasAttribute('label') && !next.querySelector('[data-testid="date-info"]')) {
-                source = clean(next.textContent).replace(/\s*Report\s+a\s+problem\s*$/i, '').replace(/\s*Report\s*$/i, '');
+                source = clean(next.textContent).replace(/\\s*Report\\s+a\\s+problem\\s*$/i, '').replace(/\\s*Report\\s*$/i, '');
             }
             out.push({ date, event, price, change, ppsf, source });
         }
         return out;
-    }).catch(() => []);
+    `)).catch(() => []);
 
     return { rows, found: true };
 }
@@ -347,14 +303,8 @@ async function scrapeOneUrl(browser, url) {
             });
         }
 
-        await delay(jitter(NAV_DELAY_MIN, NAV_DELAY_MAX));
         await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForSelector('[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"], h1', { timeout: HYDRATE_TIMEOUT }).catch(() => {});
-        // Give heavier (unblocked) page time to settle
-        if (typeof page.waitForNetworkIdle === 'function') {
-            await page.waitForNetworkIdle({ idleTime: 1200, timeout: 15000 }).catch(() => {});
-        }
-        await delay(HYDRATE_SETTLE);
 
         const title = await page.title();
         const hasContent = await page.evaluate(() => !!document.querySelector('h1, [data-testid="price"]'));
@@ -364,10 +314,10 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        // ---- Price history
+        // ---- Price history (zoom + scroll + visible table only)
         const { rows: domRows, found: tableFound } = await getPriceHistory(page, tag);
 
-        // ---- Main page data (always captures pageText)
+        // ---- Main page data
         const data = await page.evaluate((INCLUDE_PAGE_TEXT) => {
             const out = {
                 price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -480,7 +430,7 @@ async function scrapeOneUrl(browser, url) {
                 if (id) out.mls = `${id[1]} - ${src ? clean(src[1]) : ''}`.replace(/ - $/, '');
             }
 
-            // ✅ Page text — always captured, structured
+            // Page text
             if (INCLUDE_PAGE_TEXT) {
                 const SKIP = new Set([
                     'SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON',
@@ -563,7 +513,7 @@ async function scrapeOneUrl(browser, url) {
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
-            // JSON fallback #1: Next.js gdpClientCache
+            // JSON fallback for NON-history fields only (price / MLS / agent)
             try {
                 const nd = $('script#__NEXT_DATA__');
                 const nextData = nd ? JSON.parse(nd.textContent || 'null') : null;
@@ -580,56 +530,7 @@ async function scrapeOneUrl(browser, url) {
                             if (!out.mls && (ai.mlsId || ai.mlsName)) out.mls = [ai.mlsId, ai.mlsName].filter(Boolean).join(' - ');
                             if (!out.agentDetails) out.agentDetails = [ai.agentName, ai.brokerName, ai.agentPhoneNumber].filter(Boolean).join(' | ');
                         }
-                        if (Array.isArray(prop.priceHistory) && prop.priceHistory.length) {
-                            const fmtDate = (d) => {
-                                if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
-                                const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
-                                return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
-                            };
-                            out.priceHistoryText = prop.priceHistory.map(h => {
-                                const priceTxt = typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || '');
-                                const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? ` (${(h.priceChangeRate*100).toFixed(1)}%)` : '';
-                                const ppsf = h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '';
-                                return [fmtDate(h.date), h.event, priceTxt + change, ppsf, h.source ? `Source: ${h.source}` : ''].filter(Boolean).join(' | ');
-                            }).join('\n');
-                        }
                         break;
-                    }
-                }
-            } catch (e) {}
-
-            // ✅ JSON fallback #2: scan any JSON script for priceHistory array
-            try {
-                if (!out.priceHistoryText) {
-                    const scripts = document.querySelectorAll('script[type="application/json"], script[type="application/ld+json"]');
-                    for (const sc of scripts) {
-                        let j;
-                        try { j = JSON.parse(sc.textContent || 'null'); } catch (e) { continue; }
-                        const stack = [j];
-                        let found = false;
-                        while (stack.length && !found) {
-                            const cur = stack.pop();
-                            if (!cur || typeof cur !== 'object') continue;
-                            if (Array.isArray(cur.priceHistory) && cur.priceHistory.length) {
-                                const fmtDate = (d) => {
-                                    if (typeof d === 'number') { const x = new Date(d); return `${x.getUTCMonth()+1}/${x.getUTCDate()}/${x.getUTCFullYear()}`; }
-                                    const m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
-                                    return m ? `${+m[2]}/${+m[3]}/${m[1]}` : String(d || '');
-                                };
-                                out.priceHistoryText = cur.priceHistory.map(h => {
-                                    const priceTxt = typeof h.price === 'number' ? `$${h.price.toLocaleString('en-US')}` : (h.price || '');
-                                    const change = (typeof h.priceChangeRate === 'number' && h.priceChangeRate !== 0) ? ` (${(h.priceChangeRate*100).toFixed(1)}%)` : '';
-                                    const ppsf = h.pricePerSquareFoot ? `$${Math.round(h.pricePerSquareFoot)}/sqft` : '';
-                                    return [fmtDate(h.date), h.event, priceTxt + change, ppsf, h.source ? `Source: ${h.source}` : ''].filter(Boolean).join(' | ');
-                                }).join('\n');
-                                found = true;
-                                break;
-                            }
-                            for (const k of Object.keys(cur)) {
-                                if (cur[k] && typeof cur[k] === 'object') stack.push(cur[k]);
-                            }
-                        }
-                        if (found) break;
                     }
                 }
             } catch (e) {}
@@ -639,7 +540,7 @@ async function scrapeOneUrl(browser, url) {
 
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
-        // ---- Merge DOM price history (preferred over JSON fallback)
+        // ---- Price history from visible DOM table only
         if (domRows.length) {
             data.priceHistoryText = domRows.map(r => {
                 const priceTxt = (r.price || '') + (r.change ? ` (${r.change})` : '');
@@ -659,21 +560,7 @@ async function scrapeOneUrl(browser, url) {
             console.log(`   📊 [${tag}] History: ${domRows.length} row(s)`);
             domRows.forEach(r => console.log(`       ${r.date} | ${r.event} | ${r.price}${r.change ? ' (' + r.change + ')' : ''}`));
         } else {
-            // ✅ Diagnostics when history missing
-            const diag = await page.evaluate(() => {
-                const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-                const heads = Array.from(document.querySelectorAll('h1,h2,h3,h4'))
-                    .map(x => norm(x.textContent)).filter(Boolean).slice(0, 40);
-                return {
-                    heads,
-                    dateInfoCount: document.querySelectorAll('[data-testid="date-info"]').length,
-                    tableCount: document.querySelectorAll('table').length,
-                    hasNextData: !!document.querySelector('script#__NEXT_DATA__'),
-                };
-            }).catch(() => ({}));
-            console.log(`   ⚠️ [${tag}] History: EMPTY (tableFound=${tableFound})${data.priceHistoryText ? ' — JSON fallback used' : ''}`);
-            console.log(`   🔎 [${tag}] diag: date-info=${diag.dateInfoCount} tables=${diag.tableCount} nextData=${diag.hasNextData}`);
-            console.log(`   🔎 [${tag}] headings: ${JSON.stringify(diag.heads || []).slice(0, 400)}`);
+            console.log(`   ⚠️ [${tag}] History: EMPTY (tableFound=${tableFound})`);
             if (DEBUG_DUMP) await dumpDebug(page, 'nohistory');
         }
 
@@ -712,11 +599,11 @@ async function dumpDebug(page, label) {
 }
 
 // =========================================================
-// MAIN
+// MAIN (unchanged)
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Zillow Scraper V26 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
+    console.log(`🚀 Zillow Scraper V27 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -773,7 +660,7 @@ async function runScraper() {
         setCell(row, 30, d.hoa);
         setCell(row, 31, d.priceHistoryText);
         setCell(row, 32, d.factsFeaturesText);
-        setCell(row, 33, d.pageText, MAX_PAGETEXT_LEN); // ✅ last column
+        setCell(row, 33, d.pageText, MAX_PAGETEXT_LEN);
     };
     let flushChain = Promise.resolve();
     const doFlush = async () => {

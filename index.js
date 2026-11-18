@@ -36,6 +36,12 @@ const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '12000');
 const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20');
 const ZOOM_PERCENT = Number(process.env.ZOOM_PERCENT || '20');   // page zoom level
 
+// HOA retry config
+const HOA_RETRY_ENABLED = process.env.HOA_RETRY !== '0';
+const HOA_RETRY_MAX = Number(process.env.HOA_RETRY_MAX || '2');
+const HOA_RETRY_WAIT_MS = Number(process.env.HOA_RETRY_WAIT_MS || '1500');
+const HOA_CLEAR_COOKIES = process.env.HOA_CLEAR_COOKIES === '1'; // opt-in: clearing cookies logs you out
+
 const HEADER_START_COL = 9;
 const HEADERS = [
     "Price", "Street", "City", "State", "Zipcode", "Final URL", "Agent Details", "Sold Price",
@@ -46,6 +52,7 @@ const HEADERS = [
 const OVERWRITE_HEADERS = process.env.OVERWRITE_HEADERS === '1';
 
 console.log(`🧩 Resource blocking: ${BLOCK_RESOURCES ? 'ON' : 'OFF (all resources load)'} | headful: ${HEADFUL} | zoom: ${ZOOM_PERCENT}% | pageText: ON`);
+console.log(`🏠 HOA retry: ${HOA_RETRY_ENABLED ? `ON (max ${HOA_RETRY_MAX}, clearCookies=${HOA_CLEAR_COOKIES})` : 'OFF'}`);
 
 const isSkipStatus = (st) => /BLOCKED|No data|Error|Empty parse|no history/i.test(String(st || ''));
 const isDoneStatus = (st) => /✅/.test(String(st || ''));
@@ -65,7 +72,6 @@ const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndicatio
 // =========================================================
 // GLOBAL CANCEL FLAG
 // =========================================================
-// Set by SIGINT / SIGTERM. Workers check this before claiming new rows.
 let mainStop = false;
 process.once('SIGINT',  () => { mainStop = true; console.log('🛑 SIGINT received — stopping after current URLs flush.'); });
 process.once('SIGTERM', () => { mainStop = true; console.log('🛑 SIGTERM received — stopping after current URLs flush.'); });
@@ -113,7 +119,7 @@ async function saveWithRetry(sheet, retries = 4) {
         try { await sheet.saveUpdatedCells(); return; }
         catch (error) {
             if (i === retries - 1) throw error;
-            await delay((2 ** i) * 1000); // API backoff only
+            await delay((2 ** i) * 1000);
         }
     }
 }
@@ -144,7 +150,7 @@ function findNextRow(sheet, afterRow, mode) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// ZOOM + PAGE SCROLL (top -> bottom, TWICE)
+// ZOOM + PAGE SCROLL
 // =========================================================
 const SCROLL_CONTAINER_SELECTORS = [
     '.layout-container',
@@ -170,13 +176,11 @@ async function zoomAndScroll(page, tag) {
                 return null;
             };
 
-            // Zoom out so more of the page is in the viewport at once
             document.documentElement.style.zoom = String(zoomPct / 100);
             await frame();
 
             const scroller = findScroller();
 
-            // Unified API over "scroll whatever actually scrolls".
             const getScrollTop = () => scroller ? scroller.scrollTop : window.scrollY;
             const getScrollHeight = () => scroller ? scroller.scrollHeight : document.documentElement.scrollHeight;
             const getClientHeight = () => scroller ? scroller.clientHeight : window.innerHeight;
@@ -190,7 +194,6 @@ async function zoomAndScroll(page, tag) {
 
             const step = Math.max(200, getClientHeight());
 
-            // ---- Two full top -> bottom passes ----
             for (let pass = 0; pass < 2; pass++) {
                 scrollToTop();
                 await frame();
@@ -202,14 +205,12 @@ async function zoomAndScroll(page, tag) {
                     await frame();
                     const h = getScrollHeight();
                     const atBottom = (getScrollTop() + getClientHeight()) >= (h - 5);
-                    // Early-exit only on pass 1 once history is mounted at the bottom
                     if (hasHistory() && atBottom && pass === 1) break;
                     if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
                     if (atBottom && stable >= 2) break;
                 }
             }
 
-            // Final jump to bottom so the price-history table is in view
             scrollToBottom();
             await frame();
         }, { zoomPct: ZOOM_PERCENT, selectors: SCROLL_CONTAINER_SELECTORS });
@@ -327,7 +328,98 @@ async function getPriceHistory(page, tag) {
 }
 
 // =========================================================
+// SHARED PAGE HELPERS
+// =========================================================
+async function waitForHydration(page) {
+    await page.waitForSelector(
+        '[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"], h1',
+        { timeout: HYDRATE_TIMEOUT }
+    ).catch(() => {});
+}
+
+function isBlockedTitle(title) {
+    return /pardon our interruption|robot check|access denied|denied|captcha|press & hold/i.test(title);
+}
+
+// Scroll the facts panel into view to force lazy hydration of HOA data
+async function nudgeFactsPanelIntoView(page) {
+    try {
+        await page.evaluate(() => {
+            const el = document.querySelector('[data-testid="category-group"], [data-testid="fact-category"]');
+            if (el) el.scrollIntoView({ block: 'center' });
+        });
+        await delay(500);
+    } catch (e) {}
+}
+
+// Extract ONLY the HOA value from the currently loaded DOM
+async function readHoaFromPage(page) {
+    return await page.evaluate(() => {
+        const clean = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+        const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+        const fm = {};
+        $$('[data-testid="fact-category"] li').forEach(li => {
+            const t = clean(li.textContent);
+            const i = t.indexOf(': ');
+            if (i > 0) { const k = t.slice(0, i); if (!(k in fm)) fm[k] = t.slice(i + 2); }
+        });
+
+        const hasHoa = fm['Has HOA'];
+        const hoaFee = fm['HOA fee'] || fm['HOA fee frequency'];
+        if (hoaFee) return hoaFee;
+        if (hasHoa) return /^no/i.test(hasHoa) ? 'No' : `Yes (${hasHoa})`;
+        return '';
+    }).catch(() => '');
+}
+
+// Clear cache + storage via CDP, then hard-navigate to the same URL.
+// Keeps the SAME page/context alive — no browser teardown.
+async function hardReloadWithClearedState(page, url, tag) {
+    let cdp;
+    try {
+        cdp = await page.target().createCDPSession();
+
+        // Disable cache so nothing is served stale during + after reload
+        await cdp.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => {});
+        await cdp.send('Network.clearBrowserCache').catch(() => {});
+
+        // Clear per-origin storage. Cookies are opt-in because they log you out.
+        const storageTypes = HOA_CLEAR_COOKIES
+            ? 'cookies,local_storage,indexeddb,service_workers,cache_storage'
+            : 'local_storage,indexeddb,service_workers,cache_storage';
+        try {
+            const u = new URL(url);
+            await cdp.send('Storage.clearDataForOrigin', {
+                origin: u.origin,
+                storageTypes,
+            }).catch(() => {});
+        } catch (e) {}
+
+        await page.setCacheEnabled(false).catch(() => {});
+
+        // Hard navigation (replaces history entry; no bfcache/memory cache reuse)
+        await page.goto(String(url), {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000,
+            referer: 'https://www.zillow.com/',
+        });
+        await waitForHydration(page);
+
+        // Restore cache behavior for the rest of this page's life
+        await page.setCacheEnabled(true).catch(() => {});
+        await cdp.send('Network.setCacheDisabled', { cacheDisabled: false }).catch(() => {});
+    } catch (e) {
+        console.log(`   ⚠️ [${tag}] hardReload error: ${e.message}`);
+    } finally {
+        if (cdp) await cdp.detach().catch(() => {});
+    }
+}
+
+// =========================================================
 // EXTRACT ONE URL
+// Returns: { blocked, blockedTitle?, data?, tableFound?, domRowsFound?,
+//            hoaRetried?: boolean, hoaRecovered?: boolean }
 // =========================================================
 async function scrapeOneUrl(browser, url) {
     const tag = String(url).slice(-22);
@@ -347,11 +439,11 @@ async function scrapeOneUrl(browser, url) {
         }
 
         await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await page.waitForSelector('[data-testid="price"], [data-testid="description"], [data-testid="gallery-status-pill"], h1', { timeout: HYDRATE_TIMEOUT }).catch(() => {});
+        await waitForHydration(page);
 
         const title = await page.title();
         const hasContent = await page.evaluate(() => !!document.querySelector('h1, [data-testid="price"]'));
-        const blockedTitle = /pardon our interruption|robot check|access denied|denied|captcha|press & hold/i.test(title);
+        const blockedTitle = isBlockedTitle(title);
         if (blockedTitle || !hasContent) {
             if (DEBUG_DUMP) await dumpDebug(page, 'blocked');
             return { blocked: true, blockedTitle };
@@ -617,7 +709,44 @@ async function scrapeOneUrl(browser, url) {
             } catch (e) { data.description = data.description || 'N/A'; }
         }
 
-        return { blocked: false, data, tableFound, domRowsFound: domRows.length };
+        // =========================================================
+        // HOA RETRY — reload SAME page/context (no browser teardown)
+        // =========================================================
+        let hoaRetried = false;
+        let hoaRecovered = false;
+
+        if (HOA_RETRY_ENABLED && !data.hoa) {
+            hoaRetried = true;
+            for (let attempt = 1; attempt <= HOA_RETRY_MAX; attempt++) {
+                console.log(`   🔁 [${tag}] HOA missing — reload attempt ${attempt}/${HOA_RETRY_MAX} (cache+storage cleared, same page)`);
+
+                // First, try a cheap scroll-nudge + re-read (no navigation)
+                await nudgeFactsPanelIntoView(page);
+                let retry = await readHoaFromPage(page);
+                if (retry) {
+                    data.hoa = retry;
+                    hoaRecovered = true;
+                    console.log(`   ✅ [${tag}] HOA recovered via scroll-nudge: ${retry}`);
+                    break;
+                }
+
+                // Then do the full cache+storage clear + hard reload
+                await hardReloadWithClearedState(page, url, tag);
+                await nudgeFactsPanelIntoView(page);
+                retry = await readHoaFromPage(page);
+                if (retry) {
+                    data.hoa = retry;
+                    hoaRecovered = true;
+                    console.log(`   ✅ [${tag}] HOA recovered after cache-clear reload: ${retry}`);
+                    break;
+                }
+
+                console.log(`   ⚠️ [${tag}] HOA still missing after attempt ${attempt}`);
+                if (attempt < HOA_RETRY_MAX) await delay(HOA_RETRY_WAIT_MS);
+            }
+        }
+
+        return { blocked: false, data, tableFound, domRowsFound: domRows.length, hoaRetried, hoaRecovered };
     } finally {
         if (page) await page.close().catch(() => {});
         await ctx.close().catch(() => {});
@@ -640,7 +769,7 @@ async function dumpDebug(page, label) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Zillow Scraper V29 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
+    console.log(`🚀 Zillow Scraper V30 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -728,7 +857,6 @@ async function runScraper() {
     let phase = 'fresh';
     const inflight = new Map();
 
-    // ---- Serialized streak counters (no cross-worker races) -------------
     let streakChain = Promise.resolve();
     let blockStreak = 0;
     let errorStreak = 0;
@@ -792,33 +920,11 @@ async function runScraper() {
                     used++;
 
                     const key = urlKey(url);
-                    if (!inflight.has(key)) inflight.set(key, (async () => {
-                        // ---- First pass ----
-                        let result = await scrapeOneUrl(browser, url);
-
-                        // ---- HOA retry: close browser, relaunch, re-scrape once ----
-                        if (!result.blocked && result.data && !result.data.hoa) {
-                            totalHoaRetries++;
-                            console.log(`   🔁 [${tag}] HOA missing — recycling browser and re-scraping URL`);
-                            try { await closeBrowser(browser); } catch (e) {}
-                            browser = await launchBrowser();
-                            used = 0;
-
-                            const second = await scrapeOneUrl(browser, url);
-                            if (!second.blocked && second.data && second.data.hoa) {
-                                totalHoaRecovered++;
-                                console.log(`   ✅ [${tag}] HOA recovered on retry: ${second.data.hoa}`);
-                                result = second;
-                            } else if (second.blocked) {
-                                console.log(`   ⚠️ [${tag}] Retry got blocked — keeping first pass`);
-                            } else {
-                                console.log(`   ⚠️ [${tag}] HOA still missing after retry — accepting second pass`);
-                                result = second;
-                            }
-                        }
-                        return result;
-                    })());
+                    if (!inflight.has(key)) inflight.set(key, scrapeOneUrl(browser, url));
                     const result = await inflight.get(key);
+
+                    if (result.hoaRetried) totalHoaRetries++;
+                    if (result.hoaRecovered) totalHoaRecovered++;
 
                     if (result.blocked) {
                         console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}`);
@@ -845,7 +951,7 @@ async function runScraper() {
                             queue.push({ row: rowIndex, status, d });
                             success++;
                             await recordSuccess();
-                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 🏠 HOA: ${d.hoa || 'MISSING'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 📄 Text: ${d.pageText ? d.pageText.length : 0} chars | 🏷️ ${d.mls || '—'}`);
+                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 🏠 HOA: ${d.hoa || 'MISSING'}${result.hoaRecovered ? ' (recovered)' : ''} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 📄 Text: ${d.pageText ? d.pageText.length : 0} chars | 🏷️ ${d.mls || '—'}`);
                         }
                     }
                 } catch (e) {

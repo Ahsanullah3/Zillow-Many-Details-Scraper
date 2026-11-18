@@ -11,7 +11,7 @@ puppeteer.use(StealthPlugin());
 // =========================================================
 // CONFIG
 // =========================================================
-const CONCURRENCY = Number(process.env.CONCURRENCY || '4');
+const CONCURRENCY = Number(process.env.CONCURRENCY || '3');
 const MAX_URLS_PER_RUN = Number(process.env.MAX_URLS_PER_RUN || '150');
 const FLUSH_EVERY = 5;
 const REQUIRED_COLS = 34;
@@ -33,8 +33,8 @@ const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';
 const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
 const VIEWPORT_H = Number(process.env.VIEWPORT_H || '900');
 const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '12000');
-const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20000');
-const ZOOM_PERCENT = Number(process.env.ZOOM_PERCENT || '20');   // ✅ page zoom level
+const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20');
+const ZOOM_PERCENT = Number(process.env.ZOOM_PERCENT || '20');   // page zoom level
 
 const HEADER_START_COL = 9;
 const HEADERS = [
@@ -61,6 +61,14 @@ const safeCell = (v, limit = MAX_CELL_LEN) => {
 };
 
 const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndication|facebook\.net|facebook\.com|criteo|taboola|adsrvr|tiktok|snapchat|hotjar|fullstory|bing\.com|quantserve|scorecardresearch/i;
+
+// =========================================================
+// GLOBAL CANCEL FLAG
+// =========================================================
+// Set by SIGINT / SIGTERM. Workers check this before claiming new rows.
+let mainStop = false;
+process.once('SIGINT',  () => { mainStop = true; console.log('🛑 SIGINT received — stopping after current URLs flush.'); });
+process.once('SIGTERM', () => { mainStop = true; console.log('🛑 SIGTERM received — stopping after current URLs flush.'); });
 
 // =========================================================
 // BROWSER
@@ -136,44 +144,82 @@ function findNextRow(sheet, afterRow, mode) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// ✅ ZOOM + PAGE SCROLL (no timed delays — frame-based, stops when history mounts)
+// ZOOM + PAGE SCROLL (top -> bottom, TWICE)
 // =========================================================
+const SCROLL_CONTAINER_SELECTORS = [
+    '.layout-container',
+    '[data-testid="hdp-scroll-container"]',
+    '#layout-wrapper .layout-container',
+    '#layout-wrapper',
+    '.layout-column',
+    'main',
+];
+
 async function zoomAndScroll(page, tag) {
     try {
-        await page.evaluate(async (zoomPct) => {
+        await page.evaluate(async ({ zoomPct, selectors }) => {
             const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
             const hasHistory = () => Array.from(document.querySelectorAll('h2,h3,h4'))
                 .some(x => (x.textContent || '').replace(/\u00A0/g, ' ').trim().toLowerCase() === 'price history');
 
-            // Zoom out so far more of the page is in the viewport at once
+            const findScroller = () => {
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.scrollHeight > el.clientHeight + 50) return el;
+                }
+                return null;
+            };
+
+            // Zoom out so more of the page is in the viewport at once
             document.documentElement.style.zoom = String(zoomPct / 100);
             await frame();
 
-            const step = Math.max(200, window.innerHeight);
-            let lastHeight = -1, stable = 0;
+            const scroller = findScroller();
 
-            // Walk down the page in viewport steps so lazy modules mount
-            for (let round = 0; round < 60; round++) {
-                window.scrollBy(0, step);
+            // Unified API over "scroll whatever actually scrolls".
+            const getScrollTop = () => scroller ? scroller.scrollTop : window.scrollY;
+            const getScrollHeight = () => scroller ? scroller.scrollHeight : document.documentElement.scrollHeight;
+            const getClientHeight = () => scroller ? scroller.clientHeight : window.innerHeight;
+            const scrollToTop = () => scroller ? (scroller.scrollTop = 0) : window.scrollTo(0, 0);
+            const scrollByStep = (px) => scroller
+                ? (scroller.scrollTop = scroller.scrollTop + px)
+                : window.scrollBy(0, px);
+            const scrollToBottom = () => scroller
+                ? (scroller.scrollTop = scroller.scrollHeight)
+                : window.scrollTo(0, document.documentElement.scrollHeight);
+
+            const step = Math.max(200, getClientHeight());
+
+            // ---- Two full top -> bottom passes ----
+            for (let pass = 0; pass < 2; pass++) {
+                scrollToTop();
                 await frame();
-                const h = document.documentElement.scrollHeight;
-                const atBottom = (window.scrollY + window.innerHeight) >= (h - 5);
-                if (hasHistory() && atBottom) break;
-                if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
-                if (atBottom && stable >= 2) break;
+
+                let lastHeight = -1, stable = 0;
+
+                for (let round = 0; round < 80; round++) {
+                    scrollByStep(step);
+                    await frame();
+                    const h = getScrollHeight();
+                    const atBottom = (getScrollTop() + getClientHeight()) >= (h - 5);
+                    // Early-exit only on pass 1 once history is mounted at the bottom
+                    if (hasHistory() && atBottom && pass === 1) break;
+                    if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
+                    if (atBottom && stable >= 2) break;
+                }
             }
 
-            // Jump to the bottom
-            window.scrollTo(0, document.documentElement.scrollHeight);
+            // Final jump to bottom so the price-history table is in view
+            scrollToBottom();
             await frame();
-        }, ZOOM_PERCENT);
+        }, { zoomPct: ZOOM_PERCENT, selectors: SCROLL_CONTAINER_SELECTORS });
     } catch (e) {
         console.log(`   ⚠️ [${tag}] zoomAndScroll error: ${e.message}`);
     }
 }
 
 // =========================================================
-// ✅ PRICE HISTORY — visible DOM table ONLY (no JSON / no fallback locators)
+// PRICE HISTORY
 // =========================================================
 const FIND_TABLE_FN = `
     const norm = (s) => (s || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim().toLowerCase();
@@ -193,7 +239,6 @@ const FIND_TABLE_FN = `
 async function getPriceHistory(page, tag) {
     await zoomAndScroll(page, tag);
 
-    // Wait until the Price history table has rows
     const found = await page.waitForFunction(new Function(`
         ${FIND_TABLE_FN}
         const t = findTable();
@@ -205,7 +250,6 @@ async function getPriceHistory(page, tag) {
         return { rows: [], found: false };
     }
 
-    // Expand "Show more" — wait on row count increasing instead of fixed delays
     let clicks = 0;
     for (let i = 0; i < 25; i++) {
         const state = await page.evaluate(new Function(`
@@ -234,7 +278,6 @@ async function getPriceHistory(page, tag) {
     }
     if (clicks) console.log(`   🔽 [${tag}] Expanded price history (${clicks} click(s))`);
 
-    // Parse rows
     const rows = await page.evaluate(new Function(`
         ${FIND_TABLE_FN}
         const clean = (s) => (s || '').replace(/\\u00A0/g, ' ').replace(/\\s+/g, ' ').trim();
@@ -314,10 +357,8 @@ async function scrapeOneUrl(browser, url) {
             return { blocked: true, blockedTitle };
         }
 
-        // ---- Price history (zoom + scroll + visible table only)
         const { rows: domRows, found: tableFound } = await getPriceHistory(page, tag);
 
-        // ---- Main page data
         const data = await page.evaluate((INCLUDE_PAGE_TEXT) => {
             const out = {
                 price: "", street: "", city: "", state: "", zipcode: "", fullAddress: "",
@@ -430,7 +471,6 @@ async function scrapeOneUrl(browser, url) {
                 if (id) out.mls = `${id[1]} - ${src ? clean(src[1]) : ''}`.replace(/ - $/, '');
             }
 
-            // Page text
             if (INCLUDE_PAGE_TEXT) {
                 const SKIP = new Set([
                     'SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','TEMPLATE','BUTTON',
@@ -513,7 +553,6 @@ async function scrapeOneUrl(browser, url) {
 
             out.fullAddress = [out.street, out.city, out.state, out.zipcode].filter(Boolean).join(', ');
 
-            // JSON fallback for NON-history fields only (price / MLS / agent)
             try {
                 const nd = $('script#__NEXT_DATA__');
                 const nextData = nd ? JSON.parse(nd.textContent || 'null') : null;
@@ -540,7 +579,6 @@ async function scrapeOneUrl(browser, url) {
 
         if (!data.canonicalUrl) data.canonicalUrl = url;
 
-        // ---- Price history from visible DOM table only
         if (domRows.length) {
             data.priceHistoryText = domRows.map(r => {
                 const priceTxt = (r.price || '') + (r.change ? ` (${r.change})` : '');
@@ -564,7 +602,6 @@ async function scrapeOneUrl(browser, url) {
             if (DEBUG_DUMP) await dumpDebug(page, 'nohistory');
         }
 
-        // ---- Description fallback from JSON-LD
         if (!data.description || data.description === 'N/A') {
             try {
                 const ldDesc = await page.evaluate(() => {
@@ -599,16 +636,23 @@ async function dumpDebug(page, label) {
 }
 
 // =========================================================
-// MAIN (unchanged)
+// MAIN
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Zillow Scraper V27 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
+    console.log(`🚀 Zillow Scraper V29 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
             fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_more=${hasMore}\nblocked=${blocked}\n`);
         }
+    };
+
+    let stop = false;
+    let blockedExit = false;
+
+    const syncCancel = () => {
+        if (mainStop) stop = true;
     };
 
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
@@ -676,13 +720,35 @@ async function runScraper() {
     };
     const flush = () => (flushChain = flushChain.then(doFlush));
 
-    let claimed = 0, success = 0, blockStreak = 0, errorStreak = 0;
+    let claimed = 0, success = 0;
     let totalBlocks = 0, totalErrors = 0;
     let totalWithHistory = 0, totalWithTableFound = 0;
+    let totalHoaRetries = 0, totalHoaRecovered = 0;
     let cursor = -1;
     let phase = 'fresh';
-    let stop = false, blockedExit = false;
     const inflight = new Map();
+
+    // ---- Serialized streak counters (no cross-worker races) -------------
+    let streakChain = Promise.resolve();
+    let blockStreak = 0;
+    let errorStreak = 0;
+
+    const recordBlock = () => (streakChain = streakChain.then(() => {
+        blockStreak++;
+        totalBlocks++;
+        errorStreak = 0;
+        return blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS;
+    }));
+    const recordSuccess = () => (streakChain = streakChain.then(() => {
+        blockStreak = 0;
+        errorStreak = 0;
+        return false;
+    }));
+    const recordError = () => (streakChain = streakChain.then(() => {
+        errorStreak++;
+        totalErrors++;
+        return errorStreak >= MAX_CONSECUTIVE_ERRORS;
+    }));
 
     const claimRow = () => {
         let r = findNextRow(sheet, cursor, phase);
@@ -700,15 +766,20 @@ async function runScraper() {
         let browser = null, used = 0;
         try {
             while (!stop) {
+                syncCancel();
+                if (stop) break;
                 if (Date.now() - startTime >= MAX_RUNTIME_MS) break;
                 if (claimed >= MAX_URLS_PER_RUN) break;
-                if (errorStreak >= MAX_CONSECUTIVE_ERRORS) { stop = true; break; }
+
+                const errLimitHit = await (streakChain = streakChain.then(() => errorStreak >= MAX_CONSECUTIVE_ERRORS));
+                if (errLimitHit) { stop = true; break; }
 
                 const rowIndex = claimRow();
                 if (rowIndex === -1) break;
                 claimed++;
                 const url = String(safeValue(sheet, rowIndex, 0));
                 const actualRow = rowIndex + 1;
+                const tag = String(url).slice(-22);
                 console.log(`🕵️ [W${id}] Row ${actualRow} (${claimed}/${MAX_URLS_PER_RUN}) [${phase}]: ${url}`);
 
                 let recycle = false;
@@ -721,15 +792,43 @@ async function runScraper() {
                     used++;
 
                     const key = urlKey(url);
-                    if (!inflight.has(key)) inflight.set(key, scrapeOneUrl(browser, url));
+                    if (!inflight.has(key)) inflight.set(key, (async () => {
+                        // ---- First pass ----
+                        let result = await scrapeOneUrl(browser, url);
+
+                        // ---- HOA retry: close browser, relaunch, re-scrape once ----
+                        if (!result.blocked && result.data && !result.data.hoa) {
+                            totalHoaRetries++;
+                            console.log(`   🔁 [${tag}] HOA missing — recycling browser and re-scraping URL`);
+                            try { await closeBrowser(browser); } catch (e) {}
+                            browser = await launchBrowser();
+                            used = 0;
+
+                            const second = await scrapeOneUrl(browser, url);
+                            if (!second.blocked && second.data && second.data.hoa) {
+                                totalHoaRecovered++;
+                                console.log(`   ✅ [${tag}] HOA recovered on retry: ${second.data.hoa}`);
+                                result = second;
+                            } else if (second.blocked) {
+                                console.log(`   ⚠️ [${tag}] Retry got blocked — keeping first pass`);
+                            } else {
+                                console.log(`   ⚠️ [${tag}] HOA still missing after retry — accepting second pass`);
+                                result = second;
+                            }
+                        }
+                        return result;
+                    })());
                     const result = await inflight.get(key);
 
                     if (result.blocked) {
                         console.log(`❌ [W${id}] BLOCKED on Row ${actualRow}`);
                         queue.push({ row: rowIndex, status: result.blockedTitle ? "❌ BLOCKED (skipped)" : "🚫 No data - blocked? (skipped)" });
-                        blockStreak++; errorStreak = 0; totalBlocks++;
+                        const hit = await recordBlock();
                         recycle = true;
-                        if (blockStreak >= MAX_CONSECUTIVE_BLOCK_STREAKS) { stop = true; blockedExit = true; }
+                        if (hit) {
+                            console.log(`🛑 [W${id}] ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — stopping.`);
+                            stop = true; blockedExit = true;
+                        }
                     } else {
                         const d = result.data;
                         if (result.tableFound) totalWithTableFound++;
@@ -739,19 +838,22 @@ async function runScraper() {
                         if (!(d.price || d.fullAddress || d.description)) {
                             console.log(`⚠️ [W${id}] Empty parse on Row ${actualRow}`);
                             queue.push({ row: rowIndex, status: "⚠️ Empty parse (skipped)" });
-                            errorStreak++; totalErrors++;
+                            const errHit = await recordError();
+                            if (errHit) { stop = true; }
                         } else {
                             const status = hasHistory ? "✅ Done" : "⚠️ Done (no history)";
                             queue.push({ row: rowIndex, status, d });
-                            success++; blockStreak = 0; errorStreak = 0;
-                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 📄 Text: ${d.pageText ? d.pageText.length : 0} chars | 🏷️ ${d.mls || '—'}`);
+                            success++;
+                            await recordSuccess();
+                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 🏠 HOA: ${d.hoa || 'MISSING'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 📄 Text: ${d.pageText ? d.pageText.length : 0} chars | 🏷️ ${d.mls || '—'}`);
                         }
                     }
                 } catch (e) {
                     console.error(`🛑 [W${id}] Error on Row ${actualRow}: ${e.message}`);
                     queue.push({ row: rowIndex, status: "🛑 Error: " + String(e.message).slice(0, 100) });
-                    errorStreak++; totalErrors++;
+                    const errHit = await recordError();
                     recycle = true;
+                    if (errHit) { stop = true; }
                 } finally {
                     inflight.delete(urlKey(url));
                 }
@@ -769,11 +871,20 @@ async function runScraper() {
 
     console.log(`\n📊 ─── RUN TOTALS ───`);
     console.log(`✅ Success: ${success} | 🚫 Blocked: ${totalBlocks} | 🛑 Errors: ${totalErrors}`);
+    console.log(`🏠 HOA retries: ${totalHoaRetries} | 🏠 HOA recovered: ${totalHoaRecovered}`);
     console.log(`📊 Rows with history: ${totalWithHistory} | 📊 History-section rows: ${totalWithTableFound}`);
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
+    if (mainStop && !blockedExit) {
+        const remaining = findNextRow(sheet, -1, 'fresh');
+        const hasMore = remaining !== -1;
+        setOutput(hasMore, false);
+        console.log(`🛑 Cancelled by signal. has_more=${hasMore} — workflow will decide whether to re-queue.`);
+        return;
+    }
+
     if (blockedExit) {
-        console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — stopping.`);
+        console.log(`🛑 ${MAX_CONSECUTIVE_BLOCK_STREAKS} consecutive blocks — stopping. has_more=true will trigger next batch.`);
         setOutput(true, true);
         return;
     }
